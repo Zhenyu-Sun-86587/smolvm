@@ -14,6 +14,13 @@ pub(crate) struct Capacity {
     pub storage_bytes: u64,
 }
 
+const MIB: u64 = 1 << 20;
+const CAPTURE_OVERHEAD: u64 = crate::statepoint_capture::MAX_CHECKPOINT_BYTES as u64 + 4 * MIB;
+
+pub(crate) fn capture_storage(memory_mib: u64) -> u64 {
+    memory_mib.saturating_mul(MIB).saturating_add(CAPTURE_OVERHEAD)
+}
+
 fn unavailable(e: impl ToString) -> Fault {
     Fault::new("E_RESOURCE_LIMIT", e.to_string())
 }
@@ -70,7 +77,15 @@ pub(crate) fn limits(db: &Connection) -> Result<Capacity> {
     })
 }
 fn used(db: &Connection) -> Result<Capacity> {
-    Ok(db.query_row("SELECT COALESCE(SUM(vcpus),0),COALESCE(SUM(memory_mib),0),COALESCE(SUM(storage_bytes),0) FROM managed_budget_holds WHERE state!='released'",[],
+    // The durable capture journal is itself its reservation. Publication or
+    // abort ends the reservation as part of the operation's terminal commit.
+    Ok(db.query_row("SELECT COALESCE(SUM(vcpus),0),COALESCE(SUM(memory_mib),0),
+        COALESCE(SUM(storage_bytes),0) + (SELECT COALESCE(SUM(
+            CAST(json_extract(b.template,'$.memory_mib') AS INTEGER) * ?1 + ?2),0)
+            FROM managed_fork_batches b JOIN operations o USING(operation_id)
+            WHERE o.phase='NEW' AND o.kind IN ('vm_snapshot','hibernate','vm_rollback'))
+        FROM managed_budget_holds WHERE state!='released'",
+        params![MIB as i64, CAPTURE_OVERHEAD as i64],
         |r|Ok(Capacity{vcpus:r.get::<_,i64>(0)? as u64,memory_mib:r.get::<_,i64>(1)? as u64,storage_bytes:r.get::<_,i64>(2)? as u64}))?)
 }
 pub(crate) fn status(db: &Connection) -> Result<serde_json::Value> {
@@ -80,6 +95,18 @@ pub(crate) fn status(db: &Connection) -> Result<serde_json::Value> {
 pub(crate) fn unreserved_storage(db: &Connection) -> Result<u64> {
     Ok(limits(db)?.storage_bytes.saturating_sub(used(db)?.storage_bytes))
 }
+
+pub(crate) fn require_capture_space(db: &Connection, memory_mib: u64) -> Result<()> {
+    let bytes = capture_storage(memory_mib);
+    let available = unreserved_storage(db)?;
+    if bytes > available {
+        return Err(unavailable(format!(
+            "durable capture requires {bytes} storage bytes, {available} remain unreserved"
+        )));
+    }
+    Ok(())
+}
+
 /// The caller owns the immediate admission transaction, including all batch children.
 pub(crate) fn reserve(
     db: &rusqlite::Transaction<'_>,
