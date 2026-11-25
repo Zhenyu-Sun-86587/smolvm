@@ -433,6 +433,19 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            "RegisterPrivateNetwork" => {
+                self.catalog.register_private_network(&request.payload()?)?;
+                Ok(json!({"registered": true}))
+            }
+            "ReserveNetworkAttachment" => Ok(json!(self
+                .catalog
+                .reserve_network(request, &request.payload()?)?)),
+            "QueryNetworkReservation" => Ok(json!(self
+                .catalog
+                .get_network_reservation(request, &request.payload()?)?)),
+            "ReleaseNetworkReservation" => Ok(json!(self
+                .catalog
+                .release_network_reservation(request, &request.payload()?)?)),
             "RegisterBundle" => {
                 let bundle = request
                     .bundle_digest
@@ -449,7 +462,12 @@ impl Worker {
                 let data: Begin = request.payload()?;
                 if !matches!(
                     data.kind.as_str(),
-                    "catalog" | "launch" | "writer_reservation" | "generation" | "resource_lease"
+                    "catalog"
+                        | "launch"
+                        | "writer_reservation"
+                        | "generation"
+                        | "resource_lease"
+                        | "network_reservation"
                 ) {
                     return Err(Fault::new(
                         "E_CAPABILITY_UNSUPPORTED",

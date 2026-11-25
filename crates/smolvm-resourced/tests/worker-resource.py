@@ -104,6 +104,34 @@ class WorkerResource(unittest.TestCase):
         self.assertIn("result", response, response)
         return response["result"]
 
+    def test_private_network_reservation_is_scoped_and_unpublished(self):
+        for network_id in ("home", "alternate"):
+            self.call("RegisterPrivateNetwork", {
+                "network_id": network_id, "route_domain_id": f"router-{network_id}",
+                "cidr": "10.20.0.0/30",
+            })
+        a = operation(self.bundle_a, "net-a", fence("a"))
+        b = operation(self.bundle_a, "net-b", fence("b"))
+        for scope in (a, b):
+            self.call("BeginOperation", {"kind": "network_reservation"}, **scope)
+        native = {"attachment_id": "a-net", "network_id": "home", "device_id": "net0", "mode": "native"}
+        receipt = self.call("ReserveNetworkAttachment", native, **a)
+        self.assertEqual(receipt["state"], "reserved")
+        self.assertEqual(receipt["guest_ipv4"], "10.20.0.2")
+        self.assertEqual(receipt, self.call("ReserveNetworkAttachment", native, **a))
+        self.call("QueryNetworkReservation", {"attachment_id": "a-net"}, error="E_NOT_FOUND", **b)
+        fixed = {"attachment_id": "b-net", "network_id": "home", "device_id": "net0",
+                 "mode": "fixed_internal", "guest_ipv4": "192.168.4.2"}
+        self.call("ReserveNetworkAttachment", fixed, error="E_RESOURCE_EXHAUSTED", **b)
+        other = self.call("ReserveNetworkAttachment", {**fixed, "network_id": "alternate"}, **b)
+        self.assertEqual(other["private_ipv4"], receipt["private_ipv4"])
+        self.assertNotEqual(other["route_domain_id"], receipt["route_domain_id"])
+        self.assertEqual(other["guest_ipv4"], "192.168.4.2")
+        release = {"attachment_id": "a-net", "expected_revision": receipt["revision"]}
+        released = self.call("ReleaseNetworkReservation", release, **a)
+        self.assertEqual(released["state"], "released")
+        self.assertEqual(released, self.call("ReleaseNetworkReservation", release, **a))
+
     def process_peer(self):
         code = (
             "import json, socket, sys\n"
