@@ -234,9 +234,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_managed_launch.sql"))?;
                 tx.execute_batch(include_str!("schema_product_volumes.sql"))?;
                 tx.execute_batch(include_str!("schema_network_dns.sql"))?;
-                tx.execute_batch("PRAGMA user_version=13")?;
+                tx.execute_batch(include_str!("schema_capture_network.sql"))?;
+                tx.execute_batch("PRAGMA user_version=15")?;
             }
-            1..=13 => {
+            1..=13 | 15 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -272,7 +273,10 @@ impl Catalog {
                 }
                 if version < 13 {
                     tx.execute_batch(include_str!("schema_network_dns.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=13")?;
+                }
+                if version < 15 {
+                    tx.execute_batch(include_str!("schema_capture_network.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=15")?;
                 }
                 crate::network_lease_catalog::recover(&tx)?;
                 crate::activation_catalog::recover(&tx)?;
