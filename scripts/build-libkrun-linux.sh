@@ -9,8 +9,8 @@
 # C4A.metal (Axion arm64) worker and run this to produce lib/linux-aarch64/.
 # It also works on x86_64 Linux to refresh lib/linux-x86_64/.
 #
-# Why a native build: libkrunfw compiles a full Linux kernel (linux-6.12.87 +
-# patches) with the per-arch config (config-libkrunfw_<arch>), and libkrun
+# Why a native build: libkrunfw compiles the Linux kernel pinned by its Makefile
+# with patches and the per-arch config (config-libkrunfw_<arch>), and libkrun
 # embeds a static init ELF of the guest arch. Both are far simpler and more
 # reliable built natively than cross-compiled.
 #
@@ -45,6 +45,22 @@ ARCH="$(uname -m)"                       # aarch64 | x86_64
 LIBDIR="lib/linux-${ARCH}"
 GPU="${GPU:-1}"
 GPU_FLAG="GPU=${GPU}"
+VERIFIED_SOURCE="${SMOLVM_VERIFIED_SOURCE_BUILD:-0}"
+BUILD_JOBS="${SMOLVM_BUILD_JOBS:-$(nproc)}"
+
+if [[ "$VERIFIED_SOURCE" == "1" ]]; then
+    # scripts/deep/build-bundle.sh supplies a fresh out-of-tree checkout,
+    # and a patched/validated kernel tree.
+    if [[ "$ARCH" != x86_64 || "$GPU" != 0 || "${SKIP_DEPS:-0}" != 1 ||
+          "${SKIP_LIBKRUNFW:-0}" != 0 || -n "${LINUX_GLIBC:-}" || -e "$LIBDIR" ||
+          ! "${SMOLVM_VERIFIED_KERNEL_TREE:-}" =~ ^linux-[0-9]+\.[0-9]+\.[0-9]+$ ||
+          ! -f "libkrunfw/${SMOLVM_VERIFIED_KERNEL_TREE}/.config" ||
+          -e "libkrunfw/${SMOLVM_VERIFIED_KERNEL_TREE}/vmlinux" ||
+          ! "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: verified source mode requires a fresh x86-64 CPU-only build tree and prepared kernel config" >&2
+        exit 1
+    fi
+fi
 
 echo "=== building libkrun stack for linux-${ARCH} -> ${LIBDIR} ==="
 
@@ -69,7 +85,7 @@ command -v cargo >/dev/null 2>&1 || { source "$HOME/.cargo/env" 2>/dev/null || t
 # Ensure the submodules + LFS are present (the kernel config lives in-tree).
 # Tolerate running on rsync'd working trees (no parent .git) — the libkrun /
 # libkrunfw dirs just need to already contain the patched source.
-if [ -d .git ]; then
+if [[ "$VERIFIED_SOURCE" != "1" && -d .git ]]; then
     git submodule update --init libkrun libkrunfw || true
     git lfs pull 2>/dev/null || true
 fi
@@ -85,8 +101,10 @@ fi
 
 # bindgen needs to find libclang at runtime on some distros.
 if [[ -z "${LIBCLANG_PATH:-}" ]]; then
-    LIBCLANG_PATH="$(dirname "$(find /usr/lib -name 'libclang.so*' 2>/dev/null | head -1)")"
-    export LIBCLANG_PATH
+    clang_library="$(find /usr/lib -name 'libclang.so*' -print -quit 2>/dev/null)"
+    if [[ -n "$clang_library" ]]; then
+        export LIBCLANG_PATH="$(dirname "$clang_library")"
+    fi
 fi
 
 # --- 2. libkrunfw (guest kernel) ---------------------------------------------
@@ -98,7 +116,12 @@ else
     # Build from INSIDE the dir, NOT `make -C`: `-C` auto-enables -w (print-dir),
     # which lands in MAKEFLAGS as a bare `w`; the kernel's `$(MAKE) $(MAKEFLAGS)`
     # recipe then dies with "No rule to make target 'w'". -j scales the kernel build.
-    ( cd libkrunfw && make clean >/dev/null 2>&1 || true; make -j"$(nproc)" GUESTARCH="${ARCH}" )
+    if [[ "$VERIFIED_SOURCE" == "1" ]]; then
+        ( cd libkrunfw; make --no-print-directory -o "$SMOLVM_VERIFIED_KERNEL_TREE" -j"$BUILD_JOBS" \
+            CC=gcc GUESTARCH="$ARCH" )
+    else
+        ( cd libkrunfw; make clean >/dev/null 2>&1 || true; make -j"$BUILD_JOBS" GUESTARCH="$ARCH" )
+    fi
     KRUNFW_SO="$(ls -1 libkrunfw/libkrunfw.so.*.*.* 2>/dev/null | head -1)"
     [[ -n "$KRUNFW_SO" ]] || { echo "ERROR: libkrunfw build produced no .so" >&2; exit 1; }
 fi
@@ -115,7 +138,19 @@ fi
 #    musl std target must be present or the init links dynamically and can't run
 #    as the guest's PID 1.
 INIT_ENV=()
-if [[ -f libkrun/init/init.c ]]; then
+if [[ "$VERIFIED_SOURCE" == "1" ]]; then
+    echo "--- building static guest init from the locked Rust workspace ---"
+    ( cd libkrun; cargo build --manifest-path init/Cargo.toml --locked --release \
+        --target x86_64-unknown-linux-musl --target-dir target/deep-init --jobs "$BUILD_JOBS" )
+    INIT_BINARY="$(realpath libkrun/target/deep-init/x86_64-unknown-linux-musl/release/krun-init)"
+    INIT_ELF="$(readelf -W -h -l -d "$INIT_BINARY")"
+    if [[ "$INIT_ELF" != *"Advanced Micro Devices X86-64"* ]] ||
+        grep -qE '^\s*INTERP\s|\(NEEDED\)' <<<"$INIT_ELF"; then
+        echo "ERROR: krun-init must be a static x86-64 ELF" >&2
+        exit 1
+    fi
+    INIT_ENV=("KRUN_INIT_BINARY_PATH=$INIT_BINARY")
+elif [[ -f libkrun/init/init.c ]]; then
     echo "--- building guest init (legacy C; native ${ARCH} ELF) ---"
     cc -O2 -static -Wall -o libkrun/init/init libkrun/init/init.c libkrun/init/dhcp.c
     file libkrun/init/init | grep -q 'statically linked' \
@@ -135,7 +170,10 @@ echo "--- building libkrun (BLK=1 NET=1 INPUT=1 ${GPU_FLAG}) ---"
 # strip only holds if symbols bind lazily — full RELRO's BIND_NOW would eagerly
 # resolve the now-unprovided virgl symbols and fail the load. Must match the
 # relro-level=partial that build-dist.sh applies on its own libkrun compiles.
-if [[ -n "${LINUX_GLIBC:-}" ]]; then
+if [[ "$VERIFIED_SOURCE" == "1" ]]; then
+    ( cd libkrun; env "${INIT_ENV[@]}" CARGO_BUILD_JOBS="$BUILD_JOBS" RUSTFLAGS="-C relro-level=partial" \
+        make --no-print-directory BLK=1 NET=1 INPUT=1 GPU=0 'FEATURE_FLAGS=--locked --features blk,net,input' )
+elif [[ -n "${LINUX_GLIBC:-}" ]]; then
     # The Makefile's `cargo build --features ...`, linked against an older glibc
     # by zig, under the Makefile's versioned file name.
     command -v cargo-zigbuild >/dev/null 2>&1 \
@@ -217,5 +255,7 @@ echo ""
 echo "=== done: ${LIBDIR} ==="
 ls -la "$LIBDIR"
 echo ""
-echo "Commit (these are git-LFS tracked via .gitattributes 'lib/linux-aarch64/*.so'):"
-echo "  git add ${LIBDIR} && git commit -m 'feat: linux-${ARCH} libkrun/libkrunfw libs'"
+if [[ "$VERIFIED_SOURCE" != "1" ]]; then
+    echo "Commit (these are git-LFS tracked via .gitattributes 'lib/linux-aarch64/*.so'):"
+    echo "  git add ${LIBDIR} && git commit -m 'feat: linux-${ARCH} libkrun/libkrunfw libs'"
+fi
