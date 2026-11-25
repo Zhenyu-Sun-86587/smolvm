@@ -2,6 +2,7 @@
 use crate::client::{OperationReceipt, QueryError};
 pub use crate::ipc::Expected as ExecutionRef;
 use crate::ipc::{self, valid_digest, valid_id, PROTOCOL};
+use crate::network_client::{TapLease, WorkerNetworkScope};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -483,6 +484,81 @@ impl Client<'_> {
             return Err(fault("E_STALE_EXECUTION", "fork target changed"));
         }
         Ok(v["phase"] == "released")
+    }
+
+    pub fn prepare_managed_network(
+        &self,
+        prior: &ExecutionRef,
+        plan: &crate::managed::Plan,
+    ) -> Result<Option<WorkerNetworkScope>, QueryError> {
+        let Some(attachment_id) = plan.network_attachment_id() else {
+            return Ok(None);
+        };
+        let launch = &plan.launch;
+        let lease: TapLease = self.call(
+            "PrepareManagedLaunchNetwork",
+            Some(prior),
+            Some((&launch.operation_id, &launch.request_digest)),
+            empty(),
+        )?;
+        let incarnation = launch
+            .execution
+            .incarnation_id
+            .clone()
+            .filter(|id| valid_id(id));
+        if lease.attachment.attachment_id != attachment_id
+            || lease.attachment.schema != "NetworkAttachment/1"
+            || lease.route_id != "deep"
+            || lease.bundle_digest != self.bundle
+            || lease.operation_id != launch.operation_id
+            || lease.instance_id != launch.execution.instance_id
+            || lease.state != "quarantined"
+            || lease.gate != "closed"
+            || lease.revision < 1
+            || !valid_id(&lease.lease_id)
+            || lease.incarnation_id.is_some()
+            || lease.execution_epoch.is_some()
+        {
+            return Err(fault(
+                "E_PROTOCOL_UNSUPPORTED",
+                "incorrect network preparation",
+            ));
+        }
+        Ok(Some(WorkerNetworkScope {
+            socket: self.socket.into(),
+            bundle_digest: self.bundle.into(),
+            operation_id: launch.operation_id.clone(),
+            request_digest: launch.request_digest.clone(),
+            instance_id: launch.execution.instance_id.clone(),
+            incarnation_id: incarnation
+                .ok_or_else(|| fault("E_INVALID_REQUEST", "missing launch incarnation"))?,
+            execution_epoch: launch.execution.execution_epoch,
+            attachment_id,
+        }))
+    }
+
+    pub fn fence_managed_network(&self, plan: &crate::managed::Plan) -> Result<(), QueryError> {
+        let Some(attachment_id) = plan.network_attachment_id() else {
+            return Ok(());
+        };
+        let launch = &plan.launch;
+        let expected = ExecutionRef {
+            instance_id: launch.execution.instance_id.clone(),
+            incarnation_id: None,
+            execution_epoch: launch.execution.execution_epoch - 1,
+        };
+        let result: Result<Value, _> = self.call(
+            "FenceNetworkAttachment",
+            Some(&expected),
+            Some((&launch.operation_id, &launch.request_digest)),
+            json!({"attachment_id":attachment_id}),
+        );
+        match result {
+            Ok(result) if result["fenced"] == true => Ok(()),
+            Ok(_) => Err(fault("E_PROTOCOL_UNSUPPORTED", "incorrect network fence")),
+            Err(error) if error.code == "E_NOT_FOUND" => Ok(()),
+            Err(error) => Err(error),
+        }
     }
     pub fn managed_disks(
         &self,

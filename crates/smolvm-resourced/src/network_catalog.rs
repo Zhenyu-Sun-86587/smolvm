@@ -8,9 +8,9 @@ use std::net::Ipv4Addr;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RegisterNetwork {
-    network_id: String,
-    route_domain_id: String,
-    cidr: String,
+    pub(crate) network_id: String,
+    pub(crate) route_domain_id: String,
+    pub(crate) cidr: String,
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
@@ -168,6 +168,33 @@ fn unallocated_ipv4(db: &Connection, network: &str, first: u32, last: u32) -> Re
 }
 
 impl Catalog {
+    pub(crate) fn reserve_managed_network(
+        &mut self,
+        request: &Request,
+        attachment_id: &str,
+        dns_name: &str,
+        network: &crate::managed::Network,
+    ) -> Result<NetworkReservation> {
+        let prior = lookup(&self.db, attachment_id)?;
+        let fixed = network.fixed_route();
+        self.reserve_network(
+            request,
+            &ReserveNetwork {
+                attachment_id: attachment_id.into(),
+                network_id: network.network_id.clone(),
+                device_id: "net0".into(),
+                mode: if fixed.is_some() {
+                    Mode::FixedInternal
+                } else {
+                    Mode::Native
+                },
+                guest_ipv4: fixed.map(|(guest, _, _)| guest),
+                rebind_revision: prior.map(|before| before.revision),
+                dns_name: Some(dns_name.into()),
+            },
+        )
+    }
+
     pub(crate) fn private_network_prefix(&self, network_id: &str) -> Result<u8> {
         let cidr = self.db.query_row(
             "SELECT cidr FROM private_networks WHERE network_id=?",

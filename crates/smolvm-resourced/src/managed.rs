@@ -7,6 +7,33 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::net::Ipv4Addr;
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Network {
+    pub network_id: String,
+    pub route_domain_id: String,
+    pub cidr: String,
+    pub mode: NetworkMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    Native,
+    FixedInternal,
+}
+
+impl Network {
+    pub(crate) fn fixed_route(&self) -> Option<(Ipv4Addr, Ipv4Addr, u8)> {
+        (self.mode == NetworkMode::FixedInternal).then_some((
+            Ipv4Addr::new(10, 0, 2, 15),
+            Ipv4Addr::new(10, 0, 2, 2),
+            24,
+        ))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +59,8 @@ pub struct Machine {
     pub init: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<Network>,
 }
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -123,6 +152,15 @@ impl Machine {
             .map(|id| plan(c, &c.operation(&id)?))
             .transpose()?
             .flatten();
+        if previous
+            .as_ref()
+            .is_some_and(|p| p.machine.network != self.network)
+        {
+            return Err(Fault::new(
+                "E_NETWORK_ATTACHMENT_CONFLICT",
+                "managed network changes require a separate attachment operation",
+            ));
+        }
         if previous.as_ref().is_some_and(|p| {
             p.machine.boot_profile != self.boot_profile
                 || p.machine
@@ -254,6 +292,13 @@ impl Machine {
     }
 }
 impl Plan {
+    pub fn network_attachment_id(&self) -> Option<String> {
+        self.machine
+            .network
+            .as_ref()
+            .map(|_| key(&self.launch.execution.instance_id, "net", 0))
+    }
+
     pub(crate) fn heads(&self) -> Vec<VolumeHead> {
         self.devices
             .iter()
@@ -335,6 +380,13 @@ pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<O
         return c.begin(r, "launch");
     }
     let devices = machine.devices(c, id, route, bundle, expected)?;
+    if let Some(network) = &machine.network {
+        c.register_private_network(&crate::network_catalog::RegisterNetwork {
+            network_id: network.network_id.clone(),
+            route_domain_id: network.route_domain_id.clone(),
+            cidr: network.cidr.clone(),
+        })?;
+    }
     let storage = devices
         .iter()
         .filter(|d| !d.disk.read_only)

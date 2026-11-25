@@ -1111,6 +1111,34 @@ impl Worker {
                 .network
                 .prepare(&self.catalog, request)
                 .map(|lease| json!(lease)),
+            "PrepareManagedLaunchNetwork" => {
+                let op = self.catalog.active_operation(request)?;
+                let plan = crate::managed::plan(&self.catalog, &op)?
+                    .ok_or_else(|| Fault::invalid("managed launch intent is required"))?;
+                let attachment_id = plan
+                    .network_attachment_id()
+                    .ok_or_else(|| Fault::invalid("managed launch has no network intent"))?;
+                let network = plan
+                    .machine
+                    .network
+                    .as_ref()
+                    .expect("network attachment ID");
+                let dns = format!("{}.private", crate::managed::key(&op.instance_id, "vm", 0));
+                self.catalog
+                    .reserve_managed_network(request, &attachment_id, &dns, network)?;
+                let fixed = network.fixed_route();
+                let prepare = request.derived(
+                    "PrepareNetworkAttachment",
+                    json!({
+                        "attachment_id":attachment_id,
+                        "guest_gateway_ipv4":fixed.map(|(_, gateway, _)| gateway),
+                        "guest_prefix":fixed.map(|(_, _, prefix)| prefix),
+                    }),
+                );
+                self.network
+                    .prepare(&self.catalog, &prepare)
+                    .map(|lease| json!(lease))
+            }
             "QueryNetworkAttachment" => {
                 crate::network_runtime::NetworkRuntime::query(&self.catalog, request)
                     .map(|lease| json!(lease))
