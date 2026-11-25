@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::path::Path;
 use std::process::{self, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -34,6 +35,7 @@ pub struct PrivateRouter {
     namespace: Arc<File>,
     gateway: Ipv4Addr,
     mask: u32,
+    dns: Option<Arc<crate::network_dns::Resolver>>,
 }
 
 pub struct QuarantinedPort {
@@ -91,6 +93,7 @@ impl PrivateRouter {
             namespace: Arc::new(namespace),
             gateway,
             mask,
+            dns: None,
         };
         ip(
             router.namespace(),
@@ -105,6 +108,18 @@ impl PrivateRouter {
 
     pub(crate) fn idle(&self) -> bool {
         Arc::strong_count(&self.namespace) == 1
+    }
+
+    pub(crate) fn ensure_dns(&mut self, catalog: &Path, network: &str) -> io::Result<()> {
+        if self.dns.is_none() {
+            self.dns = Some(Arc::new(crate::network_dns::Resolver::start(
+                self.namespace(),
+                self.gateway,
+                catalog,
+                network,
+            )?));
+        }
+        Ok(())
     }
 
     /// Connect a TAP through private Linux namespaces. The guest-facing link

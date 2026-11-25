@@ -159,6 +159,14 @@ impl NetworkRuntime {
                 entry.insert(router)
             }
         };
+        if reservation.dns_name.is_some() {
+            let path = catalog.db.path().ok_or_else(|| {
+                Fault::new("E_CATALOG", "private DNS requires the Worker database")
+            })?;
+            router
+                .ensure_dns(std::path::Path::new(path), &reservation.network_id)
+                .map_err(host_error)?;
+        }
         let mac = attachment_mac(reservation.private_ipv4);
         let mut lease_id = [0; 16];
         getrandom::fill(&mut lease_id)
