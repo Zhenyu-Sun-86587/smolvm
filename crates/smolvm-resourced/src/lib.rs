@@ -45,6 +45,8 @@ mod network_runtime;
 #[cfg(target_os = "linux")]
 mod pivots;
 #[cfg(target_os = "linux")]
+mod product_volumes;
+#[cfg(target_os = "linux")]
 mod statepoint_capture;
 #[cfg(target_os = "linux")]
 mod statepoint_catalog;

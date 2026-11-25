@@ -49,6 +49,17 @@ pub struct Client<'a> {
     pub socket: &'a Path,
     pub bundle: &'a str,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductVolumeMutation {
+    pub operation_id: String,
+    pub request_digest: String,
+    pub volume_id: String,
+    pub owner_id: String,
+    pub expected_revision: i64,
+    pub command: Value,
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Launch {
@@ -243,12 +254,11 @@ impl Client<'_> {
         }
         let transport = |e| fault("E_RESOURCED_UNAVAILABLE", e);
         let socket = ipc::connect(self.socket).map_err(transport)?;
-        // A cold launch hashes immutable disk ancestors and the installed VMM.
-        // Only this authenticated client's response deadline is extended.
-        let seconds = if method == "AcquireManagedLaunchDisks" {
-            90
-        } else {
-            20
+        // Disk reattachment and volume mutation can hash a complete backing.
+        let seconds = match method {
+            "ApplyProductVolume" => 120,
+            "AcquireManagedLaunchDisks" => 90,
+            _ => 20,
         };
         socket
             .set_read_timeout(Some(std::time::Duration::from_secs(seconds)))
@@ -474,6 +484,63 @@ impl Client<'_> {
             &input.expected,
             json!({"kind":input.kind,"parameters":input.parameters}),
         )
+    }
+
+    pub fn product_volume(&self, volume: &str, owner: &str) -> Result<Value, QueryError> {
+        if !valid_id(volume) || !valid_id(owner) {
+            return Err(fault("E_INVALID_REQUEST", "invalid volume scope"));
+        }
+        let expected = ExecutionRef {
+            instance_id: volume.into(),
+            incarnation_id: None,
+            execution_epoch: 0,
+        };
+        let result: Value = self.call(
+            "QueryProductVolume",
+            Some(&expected),
+            None,
+            json!({"volume_id":volume,"owner_id":owner}),
+        )?;
+        self.verify_volume(&result, volume, owner)?;
+        Ok(result)
+    }
+
+    pub fn apply_product_volume(&self, input: &ProductVolumeMutation) -> Result<Value, QueryError> {
+        if !valid_id(&input.volume_id) || !valid_id(&input.owner_id) || input.expected_revision < 0
+        {
+            return Err(fault("E_INVALID_REQUEST", "invalid volume operation scope"));
+        }
+        let expected = ExecutionRef {
+            instance_id: input.volume_id.clone(),
+            incarnation_id: None,
+            execution_epoch: 0,
+        };
+        let result: Value = self.call("ApplyProductVolume", Some(&expected), Some((&input.operation_id, &input.request_digest)),
+            json!({"volume_id":input.volume_id,"owner_id":input.owner_id,"expected_revision":input.expected_revision,
+                "command":input.command}))?;
+        self.verify_volume(&result["volume"], &input.volume_id, &input.owner_id)?;
+        if result["schema"] != "VolumeOperation/1" || result["operation_id"] != input.operation_id {
+            return Err(fault(
+                "E_PROTOCOL_UNSUPPORTED",
+                "wrong volume operation receipt",
+            ));
+        }
+        Ok(result)
+    }
+
+    fn verify_volume(&self, result: &Value, volume: &str, owner: &str) -> Result<(), QueryError> {
+        if result["schema"] != "Volume/1"
+            || result["volume_id"] != volume
+            || result["owner_id"] != owner
+            || result["bundle_digest"] != self.bundle
+            || result["route_id"] != "deep"
+        {
+            return Err(fault(
+                "E_PROTOCOL_UNSUPPORTED",
+                "wrong Worker volume receipt",
+            ));
+        }
+        Ok(())
     }
     pub fn cancel(&self, id: &str, input: &Cancellation) -> Result<OperationReceipt, QueryError> {
         self.receipt(

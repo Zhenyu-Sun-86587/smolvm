@@ -339,7 +339,29 @@ impl Worker {
             return Err(stale_execution());
         }
         let mut layouts = Vec::new();
-        for device in &plan.devices {
+        for (slot, device) in plan.machine.disks.iter().zip(&plan.devices) {
+            if let Some(volume) = slot.volume_id.as_deref() {
+                let (current, layers) = crate::product_volumes::launch_device(
+                    &self.catalog,
+                    &execution.route_id,
+                    &execution.bundle_digest,
+                    &execution.instance_id,
+                    execution.execution_epoch,
+                    slot,
+                    volume,
+                )?;
+                if &current != device {
+                    return Err(Fault::new(
+                        "E_STALE_REVISION",
+                        "allocated volume changed after the launch was reserved",
+                    ));
+                }
+                layouts.push(crate::managed::DiskSet {
+                    device: current,
+                    layers,
+                });
+                continue;
+            }
             let id = if let Some(id) = &device.head_id {
                 let spec = plan
                     .head_spec(id)
@@ -833,6 +855,10 @@ impl Worker {
         match request.method.as_str() {
             "Health" => self.catalog.health(),
             "QueryWorkerBudget" => crate::admission::status(&self.catalog.db),
+            "QueryProductVolume" => crate::product_volumes::query(&self.catalog, request),
+            "ApplyProductVolume" => {
+                crate::product_volumes::mutate(&mut self.catalog, &self.objects, request)
+            }
             "BeginStatePointExport" => {
                 let execution = self.scoped_execution(request)?;
                 Ok(json!(self.statepoints.begin(
@@ -1708,6 +1734,7 @@ impl Worker {
         let mut locks = Vec::with_capacity(heads.len());
         let mut registered = Vec::with_capacity(heads.len());
         for head in heads {
+            crate::product_volumes::require_writer(&self.catalog, &head.volume_id, &execution)?;
             self.catalog.require_unsealed_head(&head.head_resource_id)?;
             let wanted = self.catalog.volume_identity(&head)?;
             let (file, identity) = self.open_backing(&head.head_resource_id)?;

@@ -232,9 +232,10 @@ impl Catalog {
                 crate::network_lease_catalog::install_initial_activations(&tx)?;
                 tx.execute_batch(include_str!("schema_statepoints.sql"))?;
                 tx.execute_batch(include_str!("schema_managed_launch.sql"))?;
-                tx.execute_batch("PRAGMA user_version=11")?;
+                tx.execute_batch(include_str!("schema_product_volumes.sql"))?;
+                tx.execute_batch("PRAGMA user_version=12")?;
             }
-            1..=11 => {
+            1..=12 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -261,11 +262,13 @@ impl Catalog {
                 }
                 if version < 10 {
                     tx.execute_batch(include_str!("schema_statepoints.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=10")?;
                 }
                 if version < 11 {
                     tx.execute_batch(include_str!("schema_managed_launch.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=11")?;
+                }
+                if version < 12 {
+                    tx.execute_batch(include_str!("schema_product_volumes.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=12")?;
                 }
                 crate::network_lease_catalog::recover(&tx)?;
                 crate::activation_catalog::recover(&tx)?;
@@ -895,6 +898,8 @@ impl Catalog {
                 | "statepoint_checkpoint"
                 | "statepoint_hibernate"
                 | "statepoint_rescue"
+                | "product_snapshot"
+                | "product_attachment"
         ) {
             return Err(Fault::invalid(
                 "this root kind is controlled by the resource protocol",
