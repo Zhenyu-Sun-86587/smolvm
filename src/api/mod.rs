@@ -615,6 +615,12 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .nest("/volumes", volume_routes)
         .nest("/cache-bases", cache_base_routes);
 
+    #[cfg(target_os = "linux")]
+    let api_v1 = api_v1.route(
+        "/runtime-ext/v1/capabilities",
+        get(crate::runtime_ext::capabilities),
+    );
+
     let cors = build_cors(cors_origins);
 
     // Prometheus metrics

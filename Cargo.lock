@@ -4364,6 +4364,7 @@ dependencies = [
  "smolvm-paths",
  "smolvm-protocol",
  "smolvm-registry",
+ "smolvm-runtime-protocol",
  "smolvm-tar",
  "socket2",
  "tempfile",
@@ -4595,6 +4596,15 @@ dependencies = [
  "tokio-util",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "smolvm-runtime-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

@@ -1,0 +1,44 @@
+//! Deep Runtime Bundle negotiation over the existing full Serve listener.
+use crate::api::error::ApiError;
+use axum::Json;
+use sha2::{Digest, Sha256};
+use smolvm_runtime_protocol::Handshake;
+use std::{
+    fs::File,
+    io::{BufReader, Read},
+};
+
+static CAPABILITIES: tokio::sync::OnceCell<Handshake> = tokio::sync::OnceCell::const_new();
+
+fn installed() -> Result<Handshake, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let root = exe.parent().ok_or("missing bundle directory")?;
+    let file = File::open(root.join("runtime-bundle.json"))
+        .map_err(|_| "no installed RuntimeBundle/1 manifest")?;
+    const LIMIT: u64 = 16 << 20;
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > LIMIT {
+        return Err("bundle manifest exceeds size limit".into());
+    }
+    let manifest = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let mut hash = Sha256::new();
+    let mut running = BufReader::new(File::open("/proc/self/exe").map_err(|e| e.to_string())?);
+    std::io::copy(&mut running, &mut hash).map_err(|e| e.to_string())?;
+    smolvm_runtime_protocol::handshake(manifest, &format!("{:x}", hash.finalize()))
+        .map_err(str::to_owned)
+}
+
+pub(crate) async fn capabilities() -> Result<Json<&'static Handshake>, ApiError> {
+    CAPABILITIES
+        .get_or_try_init(|| async {
+            tokio::task::spawn_blocking(installed)
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(ApiError::Unavailable)
+        })
+        .await
+        .map(Json)
+}
