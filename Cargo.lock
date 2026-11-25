@@ -4599,6 +4599,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "smolvm-resourced"
+version = "1.37.2"
+dependencies = [
+ "clap",
+ "getrandom 0.3.4",
+ "hex",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2",
+ "tempfile",
+]
+
+[[package]]
 name = "smolvm-runtime-protocol"
 version = "0.1.0"
 dependencies = [
