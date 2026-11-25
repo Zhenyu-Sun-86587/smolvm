@@ -179,6 +179,9 @@ impl NetworkRuntime {
         // Record the durable offer before handing the fd to the socket. An
         // uncertain send leaves the address and original queue pinned.
         let lease = catalog.offer_tap(execution, &data.attachment_id)?;
+        if lease.gate != "closed" {
+            return Err(unknown_attachment());
+        }
         Ok((lease, fd))
     }
 
@@ -207,6 +210,63 @@ impl NetworkRuntime {
         self.ports
             .get(&binding.target.attachment.attachment_id)
             .ok_or_else(unknown_attachment)
+    }
+
+    pub(crate) fn publish_initial(
+        &self,
+        catalog: &Catalog,
+        request: &Request,
+        execution: &Execution,
+        verify_process: impl Fn() -> Result<()>,
+    ) -> Result<TapLease> {
+        let data: Acknowledge = request.payload()?;
+        let operation = catalog.matching_operation(request)?;
+        if operation.kind != "launch" || operation.operation_id != execution.last_operation_id {
+            return Err(Fault::invalid(
+                "only a cold execution uses initial network activation",
+            ));
+        }
+        let lease = catalog.tap_lease(&data.attachment_id)?;
+        if !lease.matches(execution) || lease.lease_id != data.lease_id {
+            return Err(Fault::new(
+                "E_STALE_EXECUTION",
+                "network attachment is outside this launch",
+            ));
+        }
+        if lease.revision != data.expected_revision {
+            return Err(Fault::new(
+                "E_STALE_REVISION",
+                "network lease revision changed",
+            ));
+        }
+        if lease.state != "attached" {
+            return Err(unknown_attachment());
+        }
+        if lease.gate == "open" {
+            return Ok(lease);
+        }
+        catalog.ready()?;
+        catalog.active_operation(request)?;
+        let port = self
+            .ports
+            .get(&data.attachment_id)
+            .ok_or_else(unknown_attachment)?;
+        match lease.gate.as_str() {
+            "closed" => catalog.record_initial_network_activation(&lease)?,
+            "opening" => {}
+            _ => return Err(unknown_attachment()),
+        }
+        let published = port.arm_identity().map_err(host_error).and_then(|()| {
+            verify_process()?;
+            port.publish_identity().map_err(host_error)?;
+            verify_process()?;
+            catalog.finish_initial_network_activation(&lease, "open")
+        });
+        if published.is_err() && port.close_identity().is_err() {
+            catalog.finish_initial_network_activation(&lease, "unknown")?;
+        }
+        published?;
+        catalog.tap_lease(&data.attachment_id)
     }
 
     pub(crate) fn arm_target(&self, binding: &NetworkBinding) -> Result<()> {
@@ -240,13 +300,35 @@ impl NetworkRuntime {
         if lease.operation_id != reservation.operation_id || lease.state == "unknown" {
             return Err(unknown_attachment());
         }
+        self.retire_port(catalog, &lease)
+    }
+
+    pub(crate) fn fence_execution(
+        &mut self,
+        catalog: &Catalog,
+        execution: &Execution,
+        current_boot_id: &str,
+    ) -> Result<()> {
+        for lease in catalog.tap_leases_for_execution(execution)? {
+            if lease.host_boot_id != current_boot_id {
+                // The port, TAP and router were kernel objects of the previous boot.
+                catalog.retire_fenced_tap(&lease)?;
+            } else if lease.state != "unknown" {
+                self.retire_port(catalog, &lease)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn retire_port(&mut self, catalog: &Catalog, lease: &TapLease) -> Result<()> {
+        let attachment_id = &lease.attachment.attachment_id;
         let port = self
             .ports
-            .get_mut(&data.attachment_id)
+            .get_mut(attachment_id)
             .ok_or_else(unknown_attachment)?;
         port.fence().map_err(host_error)?;
-        catalog.retire_fenced_tap(&lease)?;
-        self.ports.remove(&data.attachment_id);
+        catalog.retire_fenced_tap(lease)?;
+        self.ports.remove(attachment_id);
         let domain = &lease.attachment.route_domain_id;
         if self.routers.get(domain).is_some_and(PrivateRouter::idle) {
             self.routers.remove(domain);

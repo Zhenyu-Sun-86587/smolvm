@@ -205,7 +205,7 @@ impl KrunFunctions {
         &self,
         context: u32,
         scope: &smolvm_resourced::network_client::WorkerNetworkScope,
-    ) -> Result<(), String> {
+    ) -> Result<smolvm_resourced::network_client::TapLease, String> {
         use std::os::fd::AsFd;
         let (lease, tap) = scope.acquire().map_err(|error| error.to_string())?;
         let digest = lease
@@ -219,10 +219,7 @@ impl KrunFunctions {
             0,
             digest,
         )?;
-        scope
-            .acknowledge(&lease)
-            .map_err(|error| error.to_string())?;
-        Ok(())
+        scope.acknowledge(&lease).map_err(|error| error.to_string())
     }
 
     /// Register a Worker TAP prepared for this exact launch. The caller must

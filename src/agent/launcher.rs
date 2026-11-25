@@ -656,8 +656,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     )
 }
 
-/// Boot an already registered Worker execution with its quarantined network
-/// attachment. Guest identity reconfiguration and publication are separate.
+/// Cold-boot a registered Worker execution with its exact network attachment.
+/// Restored executions obtain network publication through Guest activation.
 #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
 pub fn launch_agent_vm_with_worker_network(
     config: &LaunchConfig<'_>,
@@ -724,6 +724,7 @@ fn launch_agent_vm_inner(
             || credentials.is_some()
             || external_interceptor.is_some()
             || *dns_filter_enabled
+            || std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some()
             || resources.network_name.is_some()
             || resources
                 .network_backend
@@ -731,7 +732,7 @@ fn launch_agent_vm_inner(
     {
         return Err(Error::config(
             "Worker attachment",
-            "requires a dedicated private IPv4 configuration",
+            "requires a cold boot with a dedicated private IPv4 configuration",
         ));
     }
     // `pod_net` drives the Linux-only pod netns-tap datapath; on other targets the
@@ -1182,7 +1183,7 @@ fn launch_agent_vm_inner(
         #[cfg(target_os = "linux")]
         let mut netns_bridge: Option<smolvm_network::netns_tap::NetnsTapBridge> = None;
         #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
-        let worker_attached = if let Some(scope) = worker_network {
+        let worker_lease = if let Some(scope) = worker_network {
             if krun_add_vsock(ctx, 0) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
@@ -1190,14 +1191,18 @@ fn launch_agent_vm_inner(
                     "krun_add_vsock failed",
                 ));
             }
-            if let Err(error) = krun.attach_prepared_worker_network(ctx, scope) {
-                krun_free_ctx(ctx);
-                return Err(Error::agent("configure Worker attachment", error));
+            match krun.attach_prepared_worker_network(ctx, scope) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent("configure Worker attachment", error));
+                }
             }
-            true
         } else {
-            false
+            None
         };
+        #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+        let worker_attached = worker_lease.is_some();
         #[cfg(not(all(target_os = "linux", feature = "deep-runtime")))]
         let worker_attached = false;
         let guest_network: Option<GuestNetworkConfig> = match (
@@ -2708,12 +2713,35 @@ fn launch_agent_vm_inner(
         // Guest-network env vars — virtio-net interface config plus the TSI
         // `--dns` override — are built in one shared place so the static and
         // dynamic launchers can't diverge (see `agent::guest_network_env`).
-        env_strings.extend(crate::agent::guest_network_env(
-            guest_network,
-            resources.dns,
-            &resources.dns_options,
-            pod_net.as_ref().and_then(|p| p.gateway_mac),
-        ));
+        #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+        if let Some(lease) = &worker_lease {
+            let attachment = &lease.attachment;
+            let dns = resources.dns.unwrap_or(attachment.gateway_ipv4);
+            let network_env = [
+                (guest_env::BACKEND, guest_env::BACKEND_VIRTIO_NET.to_owned()),
+                (guest_env::GUEST_IP, attachment.guest_ipv4.to_string()),
+                (guest_env::GATEWAY, attachment.gateway_ipv4.to_string()),
+                (guest_env::PREFIX_LEN, attachment.guest_prefix.to_string()),
+                (guest_env::GUEST_MAC, super::format_mac(attachment.mac)),
+                (guest_env::DNS, dns.to_string()),
+            ];
+            env_strings.extend(network_env.into_iter().map(|(key, value)| cstr(&format!("{key}={value}"))));
+            if !resources.dns_options.is_empty() {
+                env_strings.push(cstr(&format!(
+                    "{}={}",
+                    guest_env::DNS_OPTIONS,
+                    resources.dns_options.join(" ")
+                )));
+            }
+        }
+        if !worker_attached {
+            env_strings.extend(crate::agent::guest_network_env(
+                guest_network,
+                resources.dns,
+                &resources.dns_options,
+                pod_net.as_ref().and_then(|p| p.gateway_mac),
+            ));
+        }
         env_strings.extend(crate::agent::guest_idle_poll_env());
         env_strings.extend(crate::agent::guest_workload_env(
             resources.shm_size.as_deref(),
@@ -2869,6 +2897,14 @@ fn launch_agent_vm_inner(
                 vsock_socket.to_path_buf(),
                 dir.join(crate::agent::manager::PRESSURE_FILE),
             );
+        }
+
+        #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+        if let Some((scope, lease)) = worker_network.zip(worker_lease.as_ref()) {
+            if let Err(error) = scope.publish_initial(lease) {
+                krun_free_ctx(ctx);
+                return Err(Error::agent("publish Worker attachment", error.to_string()));
+            }
         }
 
         // Start VM (this replaces the process on success)

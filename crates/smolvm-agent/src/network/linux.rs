@@ -86,6 +86,8 @@ pub fn configure_interface(
     bring_interface_up(ifname)?;
     if let Some(gateway_mac) = gateway_mac {
         add_neigh_static_v4(gateway, gateway_mac, ifindex)?;
+    }
+    if prefix_len == 32 || gateway_mac.is_some() {
         add_onlink_route_v4(gateway, ifindex)?;
     }
     add_default_route_v4(gateway, ifindex)?;

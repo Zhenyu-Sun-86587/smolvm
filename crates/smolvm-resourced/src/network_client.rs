@@ -78,6 +78,33 @@ impl WorkerNetworkScope {
         Ok(attached)
     }
 
+    /// Publish the acknowledged lease of a cold execution. A restored target
+    /// can open its port only through the private Guest activation authority.
+    pub fn publish_initial(&self, lease: &TapLease) -> Result<TapLease, QueryError> {
+        let (response, fds) = self.call(
+            "PublishInitialNetworkAttachment",
+            json!({
+                "attachment_id": self.attachment_id,
+                "lease_id": lease.lease_id,
+                "expected_revision": lease.revision,
+            }),
+        )?;
+        if !fds.is_empty() || !response.fd_table.is_empty() {
+            return Err(protocol("unexpected descriptor in network publication"));
+        }
+        let published = self.checked_lease(response)?;
+        if published.state != "attached"
+            || published.gate != "open"
+            || published.lease_id != lease.lease_id
+            || published.revision != lease.revision
+            || published.attachment != lease.attachment
+            || published.broker_session_id != lease.broker_session_id
+        {
+            return Err(protocol("network publication changed the lease"));
+        }
+        Ok(published)
+    }
+
     fn checked_lease(&self, mut response: Response) -> Result<TapLease, QueryError> {
         let lease = response
             .result

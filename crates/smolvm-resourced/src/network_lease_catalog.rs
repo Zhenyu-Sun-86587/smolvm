@@ -70,6 +70,11 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn install_initial_activations(db: &Connection) -> Result<()> {
+    db.execute_batch(include_str!("schema_initial_network_activations.sql"))?;
+    Ok(())
+}
+
 pub(crate) fn recover(db: &Connection) -> Result<()> {
     // Quarantined rows had never been sent, so this new broker can prepare a
     // replacement. Offers can remain with a live process after broker loss.
@@ -94,7 +99,7 @@ fn read(db: &Connection, id: &str) -> Result<Option<TapLease>> {
                       AND a.incarnation_id=network_tap_leases.incarnation_id
                       AND a.execution_epoch=network_tap_leases.execution_epoch
                       AND json_extract(a.binding_json, '$.network.target.lease_id')=network_tap_leases.lease_id
-                  ),'closed')
+                  ), (SELECT phase FROM initial_network_activations WHERE lease_id=network_tap_leases.lease_id), 'closed')
                   ELSE 'closed'
                 END
          FROM network_tap_leases WHERE attachment_id=? AND state<>'retired'",
@@ -125,6 +130,64 @@ fn owned(db: &Connection, attachment_id: &str) -> Result<TapLease> {
 impl Catalog {
     pub(crate) fn tap_lease(&self, attachment_id: &str) -> Result<TapLease> {
         owned(&self.db, attachment_id)
+    }
+
+    pub(crate) fn tap_leases_for_execution(&self, execution: &Execution) -> Result<Vec<TapLease>> {
+        let mut statement = self.db.prepare(
+            "SELECT attachment_id FROM network_tap_leases
+             WHERE incarnation_id=? AND execution_epoch=? AND state<>'retired'",
+        )?;
+        let mut leases = Vec::new();
+        for attachment in statement.query_map(
+            params![execution.incarnation_id, execution.execution_epoch],
+            |row| row.get::<_, String>(0),
+        )? {
+            let lease = owned(&self.db, &attachment?)?;
+            if !lease.matches(execution) {
+                return Err(Fault::new(
+                    "E_FENCE_UNPROVEN",
+                    "recorded TAP belongs to another execution",
+                ));
+            }
+            leases.push(lease);
+        }
+        Ok(leases)
+    }
+
+    pub(crate) fn record_initial_network_activation(&self, lease: &TapLease) -> Result<()> {
+        let inserted = self.db.execute(
+            "INSERT INTO initial_network_activations
+             SELECT tap.lease_id,'opening' FROM network_tap_leases tap
+             JOIN operations op USING(operation_id)
+             WHERE tap.lease_id=? AND tap.revision=? AND tap.state='attached' AND op.kind='launch'",
+            params![lease.lease_id, lease.revision],
+        )?;
+        if inserted != 1 {
+            return Err(Fault::new(
+                "E_FENCE_UNPROVEN",
+                "initial network lease changed",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_initial_network_activation(
+        &self,
+        lease: &TapLease,
+        phase: &str,
+    ) -> Result<()> {
+        let changed = self.db.execute(
+            "UPDATE initial_network_activations SET phase=?
+             WHERE lease_id=? AND phase='opening'",
+            params![phase, lease.lease_id],
+        )?;
+        if changed != 1 {
+            return Err(Fault::new(
+                "E_FENCE_UNPROVEN",
+                "initial network decision changed",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn record_quarantined_tap(
