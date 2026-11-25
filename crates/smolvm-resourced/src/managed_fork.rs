@@ -524,8 +524,8 @@ impl Actor {
             }
             "failure_return" => {
                 let inv=ep.inventory()?;
-                if inv.source_disposition=="HELD" {
-                    ep.command(&format!("CAPTURE_FINISH {scope} RETURN_STANDBY"))?;
+                if matches!(inv.source_disposition.as_str(), "HELD" | "FAILED_HELD") {
+                    ep.command(&format!("CAPTURE_CANCEL {scope}"))?;
                     return Ok(());
                 }
                 if inv.source_disposition=="STANDBY" && j.original=="RUNNING" {
@@ -539,15 +539,17 @@ impl Actor {
             }
             "holding" => {
                 let status = match ep.command(&format!("CAPTURE_PREPARE {scope} parked")) {
-                    Err(fault) if fault.code=="E_NATIVE_REFUSED" && fault.message.starts_with("ENOTSUP") => {
+                    Err(fault) if fault.code=="E_NATIVE_REFUSED" && (fault.message.starts_with("ENOTSUP") || fault.message.starts_with("EIO held capture:")) => {
                         c.db.execute("UPDATE managed_fork_batches SET stage='failure_return',error=? WHERE operation_id=? AND stage='holding'",params![fault.message,j.id])?;
                         return Ok(())
                     }
                     result=>result?
                 };
-                if serde_json::from_str::<Value>(&status).map_err(invalid)?["source_disposition"]
-                    == "HELD"
-                {
+                let status = serde_json::from_str::<Value>(&status).map_err(invalid)?;
+                if status["phase"] == "failed" {
+                    let reason = status["error"].as_str().unwrap_or("native source failed to reach the capture boundary");
+                    c.db.execute("UPDATE managed_fork_batches SET stage='failure_return',error=? WHERE operation_id=? AND stage='holding'",params![reason,j.id])?;
+                } else if status["source_disposition"] == "HELD" {
                     j.advance(
                         c,
                         if j.pivot.is_some() {
