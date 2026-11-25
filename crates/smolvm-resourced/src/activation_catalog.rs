@@ -558,6 +558,38 @@ fn writer_digest(catalog: &Catalog, execution: &Execution) -> Result<String> {
     digest(&evidence)
 }
 
+/// A same-slot StatePoint restore may reuse the private address after the
+/// stopped predecessor and its TAP have both been fenced by the Worker.
+fn stable_network_rebind(
+    catalog: &Catalog,
+    resource: &str,
+    source: &SourceCapture,
+    old: &BoundTap,
+    new: &TapLease,
+    execution: &Execution,
+) -> Result<bool> {
+    if old.attachment != new.attachment || old.lease_id == new.lease_id {
+        return Ok(false);
+    }
+    Ok(catalog.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_state_restores r
+          JOIN statepoints captured ON captured.capture_id=r.capture_id
+          JOIN statepoints fenced ON fenced.capture_id=coalesce(r.rescue_capture_id,r.capture_id)
+          JOIN executions predecessor ON predecessor.incarnation_id=fenced.source_incarnation_id
+          JOIN network_tap_leases old ON old.lease_id=?3 AND old.incarnation_id=captured.source_incarnation_id
+          JOIN network_attachments address ON address.attachment_id=old.attachment_id
+          WHERE r.operation_id=?1 AND captured.representation_id=?2 AND captured.source_incarnation_id=?4
+            AND old.state='retired' AND old.instance_id=?5 AND old.route_id=?6 AND old.bundle_digest=?7
+            AND address.state='reserved' AND address.operation_id=r.operation_id AND address.instance_id=?5
+            AND predecessor.instance_id=?5 AND predecessor.route_id=?6 AND predecessor.bundle_digest=?7
+            AND predecessor.phase='exited' AND predecessor.execution_epoch=?8-1
+            AND fenced.phase='hibernated' AND json_extract(fenced.export_json,'$.purpose') IN ('hibernate','rollback_rescue'))",
+        params![execution.last_operation_id,resource,old.lease_id,source.incarnation_id,execution.instance_id,
+            execution.route_id,execution.bundle_digest,execution.execution_epoch],
+        |row| row.get(0),
+    )?)
+}
+
 fn network_binding(
     catalog: &Catalog,
     resource: &str,
@@ -589,8 +621,7 @@ fn network_binding(
     match (old, targets.as_slice(), input) {
         (None, [], None) => Ok(None),
         (Some(old), [new], Some(input)) => {
-            if input.source_attachment_id == input.target_attachment_id
-                || !valid_id(&input.source_attachment_id)
+            if !valid_id(&input.source_attachment_id)
                 || !valid_id(&input.target_attachment_id)
                 || input.uplink_name.is_empty()
                 || input.uplink_name.len() >= libc::IFNAMSIZ
@@ -611,15 +642,20 @@ fn network_binding(
                 || new.attachment.attachment_id != input.target_attachment_id
                 || old.attachment.mode != new.attachment.mode
                 || old.attachment.device_id != new.attachment.device_id
-                || old.attachment.mac == new.attachment.mac
-                || old.attachment.private_ipv4 == new.attachment.private_ipv4
                 || (has_attestation
                     && (input.dns_ipv4 != new.attachment.gateway_ipv4
                         || input.uplink_name != "eth0"))
             {
                 return Err(tap_fence(
-                    "source and target TAP leases do not match the fork placement",
+                    "source and target TAP leases do not match the activation placement",
                 ));
+            }
+            if input.source_attachment_id == input.target_attachment_id {
+                if !has_attestation || !stable_network_rebind(catalog, resource, source, &old, new, execution)? {
+                    return Err(tap_fence("stable network identity requires a fenced StatePoint predecessor"));
+                }
+            } else if old.attachment.mac == new.attachment.mac || old.attachment.private_ipv4 == new.attachment.private_ipv4 {
+                return Err(tap_fence("a distinct target needs its own private address and MAC"));
             }
             Ok(Some(NetworkBinding {
                 source: old,
