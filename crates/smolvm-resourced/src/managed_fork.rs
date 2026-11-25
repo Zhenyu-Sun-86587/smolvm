@@ -89,6 +89,7 @@ pub(crate) fn submit(
     {
         return Err(Fault::new("E_STALE_EXECUTION", "fork source changed"));
     }
+    crate::product_volumes::require_capture_policy(c, &source, true)?;
     let start = c.operation(&source.last_operation_id)?;
     let template = crate::managed::plan(c, &start)?.ok_or_else(|| {
         Fault::new(
@@ -450,9 +451,11 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
         let mut machine = base.clone();
         machine.name = name.clone();
         for d in &mut machine.disks {
+            d.volume_id = None;
             d.generation_id = disks.get(&d.device_id).ok_or_else(||conflict("capture omits declared disk"))?.0.clone();
         }
-        let mut devices=machine.devices(c,&op,&instance)?;
+        let expected = crate::ipc::Expected { instance_id: instance.clone(), incarnation_id: None, execution_epoch: 0 };
+        let mut devices = machine.devices(c, &op, &parent.route_id, &parent.bundle_digest, &expected)?;
         for device in &mut devices {
             if device.disk.read_only {
                 device.volume_id=disks.get(&device.disk.device_id).ok_or_else(||conflict("captured read-only volume missing"))?.1.clone();

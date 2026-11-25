@@ -235,10 +235,12 @@ impl Catalog {
                 crate::network_lease_catalog::install_initial_activations(&tx)?;
                 tx.execute_batch(include_str!("schema_statepoints.sql"))?;
                 tx.execute_batch(include_str!("schema_managed_launch.sql"))?;
+                tx.execute_batch(include_str!("schema_product_volumes.sql"))?;
+                tx.execute_batch(include_str!("schema_network_dns.sql"))?;
                 tx.execute_batch(include_str!("schema_managed_forks.sql"))?;
                 tx.execute_batch("PRAGMA user_version=14")?;
             }
-            1..=11 | 14 => {
+            1..=14 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -265,11 +267,16 @@ impl Catalog {
                 }
                 if version < 10 {
                     tx.execute_batch(include_str!("schema_statepoints.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=10")?;
                 }
                 if version < 11 {
                     tx.execute_batch(include_str!("schema_managed_launch.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=11")?;
+                }
+                if version < 12 {
+                    tx.execute_batch(include_str!("schema_product_volumes.sql"))?;
+                }
+                if version < 13 {
+                    tx.execute_batch(include_str!("schema_network_dns.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=13")?;
                 }
                 if version < 14 {
                     tx.execute_batch(include_str!("schema_managed_forks.sql"))?;
@@ -912,6 +919,10 @@ impl Catalog {
                 | "statepoint_checkpoint"
                 | "statepoint_hibernate"
                 | "statepoint_rescue"
+                | "fork_capture"
+                | "managed_execution"
+                | "product_snapshot"
+                | "product_attachment"
         ) {
             return Err(Fault::invalid(
                 "this root kind is controlled by the resource protocol",

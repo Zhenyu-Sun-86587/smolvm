@@ -38,6 +38,7 @@ pub(crate) struct ReserveNetwork {
     mode: Mode,
     guest_ipv4: Option<Ipv4Addr>,
     rebind_revision: Option<i64>,
+    dns_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -67,6 +68,7 @@ pub(crate) struct NetworkReservation {
     pub(crate) guest_ipv4: Ipv4Addr,
     pub(crate) state: String,
     revision: i64,
+    pub(crate) dns_name: Option<String>,
 }
 
 struct Prefix {
@@ -120,6 +122,7 @@ fn scan_reservation(row: &Row<'_>) -> rusqlite::Result<NetworkReservation> {
         guest_ipv4: Ipv4Addr::from(row.get::<_, u32>(9)?),
         state: row.get(10)?,
         revision: row.get(11)?,
+        dns_name: row.get(12)?,
     })
 }
 
@@ -130,8 +133,9 @@ fn lookup(db: &Connection, id: &str) -> Result<Option<NetworkReservation>> {
     Ok(db
         .query_row(
             "SELECT a.attachment_id,a.operation_id,a.instance_id,a.network_id,n.route_domain_id,
-                a.device_id,a.mode,n.gateway_ipv4,a.private_ipv4,a.guest_ipv4,a.state,a.revision
+                a.device_id,a.mode,n.gateway_ipv4,a.private_ipv4,a.guest_ipv4,a.state,a.revision,dns.name
          FROM network_attachments a JOIN private_networks n USING(network_id)
+         LEFT JOIN network_dns_names dns USING(attachment_id)
          WHERE a.attachment_id=?",
             [id],
             scan_reservation,
@@ -231,6 +235,10 @@ impl Catalog {
             || data.device_id.len() >= 64
             || (data.mode == Mode::Native) != data.guest_ipv4.is_none()
             || data.guest_ipv4.is_some_and(|address| !address.is_private())
+            || data
+                .dns_name
+                .as_ref()
+                .is_some_and(|name| !crate::network_dns::valid_name(name))
         {
             return Err(Fault::invalid("invalid network attachment profile"));
         }
@@ -238,6 +246,7 @@ impl Catalog {
             if prior.network_id != data.network_id
                 || prior.device_id != data.device_id
                 || prior.mode != data.mode.as_str()
+                || (prior.state != "released" && prior.dns_name != data.dns_name)
                 || data
                     .guest_ipv4
                     .is_some_and(|address| address != prior.guest_ipv4)
@@ -305,6 +314,18 @@ impl Catalog {
                 guest
             ],
         )?;
+        if let Some(name) = &data.dns_name {
+            if tx.execute(
+                "INSERT OR IGNORE INTO network_dns_names VALUES(?,?,?)",
+                params![data.attachment_id, data.network_id, name],
+            )? != 1
+            {
+                return Err(Fault::new(
+                    "E_IDEMPOTENCY_CONFLICT",
+                    "another attachment owns this private DNS name",
+                ));
+            }
+        }
         let reservation = lookup(&tx, &data.attachment_id)?
             .ok_or_else(|| Fault::new("E_CATALOG", "network reservation was not stored"))?;
         tx.commit()?;
@@ -490,6 +511,7 @@ mod tests {
             mode: Mode::Native,
             guest_ipv4: None,
             rebind_revision: None,
+            dns_name: None,
         }
     }
 
@@ -648,6 +670,7 @@ mod tests {
             "network_reservation",
         );
         let mut intent = reserve("endpoint", "stable");
+        intent.dns_name = Some("stable.example.test".to_owned());
         let prior = catalog.reserve_network(&first, &intent).unwrap();
         catalog.finish(&first, false, 1).unwrap();
 
@@ -661,6 +684,7 @@ mod tests {
         let rebound = catalog.reserve_network(&next, &intent).unwrap();
         assert_eq!(rebound.revision, prior.revision + 1);
         assert_eq!(rebound.private_ipv4, prior.private_ipv4);
+        assert_eq!(rebound.dns_name, prior.dns_name);
         assert_eq!(
             catalog.reserve_network(&next, &intent).unwrap().revision,
             rebound.revision

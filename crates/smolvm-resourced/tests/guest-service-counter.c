@@ -2,8 +2,10 @@
 // Link against identity_counter.c compiled with -Dmain=identity_counter.
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -25,6 +27,22 @@ static int endpoint(int kind)
     return fd;
 }
 
+static ssize_t response(char *buffer, size_t size, ssize_t count)
+{
+    const char command[] = "resolve ";
+    if ((size_t)count < sizeof(command) || memcmp(buffer, command, sizeof(command) - 1))
+        return count;
+    buffer[count] = 0;
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM };
+    struct addrinfo *addresses;
+    if (getaddrinfo(buffer + sizeof(command) - 1, NULL, &hints, &addresses))
+        return -1;
+    const struct sockaddr_in *resolved = (struct sockaddr_in *)addresses->ai_addr;
+    const char *result = inet_ntop(AF_INET, &resolved->sin_addr, buffer, size);
+    freeaddrinfo(addresses);
+    return result ? (ssize_t)strlen(result) : -1;
+}
+
 static void serve(void)
 {
     struct pollfd sockets[] = {
@@ -38,7 +56,9 @@ static void serve(void)
         if (sockets[0].revents & POLLIN) {
             int accepted = accept4(sockets[0].fd, NULL, NULL, SOCK_CLOEXEC);
             if (accepted >= 0) {
-                ssize_t count = recv(accepted, buffer, sizeof(buffer), 0);
+                ssize_t count = recv(accepted, buffer, sizeof(buffer) - 1, 0);
+                if (count > 0)
+                    count = response(buffer, sizeof(buffer), count);
                 if (count > 0)
                     send(accepted, buffer, count, MSG_NOSIGNAL);
                 close(accepted);

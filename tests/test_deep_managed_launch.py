@@ -34,7 +34,7 @@ def digest(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def verify(bundle, root, guest, system_image, fork):
+def verify(bundle, root, guest, system_image, fork, product_volumes):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
@@ -109,6 +109,34 @@ def verify(bundle, root, guest, system_image, fork):
         rpc(worker, "FinishOperation", dict(abort=False, expected_revision=1), **setup)
         disks = [dict(attachment_id="attach-"+role,device_id=role,role=role,generation_id=generation,read_only=readonly)
                  for role, generation, readonly in (("root","base-ext4",not system_image),("storage","empty-data",False),("data","empty-data",False))]
+        wanted_heads = {}
+        if product_volumes:
+            def volume_operation(op, volume, revision, action, **fields):
+                payload = dict(operation_id=op, request_digest=digest(op.encode()),
+                               volume_id=volume, owner_id="volume-test", expected_revision=revision,
+                               command=dict(action=action, **fields))
+                return http(endpoint, EXT + "/volumes", payload)["volume"]
+
+            capacity = data_disk.stat().st_size
+            volume_operation("create-storage", "product-storage", 0, "create",
+                             capacity_bytes=capacity, lifecycle="persistent")
+            source = volume_operation("create-data-source", "product-source", 0, "create",
+                                      capacity_bytes=capacity, lifecycle="persistent")
+            volume_operation("snapshot-data-source", "product-source", source["revision"], "snapshot",
+                             snapshot_id="product-data-snapshot")
+            volume_operation("create-data", "product-data", 0, "create", capacity_bytes=capacity,
+                             lifecycle="persistent", source_snapshot_id="product-data-snapshot")
+            for disk in disks[1:]:
+                volume = "product-" + disk["device_id"]
+                del disk["generation_id"]
+                disk["volume_id"] = volume
+                observation = volume_operation(
+                    "reserve-" + volume, volume, 1, "attach", attachment_id=disk["attachment_id"],
+                    instance_id=before["instance_id"], execution_epoch=0, device_key=disk["device_id"],
+                    mode="rw", fork_policy="clone", capture_policy="include",
+                )
+                assert observation["attachments"][0]["state"] == "reserved", observation
+                wanted_heads[volume] = observation["head_resource_id"]
         parameters = dict(name=name,boot_profile="oci-v1",cpus=2,memory_mib=512,disks=disks,init="/counter",args=[])
         if system_image:parameters.update(boot_profile="system-debian-v1",init="/sbin/init",args=["--unit=multi-user.target","--log-target=console"])
         submit = dict(operation_id="launch-managed", request_digest=digest(json.dumps(parameters).encode()),
@@ -120,6 +148,25 @@ def verify(bundle, root, guest, system_image, fork):
         except RuntimeError as error:assert "E_RESOURCE_LIMIT" in str(error)
         else:raise AssertionError("over-budget launch admitted")
         assert rpc(worker,"QueryWorkerBudget")["allocated"]==limits["allocated"]
+        if product_volumes:
+            wrong_disks = [disks[0], {**disks[1], "device_id": "foreign-slot"}, disks[2]]
+            wrong_slot = {**submit, "operation_id": "wrong-slot", "parameters": {**parameters, "disks": wrong_disks}}
+            try:
+                http(endpoint, EXT + "/operations", wrong_slot)
+            except RuntimeError as error:
+                assert "E_VOLUME_BUSY" in str(error), error
+            else:
+                raise AssertionError("another device slot consumed a volume reservation")
+            foreign = http(endpoint, EXT + "/machines/foreign-guest/binding")
+            wrong_binding = {**submit, "operation_id": "wrong-consumer",
+                             "expected": {k: foreign[k] for k in ("instance_id", "incarnation_id", "execution_epoch")},
+                             "parameters": {**parameters, "name": "foreign-guest"}}
+            try:
+                http(endpoint, EXT + "/operations", wrong_binding)
+            except RuntimeError as error:
+                assert "E_VOLUME_BUSY" in str(error), error
+            else:
+                raise AssertionError("another machine consumed a volume reservation")
         original = http(endpoint, EXT+"/operations",submit)
         assert original["phase"] == "NEW"
         def final():
@@ -156,6 +203,12 @@ def verify(bundle, root, guest, system_image, fork):
         assert record["execution"]["uid"]>0
         heads=[d for d in record["inventory"]["devices"] if d.get("block")]
         assert len(heads)==3, heads
+        if product_volumes:
+            attached = [d["block"]["managed_attachment"] for d in heads[1:]]
+            assert {d["volume_id"]: d["writable_head_id"] for d in attached} == wanted_heads, attached
+            for volume in wanted_heads:
+                actual = http(endpoint, EXT + "/volumes/" + volume + "?owner_id=volume-test")
+                assert actual["attachments"][0]["state"] == "attached", actual
         logs=root/"state/managed"
         def guest_log():
             return (logs/(ref["incarnation_id"]+".log")).read_text(errors="replace")
@@ -223,6 +276,14 @@ def verify(bundle, root, guest, system_image, fork):
             prior=until(lambda:(v if (v:=binding())["incarnation_id"] is None else None),20)
             assert prior["execution_epoch"]==1
             assert rpc(worker,"QueryWorkerBudget")["allocated"]==limits["allocated"]
+            if product_volumes:
+                stale = {**submit, "operation_id": "stale-cold-launch", "request_digest": digest(b"stale")}
+                try:
+                    http(endpoint, EXT + "/operations", stale)
+                except RuntimeError as error:
+                    assert "E_STALE_EXECUTION" in str(error), error
+                else:
+                    raise AssertionError("stale execution reopened the product writer")
             restarted={**submit,"operation_id":"restart-managed","request_digest":digest(b"restart"),
                        "expected":{k:prior[k] for k in ("instance_id","incarnation_id","execution_epoch")}}
             http(endpoint,EXT+"/operations",restarted)
@@ -237,6 +298,19 @@ def verify(bundle, root, guest, system_image, fork):
             new_blocks=[d["block"]["managed_attachment"] for d in new["inventory"]["devices"] if d.get("block")]
             for x,y in zip(old_blocks,new_blocks,strict=True):
                 assert (x["volume_id"],x["writable_head_id"])==(y["volume_id"],y["writable_head_id"])
+            if product_volumes:
+                assert all(x["grant_id"] != y["grant_id"] for x, y in zip(old_blocks[1:], new_blocks[1:], strict=True))
+                assert all(d["execution_epoch"] == 2 for d in new_blocks[1:])
+                second_log = logs / (second_ref["incarnation_id"] + ".log")
+                def persisted_write():
+                    if not second_log.exists():
+                        return False
+                    for line in second_log.read_text(errors="replace").splitlines():
+                        if "PARKED_BLOCK_TICK 1 " in line:
+                            return all(int(x) != 0 for x in line.split()[-2:])
+                    return False
+                until(persisted_write, 20)
+                print("Cold launch retained both real product heads and guest writes through the fenced restart. Wrong consumer, device slot and stale epoch were rejected.", flush=True)
             print("Fenced exit released the budget; a new epoch reopened the same independent writable heads.",flush=True)
         print(f"Managed launch {ref['incarnation_id']} on real KVM, UID {record['execution']['uid']}, three block attachments and two writers; private Serve restart and exact replay passed.", flush=True)
 
@@ -247,15 +321,16 @@ def main():
     parser.add_argument("--guest",type=Path,help="prebuilt static kvm-parked-block-guest test binary")
     parser.add_argument("--system-image",type=Path,help="managed Debian ext4 image containing the systemd Guest Agent service")
     parser.add_argument("--fork",action="store_true",help="fork a batch of two managed guests from one live capture")
+    parser.add_argument("--product-volumes", action="store_true", help="open existing registered product disk heads")
     args=parser.parse_args()
     if os.geteuid()!=0:parser.error("requires root, KVM and systemd")
     if not os.environ.get("SMOLVM_MANAGED_TEST_ISOLATED"):
         os.execvpe("unshare",["unshare","--mount","--propagation","private","--net","--",sys.executable,__file__,
-                             "--bundle",str(args.bundle.resolve()),*(["--guest",str(args.guest.resolve())] if args.guest else []),*(["--system-image",str(args.system_image.resolve())] if args.system_image else []),*(["--fork"] if args.fork else [])],{**os.environ,"SMOLVM_MANAGED_TEST_ISOLATED":"1"})
+                             "--bundle",str(args.bundle.resolve()),*(["--guest",str(args.guest.resolve())] if args.guest else []),*(["--system-image",str(args.system_image.resolve())] if args.system_image else []), *(["--fork"] if args.fork else []), *(["--product-volumes"] if args.product_volumes else [])],{**os.environ,"SMOLVM_MANAGED_TEST_ISOLATED":"1"})
     with tempfile.TemporaryDirectory(dir="/var/tmp",prefix="smm-") as tmp:
         root=Path(tmp)
         root.chmod(0o755)
-        try: verify(args.bundle.resolve(),root,args.guest,args.system_image,args.fork)
+        try: verify(args.bundle.resolve(),root,args.guest,args.system_image,args.fork,args.product_volumes)
         except BaseException:
             for log in [root/"serve.log",root/"worker.log",*(root/"state/managed").glob("*.log")]:
                 if log.exists():print(f"{log.name}\n{log.read_text(errors='replace')[-7000:]}",file=sys.stderr)

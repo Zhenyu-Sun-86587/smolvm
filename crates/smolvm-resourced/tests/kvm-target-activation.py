@@ -186,13 +186,13 @@ def frame_for(receipt, network):
     return frame, machine.hex().encode()
 
 
-def service_dial(worker, operation, lease, *, error=None):
+def service_dial(worker, operation, lease, *, error=None, resolve=None):
     data = {"attachment_id": lease["attachment"]["attachment_id"], "lease_id": lease["lease_id"],
             "expected_revision": lease["revision"], "guest_port": 34567}
     if error:
         rpc(worker, "DialNetworkAttachment", {**data, "transport": "tcp"}, error=error, **operation)
         return
-    for transport in ("tcp", "udp"):
+    for transport in (("tcp",) if resolve else ("tcp", "udp")):
         returned, fds = rpc(worker, "DialNetworkAttachment", {**data, "transport": transport},
                             roles=[f"network_{transport}"], **operation)
         assert returned == lease, returned
@@ -201,9 +201,33 @@ def service_dial(worker, operation, lease, *, error=None):
             assert service.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0
             assert service.getpeername() == (lease["attachment"]["private_ipv4"], 34567)
             service.settimeout(3)
-            message = ("worker-" + transport).encode()
+            message = ("resolve " + resolve).encode() if resolve else ("worker-" + transport).encode()
             service.sendall(message)
-            assert service.recv(256) == message
+            expected = lease["attachment"]["private_ipv4"].encode() if resolve else message
+            assert service.recv(256) == expected
+
+
+def dns_lookup(namespace, gateway, name):
+    probe = r"""
+import ipaddress, socket, struct, sys
+name = sys.argv[2].encode().split(b'.')
+question = b''.join(bytes([len(label)]) + label for label in name) + b'\0' + struct.pack('!HH', 1, 1)
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+    client.settimeout(2)
+    client.sendto(struct.pack('!6H', 42, 256, 1, 0, 0, 0) + question, (sys.argv[1], 53))
+    reply, peer = client.recvfrom(512)
+ident, flags, questions, answers, _, _ = struct.unpack_from('!6H', reply)
+assert peer == (sys.argv[1], 53) and ident == 42 and flags & 0x8400 == 0x8400 and not flags & 0x80
+assert questions == 1
+if answers:
+    assert flags & 15 == 0 and answers == 1
+    print(ipaddress.IPv4Address(reply[-4:]))
+else:
+    assert flags & 15 == 3
+"""
+    result = subprocess.run(["nsenter", f"--net={namespace}", "--", sys.executable, "-c", probe,
+                             gateway, name], check=True, capture_output=True, text=True)
+    return result.stdout.strip() or None
 
 
 def run(args):
@@ -280,6 +304,8 @@ def run(args):
                 config["attachment"] = name + "-tap"
                 reserve = {"attachment_id": config["attachment"], "network_id": "tap-kvm",
                            "device_id": "net0", "mode": "fixed_internal" if args.fixed_internal else "native"}
+                if args.test_private_dns:
+                    reserve["dns_name"] = name + ".deep.internal"
                 placement = {"attachment_id": config["attachment"]}
                 if args.fixed_internal:
                     reserve["guest_ipv4"] = "10.91.0.2"
@@ -326,6 +352,8 @@ def run(args):
             tap = probe.until(attached)
             source_ip = tap["attachment"]["private_ipv4"]
             assert tap["gate"] == "closed" and not ping(router_ns, source_ip), tap
+            if args.test_private_dns:
+                assert dns_lookup(router_ns, router_ip, "source.deep.internal") is None
             rpc(worker, "FinishOperation", {"abort": False, "expected_revision": 1},
                 error="E_FENCE_UNPROVEN", **src)
             publish = {"attachment_id": "source-tap", "lease_id": tap["lease_id"],
@@ -341,6 +369,8 @@ def run(args):
             probe.until(lambda: ping(router_ns, source_ip), 12)
         launch_record = rpc(worker, "QueryOperation", **{k: src[k] for k in ("operation_id", "bundle_digest", "route_id")})
         rpc(worker, "FinishOperation", {"abort": False, "expected_revision": launch_record["revision"]}, **src)
+        if args.test_private_dns:
+            assert dns_lookup(router_ns, router_ip, "source.deep.internal") == source_ip
         if relay:
             assert verify_peer(src, relay_connections[0])["pid"] == processes[-1].pid
         generation = scope(bundle, "source", "capture", 1)
@@ -410,6 +440,8 @@ def run(args):
                                                                "expected_revision": tap["revision"]},
                 error="E_INVALID_REQUEST", **child)
             assert not ping(router_ns, tap["attachment"]["private_ipv4"])
+            if args.test_private_dns:
+                assert dns_lookup(router_ns, router_ip, "child.deep.internal") is None
             if args.test_service_dial:
                 service_dial(worker, child, tap, error="E_FENCE_UNPROVEN")
         if args.restart_before_commit:
@@ -452,6 +484,10 @@ def run(args):
                 service_dial(worker, src, tap, error="E_STALE_EXECUTION")
         assert source_rows() == parked
         rpc(worker, "FinishOperation", {"abort": False, "expected_revision": 1}, **child)
+        if args.test_private_dns:
+            assert dns_lookup(router_ns, router_ip, "child.deep.internal") == att["private_ipv4"]
+            if args.test_service_dial:
+                service_dial(worker, child, tap, resolve="child.deep.internal")
         if relay:
             assert verify_peer(child, relay_connections[1])["pid"] == child_process.pid
             verify_peer(child, relay_connections[0], "E_PERMISSION_DENIED")
@@ -463,11 +499,30 @@ def run(args):
             assert ping(router_ns, source_ip) and ping(router_ns, att["private_ipv4"])
             child_process.terminate()
             child_process.wait(timeout=5)
+            if args.test_private_dns:
+                assert dns_lookup(router_ns, router_ip, "child.deep.internal") is None
             dead = rpc(worker, "FinalizeExecutionExit", **child)
             assert dead["phase"] == "exited", dead
             rpc(worker, "QueryNetworkAttachment", {"attachment_id": "child-tap"},
                 error="E_NOT_FOUND", **child)
             assert not ping(router_ns, att["private_ipv4"]) and ping(router_ns, source_ip)
+            if args.test_private_dns:
+                assert dns_lookup(router_ns, router_ip, "child.deep.internal") is None
+                restart = scope(bundle, "child", "rebind-child")
+                restart["expected"]["execution_epoch"] = child["expected"]["execution_epoch"]
+                rpc(worker, "BeginOperation", {"kind": "launch"}, **restart)
+                intent = {"attachment_id": "child-tap", "network_id": "tap-kvm", "device_id": "net0",
+                          "mode": att["mode"], "dns_name": "child.deep.internal", "rebind_revision": 1}
+                placement = {"attachment_id": "child-tap"}
+                if args.fixed_internal:
+                    intent["guest_ipv4"] = att["guest_ipv4"]
+                    placement.update(guest_gateway_ipv4=att["gateway_ipv4"], guest_prefix=att["guest_prefix"])
+                reservation = rpc(worker, "ReserveNetworkAttachment", intent, **restart)
+                assert reservation["private_ipv4"] == att["private_ipv4"] and reservation["revision"] == 2
+                assert reservation["dns_name"] == "child.deep.internal"
+                rebound = rpc(worker, "PrepareNetworkAttachment", placement, **restart)
+                assert rebound["state"] == "quarantined" and rebound["attachment"] == att
+                assert dns_lookup(router_ns, router_ip, "child.deep.internal") is None
         print(f"Worker pidfd + sealed RAM + KVM target authority passed; network={args.network}; "
               f"source and child retain PID {parked[-1][1].decode()}; journal revision {released['revision']}")
     finally:
@@ -499,8 +554,9 @@ if __name__ == "__main__":
     parser.add_argument("--restart-before-commit", action="store_true")
     parser.add_argument("--test-service-dial", action="store_true", help="use guest-service-counter on both boot fixtures")
     parser.add_argument("--test-guest-transport", action="store_true")
+    parser.add_argument("--test-private-dns", action="store_true")
     args = parser.parse_args()
-    if args.fixed_internal:
+    if args.fixed_internal or args.test_private_dns:
         args.network = True
     args.lib = args.lib.resolve()
     args.probe = args.probe.resolve()

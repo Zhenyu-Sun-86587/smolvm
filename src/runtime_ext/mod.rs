@@ -99,6 +99,14 @@ pub fn worker_operations_router(socket: std::path::PathBuf) -> axum::Router {
             "/api/v1/runtime-ext/v1/machines/{name}/execution",
             axum::routing::get(machine_execution),
         )
+        .route(
+            "/api/v1/runtime-ext/v1/volumes",
+            axum::routing::post(apply_volume),
+        )
+        .route(
+            "/api/v1/runtime-ext/v1/volumes/{id}",
+            axum::routing::get(volume),
+        )
         .merge(guest_agent::router());
     #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
     let router = {
@@ -109,6 +117,36 @@ pub fn worker_operations_router(socket: std::path::PathBuf) -> axum::Router {
         )
     };
     router.with_state(socket)
+}
+
+#[cfg(feature = "deep-runtime")]
+async fn apply_volume(
+    axum::extract::State(socket): axum::extract::State<std::path::PathBuf>,
+    Json(input): Json<smolvm_resourced::native_client::ProductVolumeMutation>,
+) -> axum::response::Response {
+    native(socket, move |client| {
+        if let Some(instance) = input
+            .command
+            .get("instance_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            launch::require_own(instance)?;
+        }
+        client.apply_product_volume(&input)
+    })
+    .await
+}
+
+#[cfg(feature = "deep-runtime")]
+async fn volume(
+    axum::extract::State(socket): axum::extract::State<std::path::PathBuf>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(owner): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    native(socket, move |client| {
+        client.product_volume(&id, owner.get("owner_id").map(String::as_str).unwrap_or(""))
+    })
+    .await
 }
 #[cfg(feature = "deep-runtime")]
 async fn machine_execution(
@@ -212,6 +250,8 @@ async fn native<T: serde::Serialize + Send + 'static>(
                 | "E_STALE_EXECUTION"
                 | "E_OPERATION_IN_PROGRESS"
                 | "E_STATE_CONFLICT"
+                | "E_VOLUME_BUSY"
+                | "E_VOLUME_GENERATION_MISMATCH"
                 | "E_ALREADY_COMMITTED"
                 | "E_STALE_REVISION" => StatusCode::CONFLICT,
                 _ => StatusCode::SERVICE_UNAVAILABLE,

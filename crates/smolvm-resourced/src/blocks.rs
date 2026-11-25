@@ -370,6 +370,17 @@ pub(crate) fn materialize(
     source: Option<OwnedFd>,
     parent: Option<&BlockObject>,
 ) -> Result<BlockObject> {
+    materialize_with(root, operation_id, spec, |spec, data| {
+        write_image(spec, data, source, parent)
+    })
+}
+
+pub(crate) fn materialize_with(
+    root: &File,
+    operation_id: &str,
+    spec: BlockSpec,
+    initialize: impl FnOnce(&BlockSpec, &File) -> Result<()>,
+) -> Result<BlockObject> {
     if let Some(object) = read_published(root, &spec)? {
         root.sync_all().map_err(io_fault)?;
         return Ok(object);
@@ -385,7 +396,7 @@ pub(crate) fn materialize(
             .custom_flags(libc::O_NOFOLLOW)
             .open(dir_path.join("data"))
             .map_err(io_fault)?;
-        write_image(&spec, &data, source, parent)?;
+        initialize(&spec, &data)?;
         let object = BlockObject {
             backing_identity: backing_identity(&data).map_err(io_fault)?,
             format: spec.format().into(),
@@ -736,7 +747,7 @@ impl Catalog {
             .transpose()
     }
 
-    fn begin_block(&self, op: &str, spec: &BlockSpec) -> Result<()> {
+    pub(crate) fn begin_block(&self, op: &str, spec: &BlockSpec) -> Result<()> {
         let inserted = self.db.execute(
             "INSERT OR IGNORE INTO managed_blocks SELECT ?,?,?,NULL
             WHERE NOT EXISTS(SELECT 1 FROM resources WHERE resource_id=?)
@@ -758,7 +769,7 @@ impl Catalog {
         Ok(())
     }
 
-    fn commit_block(&mut self, op: &str, object: &BlockObject) -> Result<Value> {
+    pub(crate) fn commit_block(&mut self, op: &str, object: &BlockObject) -> Result<Value> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

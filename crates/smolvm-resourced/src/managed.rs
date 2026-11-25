@@ -14,7 +14,10 @@ pub struct Disk {
     pub attachment_id: String,
     pub device_id: String,
     pub role: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub generation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_id: Option<String>,
     pub read_only: bool,
 }
 
@@ -81,7 +84,14 @@ fn serve_id(instance: &str, name: &str) -> Result<String> {
     Ok(id.to_string())
 }
 impl Machine {
-    pub(crate) fn devices(&self, c: &Catalog, op: &str, instance: &str) -> Result<Vec<Device>> {
+    pub(crate) fn devices(
+        &self,
+        c: &Catalog,
+        op: &str,
+        route: &str,
+        bundle: &str,
+        expected: &crate::ipc::Expected,
+    ) -> Result<Vec<Device>> {
         if !valid_id(&self.name)
             || self.cpus == 0
             || self.memory_mib < 64
@@ -108,13 +118,18 @@ impl Machine {
         }
         let original:Option<String>=c.db.query_row(
             "SELECT m.operation_id FROM managed_launches m JOIN operations o USING(operation_id) WHERE o.instance_id=? AND o.phase='COMPLETED' ORDER BY o.expected_execution_epoch DESC LIMIT 1",
-            [instance],|r|r.get(0)).optional()?;
+            [&expected.instance_id],|r|r.get(0)).optional()?;
         let previous = original
             .map(|id| plan(c, &c.operation(&id)?))
             .transpose()?
             .flatten();
         if previous.as_ref().is_some_and(|p| {
-            p.machine.disks != self.disks || p.machine.boot_profile != self.boot_profile
+            p.machine.boot_profile != self.boot_profile
+                || p.machine
+                    .disks
+                    .iter()
+                    .filter(|d| d.volume_id.is_none())
+                    .ne(self.disks.iter().filter(|d| d.volume_id.is_none()))
         }) {
             return Err(Fault::new(
                 "E_VOLUME_CONFLICT",
@@ -123,10 +138,11 @@ impl Machine {
         }
         let mut attachments = HashSet::new();
         let mut ids = HashSet::new();
+        let mut volumes = HashSet::new();
         let mut layers = HashSet::new();
         let mut devices = Vec::new();
         for (i, disk) in self.disks.iter().enumerate() {
-            if ![&disk.device_id, &disk.attachment_id, &disk.generation_id]
+            if ![&disk.device_id, &disk.attachment_id]
                 .iter()
                 .all(|v| valid_id(v))
                 || !ids.insert(&disk.device_id)
@@ -135,6 +151,28 @@ impl Machine {
                     || matches!(disk.role.as_str(), "data" | "overlay" | "cache" | "storage"))
             {
                 return Err(Fault::invalid("duplicate or invalid managed disk slot"));
+            }
+            if let Some(volume) = disk.volume_id.as_deref() {
+                if !disk.generation_id.is_empty() || !valid_id(volume) || !volumes.insert(volume) {
+                    return Err(Fault::invalid("invalid or duplicate reserved volume"));
+                }
+                let (device, closure) = crate::product_volumes::launch_device(
+                    c,
+                    route,
+                    bundle,
+                    &expected.instance_id,
+                    expected.execution_epoch + 1,
+                    disk,
+                    volume,
+                )?;
+                layers.extend(closure.into_iter().map(|layer| layer.spec.resource_id));
+                devices.push(device);
+                continue;
+            }
+            if !valid_id(&disk.generation_id) {
+                return Err(Fault::invalid(
+                    "managed disk requires a generation or reserved volume",
+                ));
             }
             let closure = c.block_closure(&disk.generation_id)?;
             let base = &closure[0].spec;
@@ -147,7 +185,11 @@ impl Machine {
             for layer in &closure {
                 layers.insert(layer.spec.resource_id.clone());
             }
-            let old = previous.as_ref().map(|p| &p.devices[i]);
+            let old = previous.as_ref().and_then(|p| {
+                p.devices
+                    .iter()
+                    .find(|d| d.disk.attachment_id == disk.attachment_id)
+            });
             let volume_id = old
                 .map(|d| d.volume_id.clone())
                 .unwrap_or_else(|| key(op, "volume", i));
@@ -201,6 +243,7 @@ impl Machine {
                 reattach,
             });
         }
+        crate::product_volumes::require_launch_set(c, route, &expected.instance_id, volumes.len())?;
         if layers.len() > crate::ipc::MAX_FDS {
             return Err(Fault::new(
                 "E_RESOURCE_LIMIT",
@@ -262,7 +305,7 @@ pub(crate) fn plan(c: &Catalog, op: &Operation) -> Result<Option<Plan>> {
 }
 pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<Operation> {
     let (id, _) = r.operation()?;
-    let (route, _, expected) = r.scope()?;
+    let (route, bundle, expected) = r.scope()?;
     if route != "deep" || expected.incarnation_id.is_some() || expected.execution_epoch == i64::MAX
     {
         return Err(Fault::new(
@@ -291,7 +334,7 @@ pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<O
         }
         return c.begin(r, "launch");
     }
-    let devices = machine.devices(c, id, &expected.instance_id)?;
+    let devices = machine.devices(c, id, route, bundle, expected)?;
     let storage = devices
         .iter()
         .filter(|d| !d.disk.read_only)
@@ -313,6 +356,11 @@ pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<O
         for device in &devices {
             tx.execute("INSERT OR IGNORE INTO root_refs(owner_kind,owner_id,resource_id,state,revision,created_by_operation)
                 VALUES('operation',?,?,'active',1,?)",params![id,device.disk.generation_id,id])?;
+            if device.reattach {
+                let head = device.head_id.as_ref().ok_or_else(|| Fault::invalid("missing reattached head"))?;
+                tx.execute("INSERT OR IGNORE INTO root_refs(owner_kind,owner_id,resource_id,state,revision,created_by_operation)
+                    VALUES('operation',?,?,'active',1,?)",params![id,head,id])?;
+            }
         }
         Ok(())
     })

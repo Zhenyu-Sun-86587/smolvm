@@ -137,6 +137,7 @@ impl StatePoints {
                 "StatePoint requires its own capture operation",
             ));
         }
+        crate::product_volumes::require_capture_policy(catalog, source, false)?;
         let endpoint = Endpoint::load(&catalog.db, &source.incarnation_id, boot)?;
         if export.purpose != Purpose::Checkpoint {
             let query = format!("CAPTURE_QUERY {} {}", export.session, export.hold_token);
