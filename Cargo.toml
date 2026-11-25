@@ -143,6 +143,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # Seccomp + Landlock for the VM boot subprocess (runtime isolation). Linux-only
 # — macOS/HVF has neither; the code is cfg-gated to linux (seccomp also to x86_64).
 [target.'cfg(target_os = "linux")'.dependencies]
+smolvm-resourced = { path = "crates/smolvm-resourced" }
 seccompiler = "0.4"
 landlock = "0.4"
 secret-service = { version = "5.2", default-features = false, features = ["rt-async-io-crypto-rust"] }

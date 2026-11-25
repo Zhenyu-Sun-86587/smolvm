@@ -65,6 +65,11 @@ pub struct ServeStartCmd {
     )]
     listen: String,
 
+    /// WorkerResource/1 socket for bundle-scoped operation queries on the Unix listener
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_name = "PATH")]
+    worker_resource_socket: Option<PathBuf>,
+
     /// Enable debug logging (or set RUST_LOG=debug)
     #[arg(short, long)]
     verbose: bool,
@@ -300,6 +305,15 @@ impl ServeStartCmd {
         }
 
         let listen_target = ListenTarget::parse(&self.listen)?;
+        #[cfg(target_os = "linux")]
+        if let Some(socket) = &self.worker_resource_socket {
+            if !socket.is_absolute() || !matches!(listen_target, ListenTarget::Unix(_)) {
+                return Err(smolvm::Error::config(
+                    "configure worker operation queries",
+                    "use an absolute --worker-resource-socket and a Unix --listen address",
+                ));
+            }
+        }
 
         // Set up verbose logging if requested
         if self.verbose {
@@ -731,6 +745,11 @@ impl ServeStartCmd {
             }
             #[cfg(unix)]
             ListenTarget::Unix(path) => {
+                #[cfg(target_os = "linux")]
+                let app = match &self.worker_resource_socket {
+                    Some(socket) => app.merge(smolvm::api::worker_operations_router(socket.clone())),
+                    None => app,
+                };
                 self.serve_unix(path, app, shutdown_rx.clone(), grace).await
             }
         };
