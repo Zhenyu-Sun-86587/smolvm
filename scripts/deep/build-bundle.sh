@@ -137,6 +137,7 @@ stage_checkout() {
 }
 
 stage_checkout "$SOURCE_ROOT" "$SOURCES" "$SMOLVM_COMMIT" yes
+export SOURCE_DATE_EPOCH="$(git -C "$SOURCES" show -s --format=%ct "$SMOLVM_COMMIT")"
 
 build_libraries() {
     stage_checkout "$SOURCE_ROOT/libkrun" "$SOURCES/libkrun" "$KRUN_COMMIT" no
@@ -191,6 +192,8 @@ PY
     # Verify the staged script is the revision containing the locked source mode.
     cmp -s "$SOURCE_ROOT/scripts/build-libkrun-linux.sh" "$SOURCES/scripts/build-libkrun-linux.sh" ||
         fail "the staged build script differs from the verified checkout"
+    KBUILD_BUILD_TIMESTAMP="$(date -u -d "@$SOURCE_DATE_EPOCH")" \
+        KBUILD_BUILD_USER=smolvm KBUILD_BUILD_HOST=deep-builder KBUILD_BUILD_VERSION=1 \
     GPU=0 SKIP_DEPS=1 SKIP_LIBKRUNFW=0 SMOLVM_VERIFIED_SOURCE_BUILD=1 \
         SMOLVM_VERIFIED_KERNEL_TREE="$KERNEL_NAME" SMOLVM_BUILD_JOBS="$JOBS" \
         "$SOURCES/scripts/build-libkrun-linux.sh"
@@ -245,7 +248,7 @@ PY
     python3 "$SOURCES/scripts/deep/assemble-oci-rootfs.py" --source-root "$SOURCES" \
         --toolchain-lock "$TOOLCHAIN_LOCK" --input-lock "$ROOTFS_INPUT_LOCK" --seed "$WORK/oci-seed.tar.gz" \
         --agent "$CANDIDATE/guest/agent" --output "$CANDIDATE/guest/oci-rootfs.tar.gz" --metadata "$CANDIDATE/metadata" \
-        --timestamp "$(git -C "$SOURCES" show -s --format=%ct "$SMOLVM_COMMIT")"
+        --timestamp "$SOURCE_DATE_EPOCH"
 
     ( cd "$SOURCES"; cargo build --locked --jobs "$JOBS" --release -p smolvm --features deep-runtime;
         cargo build --locked --jobs "$JOBS" --release -p smolvm-resourced )

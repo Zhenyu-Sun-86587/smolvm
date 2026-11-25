@@ -1,0 +1,103 @@
+name: Build deep runtime from source
+
+on:
+  workflow_dispatch:
+    inputs:
+      builder_image:
+        description: Linux x86-64 builder image with its immutable SHA-256 digest
+        required: true
+        type: string
+      platform_repository:
+        description: Platform GitHub repository containing the bundle verifier and candidate locks
+        required: true
+        type: string
+      platform_commit:
+        description: Full Git commit ID of that platform checkout
+        required: true
+        type: string
+      lock_directory:
+        description: Directory of candidate locks relative to the platform checkout
+        required: true
+        type: string
+      kernel_archive_url:
+        description: HTTPS URL for the pinned kernel archive
+        required: true
+        type: string
+      oci_seed_url:
+        description: HTTPS URL for the pinned OCI rootfs seed
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: ${{ inputs.builder_image }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILDER_IMAGE: ${{ inputs.builder_image }}
+      PLATFORM_COMMIT: ${{ inputs.platform_commit }}
+      LOCK_DIRECTORY: ${{ inputs.lock_directory }}
+      KERNEL_ARCHIVE_URL: ${{ inputs.kernel_archive_url }}
+      OCI_SEED_URL: ${{ inputs.oci_seed_url }}
+    steps:
+      - name: Validate input format
+        run: |
+          set -euo pipefail
+          [[ "$BUILDER_IMAGE" =~ ^[a-z0-9][a-z0-9./:_-]*@sha256:[0-9a-f]{64}$ ]]
+          [[ "$PLATFORM_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$KERNEL_ARCHIVE_URL" == https://* && "$OCI_SEED_URL" == https://* ]]
+
+      - name: Check out locked smolvm and submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: smolvm
+          submodules: recursive
+          lfs: true
+          persist-credentials: false
+
+      - name: Check out platform bundle tools and locks
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.platform_repository }}
+          ref: ${{ inputs.platform_commit }}
+          path: platform
+          persist-credentials: false
+
+      - name: Build verified libraries and runtime
+        run: |
+          set -euo pipefail
+          [[ "$(git -C platform rev-parse HEAD)" == "$PLATFORM_COMMIT" ]]
+          locks="$(realpath -e -- "platform/$LOCK_DIRECTORY")"
+          [[ "$locks" == "$GITHUB_WORKSPACE/platform/"* ]]
+          mkdir stage
+          for input in kernel seed; do
+            if [[ "$input" == kernel ]]; then
+              url="$KERNEL_ARCHIVE_URL"
+            else
+              url="$OCI_SEED_URL"
+            fi
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+              --retry 3 --output "stage/$input" -- "$url"
+          done
+          options=(--source-lock "$locks/build-lock.json" --toolchain-lock "$locks/toolchain-lock.json"
+                   --kernel-archive "$GITHUB_WORKSPACE/stage/kernel" --builder-image "$BUILDER_IMAGE"
+                   --bundle-tool "$GITHUB_WORKSPACE/platform/packaging/deep/bundle.py" --jobs 2)
+          smolvm/scripts/deep/build-bundle.sh "${options[@]}" --stage libraries --output stage/libraries
+          smolvm/scripts/deep/build-bundle.sh "${options[@]}" --stage runtime --output stage/runtime \
+            --libraries stage/libraries --rootfs-seed stage/seed \
+            --rootfs-input-lock scripts/deep/locks/oci-x86_64.json
+          tar -C stage/runtime -czf stage/runtime-x86_64.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deep-runtime-stage-x86_64
+          path: stage/runtime-x86_64.tar.gz
+          if-no-files-found: error

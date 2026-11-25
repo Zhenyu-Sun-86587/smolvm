@@ -9,7 +9,7 @@ common=(--source-lock "$build_lock" --toolchain-lock "$toolchain_lock"
 scripts/deep/build-bundle.sh "${common[@]}" --stage libraries --output "$library_stage"
 scripts/deep/build-bundle.sh "${common[@]}" --stage runtime --output "$runtime_stage" \
     --libraries "$library_stage" --rootfs-seed "$oci_seed" \
-    --rootfs-input-lock scripts/deep/oci-rootfs-input.json
+    --rootfs-input-lock scripts/deep/locks/oci-x86_64.json
 ```
 
 The libraries stage builds firmware, static guest init and libkrun in a private checkout. It applies kernel config fragments listed in `RuntimeBuildLock/1.patches` under `libkrunfw/config-fragments/`, in lock order. The inputs must include the kernel archive pinned by both the build lock and the firmware Makefile. The staged configuration is checked before and after firmware compilation.
@@ -26,5 +26,7 @@ Prepare the OCI seed with the locked `scripts/build-agent-rootfs.sh` recipe and 
 | `crane_sha256` | Prefixed SHA-256 of `usr/local/bin/crane` |
 
 The runtime stage verifies the seed and matches its crun provenance to the pinned recipe, patches, inputs and installed binary. It builds the Agent, smolvm with `deep-runtime` enabled, and resourced from the locked source checkout. The OCI archive contains the newly built Agent. Staging records include the seed input lock, the rootfs provenance and the resulting artifact digests. Deployment must set `SMOLVM_AGENT_ROOTFS` to the extracted, verified rootfs directory.
+
+The manual **Build deep runtime from source** workflow runs both stages inside the digest-pinned builder image. Dispatch it from the smolvm commit in the build lock and supply the pinned platform checkout and lock directory, plus HTTPS locations for the kernel and OCI seed. The workflow stores the runtime stage as a tar archive to preserve file modes.
 
 The stage output is intended for subsequent Bundle packaging. Packaging requires production identity, profile and license inputs. An isolated KVM boot and exec gate is still required for release.
