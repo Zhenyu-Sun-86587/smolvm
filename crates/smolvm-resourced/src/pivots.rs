@@ -506,6 +506,46 @@ pub fn query_execution(
     Ok(pivot.receipt())
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkOrigin {
+    pub pivot_id: String,
+    hold_token: String,
+    grant_id: String,
+    execution_epoch: i64,
+}
+
+pub fn validate_fork_origin(
+    catalog: &Catalog,
+    origin: &ForkOrigin,
+    target: &Execution,
+    source_heads: &HashMap<String, String>,
+    target_volumes: &HashSet<String>,
+) -> Result<()> {
+    let point = catalog
+        .writer_pivot(&origin.pivot_id)?
+        .ok_or_else(missing)?;
+    let source = catalog.operation(&origin.pivot_id)?;
+    if point.state != "complete"
+        || point.plan.hold_token != origin.hold_token
+        || point.plan.previous_grant_id != origin.grant_id
+        || point.epoch != origin.execution_epoch
+        || source.bundle_digest != target.bundle_digest
+        || source.route_id != target.route_id
+        || point.incarnation_id == target.incarnation_id
+        || point.plan.heads.len() != source_heads.len()
+        || point.plan.heads.iter().any(|head| {
+            source_heads.get(&head.volume_id) != Some(&head.head_resource_id)
+                || target_volumes.contains(&head.volume_id)
+        })
+    {
+        return Err(fence_unproven(
+            "restore does not name the complete sealed source pivot and independent volumes",
+        ));
+    }
+    Ok(())
+}
+
 impl Catalog {
     fn finish_dead_pivot(&mut self, id: &str, committed: bool) -> Result<()> {
         let tx = self

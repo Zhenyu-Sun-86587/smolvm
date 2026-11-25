@@ -330,6 +330,7 @@ impl Worker {
                 | "ReconcileWriterSet"
                 | "CommitWriterPivot"
                 | "FinalizeWriterPivot"
+                | "ValidateRestoreWriterSet"
         ) && (!descriptors.is_empty() || !request.fd_table.is_empty())
         {
             return Err(Fault::new(
@@ -338,6 +339,16 @@ impl Worker {
             ));
         }
         let result = match request.method.as_str() {
+            "ValidateRestoreWriterSet" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                crate::grants::verify_restore_writer(
+                    &self.catalog,
+                    &self.objects,
+                    request,
+                    &execution,
+                    descriptors,
+                )
+            }
             "QueryWriterPivot"
                 if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } =>
             {

@@ -1,12 +1,15 @@
 //! Journal of writable OFD sets sent to a particular authorized VMM.
 
 use crate::catalog::{Catalog, Execution};
-use crate::ipc::{valid_id, Fault, Result};
+use crate::ipc::{valid_id, Fault, Request, Result, MAX_FDS};
+use crate::pivots::ForkOrigin;
 use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +26,112 @@ pub struct WriterGrant {
     pub execution_epoch: i64,
     pub state: String,
     pub revision: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreHead {
+    source_volume_id: String,
+    volume_id: String,
+    head_resource_id: String,
+    generation_id: String,
+    layers: Vec<(u64, u64)>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreProof {
+    origin: ForkOrigin,
+    grant_id: String,
+    expected_revision: i64,
+    heads: Vec<RestoreHead>,
+}
+
+pub fn verify_restore_writer(
+    catalog: &Catalog,
+    root: &File,
+    request: &Request,
+    execution: &Execution,
+    descriptors: Vec<OwnedFd>,
+) -> Result<Value> {
+    catalog.ready()?;
+    let operation = catalog.matching_operation(request)?;
+    let wanted: RestoreProof = request.payload()?;
+    if !valid_id(&wanted.origin.pivot_id)
+        || !valid_id(&wanted.grant_id)
+        || wanted.heads.is_empty()
+        || wanted.heads.len() > MAX_FDS
+        || wanted.heads.len() != descriptors.len()
+        || wanted.heads.len() != request.fd_table.len()
+    {
+        return Err(Fault::invalid("restore WriterSet proof is incomplete"));
+    }
+    let grant = catalog
+        .writer_grant(&wanted.grant_id)?
+        .ok_or_else(|| fence_unproven("restore writer grant is missing"))?;
+    if !grant.belongs_to(&operation.operation_id, execution)
+        || grant.state != "attached"
+        || grant.revision != wanted.expected_revision
+    {
+        return Err(fence_unproven(
+            "restore has no current attached writer grant",
+        ));
+    }
+    let set = catalog
+        .writer_set(&grant.operation_id)?
+        .ok_or_else(|| fence_unproven("restore writer reservation is missing"))?;
+    if set.heads.len() != wanted.heads.len() {
+        return Err(fence_unproven(
+            "restore must name every original writer descriptor",
+        ));
+    }
+    let mut sources = HashMap::new();
+    let mut volumes = HashSet::new();
+    for (((head, record), entry), descriptor) in wanted
+        .heads
+        .iter()
+        .zip(set.heads)
+        .zip(&request.fd_table)
+        .zip(descriptors)
+    {
+        if head.volume_id != record.volume_id
+            || head.head_resource_id != record.head_resource_id
+            || entry.role != "block_writer"
+            || entry.resource_id != head.head_resource_id
+        {
+            return Err(fence_unproven(
+                "restore writer descriptor belongs to a different head or volume",
+            ));
+        }
+        let closure = catalog.block_closure(&head.head_resource_id)?;
+        if closure[0].spec.volume_id.as_ref() != Some(&head.volume_id)
+            || closure.get(1).is_none_or(|layer| {
+                layer.spec.mutable() || layer.spec.resource_id != head.generation_id
+            })
+            || sources
+                .insert(head.source_volume_id.clone(), head.generation_id.clone())
+                .is_some()
+            || !volumes.insert(head.volume_id.clone())
+        {
+            return Err(fence_unproven(
+                "restore head does not start at its exact immutable source generation",
+            ));
+        }
+        let expected = crate::blocks::open_object(root, &closure[0], true)?;
+        prove_live_ofd(&expected, &File::from(descriptor))?;
+        if closure.len() != head.layers.len()
+            || closure
+                .iter()
+                .zip(&head.layers)
+                .any(|(object, (dev, ino))| object.backing_identity != format!("inode:{dev}:{ino}"))
+        {
+            return Err(fence_unproven(
+                "restore disk uses different opened ancestor files",
+            ));
+        }
+    }
+    crate::pivots::validate_fork_origin(catalog, &wanted.origin, execution, &sources, &volumes)?;
+    Ok(json!({"origin":wanted.origin,"grant":grant,"heads":wanted.heads}))
 }
 
 impl WriterGrant {
