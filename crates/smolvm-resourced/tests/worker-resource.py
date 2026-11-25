@@ -326,9 +326,31 @@ class WorkerResource(unittest.TestCase):
         self.call("ReconcileExecution", **launch)
         session = {"broker_session_id": self.call("Health")["broker_session_id"]}
         self.call("CompleteRecovery", session, error="E_RECOVERING")
+        update = {"lease_id": "lease", "expected_revision": 3}
+        first, second = (request(
+            "ReconcileExecutionExports", update,
+            fd_table=[{"index": 0, "resource_id": f"ram-{name}", "role": "immutable_backing"}],
+            **lease_scope,
+        ) for name in ("a", "b"))
+        self.assertEqual(rpc(self.path, first, [held[1]])["error"]["code"], "E_FENCE_UNPROVEN")
+        self.assertEqual(rpc(self.path, first, [held[0]])["result"]["received"], 1)
+        self.assertEqual(self.call("QueryResource", {"resource_id": "generation"})["state"], "missing")
+        self.call("CompleteRecovery", session, error="E_RECOVERING")
+        receipt = rpc(self.path, second, [held[1]])["result"]
+        self.assertEqual(receipt["lease"]["state"], "attached")
+        self.assertEqual(receipt["received"], 2)
+        self.assertEqual(rpc(self.path, second, [held[1]])["result"], receipt)
+        self.assertEqual(self.call("QueryResource", {"resource_id": "generation"})["state"], "available")
+        self.assertEqual(self.call("CompleteRecovery", session)["state"], "ready")
+
+        self.stop(self.process)
+        self.start()
+        self.call("ReconcileExecution", **launch)
+        session = {"broker_session_id": self.call("Health")["broker_session_id"]}
+        self.call("CompleteRecovery", session, error="E_RECOVERING")
         for backing in holds:
             backing.close()
-        self.call("ReleaseResourceLease", {"lease_id": "lease", "expected_revision": 3}, **lease_scope)
+        self.call("ReleaseResourceLease", {"lease_id": "lease", "expected_revision": 5}, **lease_scope)
         self.assertEqual(self.call("QueryResource", {"resource_id": "generation"})["state"], "lost")
         self.assertEqual(self.call("CompleteRecovery", session)["state"], "ready")
 

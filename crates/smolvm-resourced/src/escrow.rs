@@ -84,6 +84,12 @@ struct Backing {
     length: u64,
 }
 
+impl Backing {
+    fn identity(&self) -> (u64, u64, u64) {
+        (self.device, self.inode, self.length)
+    }
+}
+
 struct Transfer {
     descriptor: Descriptor,
     incarnation_id: String,
@@ -96,10 +102,16 @@ struct Generation {
     backings: BTreeMap<String, Backing>,
 }
 
+struct Reexport {
+    incarnation_id: String,
+    backings: BTreeMap<String, Backing>,
+}
+
 #[derive(Default)]
 pub struct Escrow {
     staging: HashMap<String, Transfer>,
     generations: HashMap<String, Generation>,
+    reexports: HashMap<String, Reexport>,
 }
 
 pub struct LeasePacket {
@@ -224,9 +236,13 @@ fn check_backing(descriptor: OwnedFd, wanted_length: u64) -> Result<Backing> {
             "RAM backing must be a correctly sized sealed memfd",
         ));
     }
-    // Reopen the sealed memfd read-only so a lease never gives a writer-capable description.
-    let readonly =
-        File::open(&path).map_err(|_| Fault::invalid("cannot reopen sealed memfd read-only"))?;
+    // Preserve an existing read-only capability from a provider that could have a
+    // different UID. Reopening an O_RDWR memfd requires permission on its inode.
+    let readonly = if flags & libc::O_ACCMODE == libc::O_RDONLY {
+        file
+    } else {
+        File::open(&path).map_err(|_| Fault::invalid("cannot reopen sealed memfd read-only"))?
+    };
     let opened = readonly
         .metadata()
         .map_err(|_| Fault::invalid("cannot verify reopened sealed memfd"))?;
@@ -242,6 +258,23 @@ fn check_backing(descriptor: OwnedFd, wanted_length: u64) -> Result<Backing> {
 }
 
 impl Escrow {
+    fn parked_descriptors(&self) -> usize {
+        self.staging
+            .values()
+            .map(|transfer| transfer.backings.len())
+            .sum::<usize>()
+            + self
+                .generations
+                .values()
+                .map(|generation| generation.backings.len())
+                .sum::<usize>()
+            + self
+                .reexports
+                .values()
+                .map(|transfer| transfer.backings.len())
+                .sum::<usize>()
+    }
+
     pub fn begin(
         &mut self,
         catalog: &Catalog,
@@ -353,16 +386,7 @@ impl Escrow {
                 "generation batch descriptor count or index is invalid",
             ));
         }
-        let parked = self
-            .staging
-            .values()
-            .map(|t| t.backings.len())
-            .sum::<usize>()
-            + self
-                .generations
-                .values()
-                .map(|g| g.backings.len())
-                .sum::<usize>();
+        let parked = self.parked_descriptors();
         let transfer = self
             .staging
             .get_mut(&input.transfer_id)
@@ -570,24 +594,13 @@ impl Escrow {
     }
 
     pub fn update_lease(
-        &self,
+        &mut self,
         catalog: &mut Catalog,
         request: &Request,
         execution: &Execution,
         release: bool,
     ) -> Result<Value> {
-        let input: LeaseUpdate = request.payload()?;
-        require_id(&input.lease_id)?;
-        let lease = catalog.lease(&input.lease_id)?;
-        let operation = catalog.matching_operation(request)?;
-        if lease.incarnation_id != execution.incarnation_id
-            || lease.operation_id != operation.operation_id
-        {
-            return Err(Fault::new(
-                "E_PERMISSION_DENIED",
-                "descriptor lease belongs to another execution",
-            ));
-        }
+        let (input, lease) = Self::scoped_lease(catalog, request, execution)?;
         if !release && lease.state == "pending" {
             let total = self
                 .generations
@@ -600,11 +613,111 @@ impl Escrow {
                 ));
             }
         }
-        Ok(json!(catalog.update_lease(
-            &lease,
-            input.expected_revision,
-            release
-        )?))
+        let updated = catalog.update_lease(&lease, input.expected_revision, release)?;
+        if release {
+            self.reexports.remove(&input.lease_id);
+        }
+        Ok(json!(updated))
+    }
+
+    fn scoped_lease(
+        catalog: &Catalog,
+        request: &Request,
+        execution: &Execution,
+    ) -> Result<(LeaseUpdate, LeaseRecord)> {
+        let input: LeaseUpdate = request.payload()?;
+        require_id(&input.lease_id)?;
+        let lease = catalog.lease(&input.lease_id)?;
+        let operation = catalog.matching_operation(request)?;
+        if lease.incarnation_id != execution.incarnation_id
+            || lease.operation_id != operation.operation_id
+        {
+            return Err(Fault::new(
+                "E_PERMISSION_DENIED",
+                "descriptor lease belongs to another execution",
+            ));
+        }
+        Ok((input, lease))
+    }
+
+    pub fn reexport(
+        &mut self,
+        catalog: &mut Catalog,
+        request: &Request,
+        execution: &Execution,
+        fds: Vec<OwnedFd>,
+    ) -> Result<Value> {
+        let (input, lease) = Self::scoped_lease(catalog, request, execution)?;
+        if fds.is_empty() || fds.len() != request.fd_table.len() {
+            return Err(Fault::invalid("RAM re-export requires a matching FD table"));
+        }
+        let identities = catalog.backing_identities(&lease.resource_id)?;
+        let mut incoming = BTreeMap::new();
+        for (item, fd) in request.fd_table.iter().zip(fds) {
+            let wanted = identities
+                .get(&item.resource_id)
+                .ok_or_else(|| Fault::invalid("RAM re-export backing is unknown"))?;
+            let backing = check_backing(fd, wanted.2)?;
+            if item.role != "immutable_backing" || backing.identity() != *wanted {
+                return Err(Fault::new(
+                    "E_FENCE_UNPROVEN",
+                    "RAM re-export does not match the original sealed inode",
+                ));
+            }
+            if incoming.insert(item.resource_id.clone(), backing).is_some() {
+                return Err(Fault::invalid("duplicate RAM re-export backing"));
+            }
+        }
+        if lease.state == "attached"
+            && input.expected_revision.checked_add(1) == Some(lease.revision)
+            && self.generations.contains_key(&lease.resource_id)
+        {
+            return Ok(
+                json!({"lease":lease, "received":identities.len(), "total":identities.len()}),
+            );
+        }
+        if lease.state != "unknown" || input.expected_revision != lease.revision {
+            return Err(Fault::new(
+                "E_STALE_REVISION",
+                "RAM re-export requires the current unknown lease",
+            ));
+        }
+        let parked = self.parked_descriptors();
+        let transfer = self
+            .reexports
+            .entry(input.lease_id.clone())
+            .or_insert_with(|| Reexport {
+                incarnation_id: execution.incarnation_id.clone(),
+                backings: BTreeMap::new(),
+            });
+        let additional = incoming
+            .keys()
+            .filter(|id| !transfer.backings.contains_key(*id))
+            .count();
+        if parked + additional > MAX_ESCROW_FDS {
+            return Err(Fault::new(
+                "E_RESOURCE_LIMIT",
+                "worker escrow descriptor budget exhausted",
+            ));
+        }
+        transfer.backings.extend(incoming);
+        let received = transfer.backings.len();
+        let total = identities.len();
+        if received != total {
+            return Ok(json!({"lease":lease, "received":received, "total":total}));
+        }
+        let attached = catalog.commit_reexport(&lease, total)?;
+        let transfer = self
+            .reexports
+            .remove(&input.lease_id)
+            .expect("validated re-export");
+        self.generations
+            .entry(lease.resource_id)
+            .or_insert(Generation {
+                bundle_digest: execution.bundle_digest.clone(),
+                backings: transfer.backings,
+            });
+        Ok(json!({"lease":attached, "received":received, "total":total}))
     }
 
     pub fn collect(&mut self, id: &str) {
@@ -613,6 +726,8 @@ impl Escrow {
 
     pub fn forget_execution(&mut self, incarnation_id: &str) {
         self.staging
+            .retain(|_, transfer| transfer.incarnation_id != incarnation_id);
+        self.reexports
             .retain(|_, transfer| transfer.incarnation_id != incarnation_id);
     }
 }
