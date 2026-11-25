@@ -221,6 +221,47 @@ impl Endpoint {
         }
         Ok(result)
     }
+
+    pub(crate) fn recover_descriptors(
+        &self,
+        kind: &str,
+        identities: &[(u64, u64, u64)],
+    ) -> Result<Option<Vec<OwnedFd>>> {
+        let mut descriptors = Vec::with_capacity(identities.len());
+        for group in identities.chunks(32) {
+            let (socket, pidfd) = self.connect()?;
+            let stream = std::os::unix::net::UnixStream::from(OwnedFd::from(socket));
+            let list = serde_json::to_string(group).map_err(unavailable)?;
+            let header = crate::statepoint_capture::control_reply(
+                &stream,
+                &format!("CAPTURE_RECOVER_FDS {kind} {list}"),
+            )?;
+            let count = header["fd_count"].as_u64();
+            if header["protocol"] != "CaptureRecovery/1"
+                || !count.is_some_and(|count| count == 0 || count == group.len() as u64)
+            {
+                return Err(unavailable("invalid native descriptor recovery receipt"));
+            }
+            if count == Some(0) {
+                if pid_exited(&pidfd).map_err(unavailable)? {
+                    return Err(stale());
+                }
+                return Ok(None);
+            }
+            let socket = Socket::from(OwnedFd::from(stream));
+            for _ in group {
+                let packet = ipc::receive_packet_with_limit(&socket, 1)?;
+                if packet.body != b"F" || packet.descriptors.len() != 1 {
+                    return Err(unavailable("incomplete native recovery descriptor"));
+                }
+                descriptors.extend(packet.descriptors);
+            }
+            if pid_exited(&pidfd).map_err(unavailable)? {
+                return Err(stale());
+            }
+        }
+        Ok(Some(descriptors))
+    }
 }
 
 pub(crate) fn actor_db(path: &Path) -> io::Result<rusqlite::Connection> {
