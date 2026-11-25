@@ -158,15 +158,19 @@ fn signal_name(signal: libc::c_int) -> String {
 /// process's.
 #[cfg(target_os = "linux")]
 pub fn own_cgroup_oom_kills(pid: i32) -> Option<u64> {
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
-    let leaf = path.rsplit('/').next()?;
-    let own =
-        leaf == format!("vm-{pid}") || (leaf.starts_with("smolvm-vm-") && leaf.ends_with(".scope"));
-    if !own {
+    let path = crate::process::cgroup_v2_process_dir(pid)?;
+    #[cfg(feature = "deep-runtime")]
+    let owned = crate::systemd_scope::owns_cgroup(&path, None);
+    #[cfg(not(feature = "deep-runtime"))]
+    let owned = crate::process::owned_delegated_cgroup(&path, pid)
+        || path
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .is_some_and(|leaf| leaf.starts_with("smolvm-vm-") && leaf.ends_with(".scope"));
+    if !owned {
         return None;
     }
-    let events = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.events")).ok()?;
+    let events = std::fs::read_to_string(path.join("memory.events")).ok()?;
     events
         .lines()
         .find_map(|line| line.strip_prefix("oom_kill "))

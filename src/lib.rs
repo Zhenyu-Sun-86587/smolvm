@@ -61,6 +61,9 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+#[cfg(all(feature = "deep-runtime", not(target_os = "linux")))]
+compile_error!("deep-runtime requires Linux");
+
 pub mod agent;
 pub mod api;
 /// Reference-safe lifecycle management for Linux shared pack and COW caches.
@@ -88,6 +91,9 @@ pub mod cuda_host;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;
 pub mod db;
+/// Host state and socket ownership for the deep distribution.
+#[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+pub mod deep_state;
 pub mod deletion;
 pub mod disk_grants;
 pub mod disk_utils;

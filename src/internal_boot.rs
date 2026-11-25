@@ -128,6 +128,13 @@ pub fn run_owned(config_path: PathBuf, token: String) -> crate::Result<()> {
 
 fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
     let t_proc = std::time::Instant::now();
+    #[cfg(feature = "deep-runtime")]
+    {
+        crate::deep_state::require_private_path(&config_path)?;
+        let scope = std::env::var("SMOLVM_DEEP_VM_SCOPE")
+            .map_err(|_| crate::Error::config("start deep VM", "no owning VM scope supplied"))?;
+        crate::systemd_scope::verify_boot_scope(&scope)?;
+    }
     // Map the anonymous commit file before redirecting stdin or closing inherited
     // descriptors. The mapping also survives the later credential/sandbox setup.
     #[cfg(unix)]
@@ -214,6 +221,8 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
                 "boot config does not belong to this startup",
             ));
         }
+        #[cfg(feature = "deep-runtime")]
+        crate::deep_state::require_private_path(&ticket.database)?;
         crate::db::SmolvmDb::open_at(&ticket.database)?.admit_vm_boot(&token)?;
     } else if config.startup_ticket.is_some() {
         return Err(crate::Error::agent_conflict(
@@ -346,7 +355,9 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
         // guest can't peg host CPU, fork-bomb the host, or balloon VMM memory. Inert
         // when the env var is unset (no delegation) — never blocks boot.
         #[cfg(target_os = "linux")]
-        if let Some(cgroup_root) = std::env::var_os("SMOLVM_CGROUP_ROOT") {
+        if let Some(cgroup_root) =
+            std::env::var_os("SMOLVM_CGROUP_ROOT").filter(|_| !cfg!(feature = "deep-runtime"))
+        {
             // A CPU limit set on the machine holds for every VMM it launches.
             let vm_dir = config.vsock_socket.parent();
             let (cpu_limit, cpu_quota) = vm_dir.map_or(

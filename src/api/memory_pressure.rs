@@ -645,6 +645,11 @@ fn kill_for_slice(candidates: &[Candidate], slice: &SliceSample, last_kill: &mut
 
 /// The guard loop; returns on shutdown.
 pub async fn run(state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<bool>) {
+    if cfg!(feature = "deep-runtime") {
+        // A Serve only knows its own records. Worker-wide reclaim and
+        // relief need a single owner that sees all bundles' executions.
+        return;
+    }
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_resume: Option<Instant> = None;
