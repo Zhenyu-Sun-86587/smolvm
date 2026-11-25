@@ -242,9 +242,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_network_dns.sql"))?;
                 tx.execute_batch(include_str!("schema_managed_forks.sql"))?;
                 tx.execute_batch(include_str!("schema_capture_network.sql"))?;
-                tx.execute_batch("PRAGMA user_version=15")?;
+                tx.execute_batch(include_str!("schema_lifecycle.sql"))?;
+                tx.execute_batch("PRAGMA user_version=17")?;
             }
-            1..=15 => {
+            1..=15 | 17 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -287,8 +288,12 @@ impl Catalog {
                 }
                 if version < 15 {
                     tx.execute_batch(include_str!("schema_capture_network.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=15")?;
                 }
+                if version < 17 {
+                    tx.execute_batch(include_str!("schema_lifecycle.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=17")?;
+                }
+                crate::lifecycle_controller::recover(&tx)?;
                 crate::network_lease_catalog::recover(&tx)?;
                 crate::activation_catalog::recover(&tx)?;
                 let old_boot: String =
