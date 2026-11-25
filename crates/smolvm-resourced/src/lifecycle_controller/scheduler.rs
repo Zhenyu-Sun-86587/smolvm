@@ -178,7 +178,7 @@ fn record(
     o: &Observation,
     start: Option<u64>,
 ) -> Result<()> {
-    let tx = c.db.unchecked_transaction()?;
+    let tx = Transaction::new_unchecked(&c.db, TransactionBehavior::Immediate)?;
     let n: i64 = tx.query_row(
         "SELECT coalesce(max(rowid),0)+1 FROM lifecycle_decisions",
         [],

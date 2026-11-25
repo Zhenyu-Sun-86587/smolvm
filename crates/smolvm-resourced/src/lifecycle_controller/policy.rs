@@ -82,6 +82,7 @@ impl Policy {
             || self.reclaim_priority > 100
             || !matches!(self.pressure_reclaim.as_str(), "disabled" | "idle_only")
             || self.activity.unknown != "block_auto_sleep"
+            || !self.activity.protect_running_leases
             || self.standby_after_seconds > max
             || self.hibernate_after_seconds > max
             || self.min_running_after_wake_seconds > max

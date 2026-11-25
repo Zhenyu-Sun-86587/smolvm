@@ -6,7 +6,7 @@ mod scheduler;
 use crate::catalog::Catalog;
 use crate::ipc::{valid_id, Expected, Fault, Request, Result};
 use policy::Policy;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -255,8 +255,8 @@ fn report(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> Result<Valu
 
 pub(crate) fn handle(c: &mut Catalog, r: &Request) -> Result<Value> {
     let (_, bundle, expected) = r.scope()?;
-    let (actual, _) = binding(c, r)?;
     if r.method == "QueryLifecycleEvents" {
+        let (actual, _) = binding(c, r)?;
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Since {
@@ -272,9 +272,11 @@ pub(crate) fn handle(c: &mut Catalog, r: &Request) -> Result<Value> {
         return Ok(json!({"events":rows}));
     }
     if r.method == "GetLifecycleStatus" {
+        let (actual, _) = binding(c, r)?;
         return scheduler::status(c, &actual);
     }
     if r.method == "QueryProtection" {
+        let (actual, _) = binding(c, r)?;
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Query {
@@ -297,7 +299,10 @@ pub(crate) fn handle(c: &mut Catalog, r: &Request) -> Result<Value> {
     let (id, digest) = r.operation()?;
     let scope = json!([r.method, r.route_id, bundle, expected, r.payload, digest]);
     let fingerprint = format!("sha256:{:x}", Sha256::digest(scope.to_string()));
-    let tx = c.db.transaction()?;
+    // Take the WAL writer before reading the binding and request receipt. A
+    // concurrent native state transition must serialize with this decision.
+    let tx = Transaction::new_unchecked(&c.db, TransactionBehavior::Immediate)?;
+    let (actual, _) = binding(c, r)?;
     if let Some((prior, answer)) = tx
         .query_row(
             "SELECT digest,reply FROM lifecycle_requests WHERE instance_id=? AND request_id=?",
