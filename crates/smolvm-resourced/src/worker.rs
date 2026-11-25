@@ -373,6 +373,7 @@ impl Worker {
                 | "ReconcileWriterSet"
                 | "CommitWriterPivot"
                 | "FinalizeWriterPivot"
+                | "VerifyGuestTransport"
                 | "ValidateRestoreWriterSet"
         ) && (!descriptors.is_empty() || !request.fd_table.is_empty())
         {
@@ -494,6 +495,32 @@ impl Worker {
                 self.network
                     .acknowledge(&self.catalog, request, &execution)
                     .map(|lease| json!(lease))
+            }
+            "VerifyGuestTransport" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new(
+                        "E_PERMISSION_DENIED",
+                        "trusted Guest relay control peer required",
+                    ));
+                }
+                let execution = self.scoped_execution(request)?;
+                if descriptors.len() != 1
+                    || request.fd_table.len() != 1
+                    || request.fd_table[0].role != "guest_transport"
+                    || request.fd_table[0].resource_id != execution.incarnation_id
+                {
+                    return Err(Fault::invalid(
+                        "one accepted Guest transport descriptor is required",
+                    ));
+                }
+                self.verify_live_execution(&execution)?;
+                let connection = descriptors
+                    .into_iter()
+                    .next()
+                    .expect("one checked descriptor");
+                crate::guest_transport::verify(&self.catalog, &execution, connection)?;
+                self.verify_live_execution(&execution)?;
+                Ok(json!(execution))
             }
             "DialNetworkAttachment" => {
                 if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
@@ -798,6 +825,25 @@ impl Worker {
             "QueryNetworkAttachment" => {
                 crate::network_runtime::NetworkRuntime::query(&self.catalog, request)
                     .map(|lease| json!(lease))
+            }
+            "QueryExecutionNetworkAttachment" => {
+                let execution = self.scoped_execution(request)?;
+                self.verify_live_execution(&execution)?;
+                let leases = self.catalog.tap_leases_for_execution(&execution)?;
+                if leases.is_empty() {
+                    return Err(Fault::new(
+                        "E_NOT_FOUND",
+                        "execution has no managed network attachment",
+                    ));
+                }
+                let [lease] = leases.as_slice() else {
+                    return Err(Fault::new(
+                        "E_CAPABILITY_UNSUPPORTED",
+                        "service dial requires one managed uplink",
+                    ));
+                };
+                let operation = self.catalog.operation(&execution.last_operation_id)?;
+                Ok(json!({"lease": lease, "request_digest": operation.request_digest}))
             }
             "FenceNetworkAttachment" => {
                 self.network.fence(&self.catalog, request)?;
