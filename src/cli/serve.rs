@@ -376,7 +376,7 @@ impl ServeStartCmd {
         #[cfg(target_os = "linux")]
         if cfg!(feature = "deep-runtime") {
             tracing::info!(
-                slice = smolvm::systemd_scope::VM_SLICE,
+                slice = smolvm::systemd_scope::vm_slice()?,
                 "deep VM slice budgets belong to the Worker"
             );
         } else if smolvm::systemd_scope::is_available() {

@@ -1457,6 +1457,7 @@ impl Worker {
         }
         let (start, pidfd) = observe_pid(target.pid)?;
         verify_executable(target.pid, start, &pidfd, &self.catalog.bundle(bundle)?)?;
+        self.verify_execution_scope(&op.operation_id, target.pid)?;
         crate::managed::claim(
             &self.catalog,
             &op.operation_id,
@@ -1525,6 +1526,7 @@ impl Worker {
             &permit.pidfd,
             &self.catalog.bundle(bundle)?,
         )?;
+        self.verify_execution_scope(&op.operation_id, peer.pid)?;
         let execution = self.catalog.register_execution(
             &op,
             NewExecution {
@@ -1578,6 +1580,21 @@ impl Worker {
         Ok(execution)
     }
 
+    fn verify_execution_scope(&self, operation: &str, pid: i32) -> Result<()> {
+        let managed: bool = self.catalog.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_launches WHERE operation_id=?)",
+            [operation],
+            |row| row.get(0),
+        )?;
+        if managed && !crate::worker_scope::contains_process(pid).map_err(broker_error)? {
+            return Err(Fault::new(
+                "E_FENCE_UNPROVEN",
+                "managed VMM is outside the Worker VM slice",
+            ));
+        }
+        Ok(())
+    }
+
     fn verify_live_execution(&self, execution: &Execution) -> Result<()> {
         if execution.phase != "registered" || execution.host_boot_id != self.boot {
             return Err(stale_execution());
@@ -1591,8 +1608,8 @@ impl Worker {
             execution.pid_start_time,
             pidfd,
             &self.catalog.bundle(&execution.bundle_digest)?,
-        )
-        .map(|_| ())
+        )?;
+        self.verify_execution_scope(&execution.last_operation_id, execution.pid)
     }
 
     fn reconcile_execution(&mut self, r: &Request, peer: libc::ucred) -> Result<Value> {
@@ -1622,6 +1639,7 @@ impl Worker {
             &pidfd,
             &self.catalog.bundle(&execution.bundle_digest)?,
         )?;
+        self.verify_execution_scope(&execution.last_operation_id, execution.pid)?;
         let result = self
             .catalog
             .reconcile_execution(&execution.incarnation_id)?;
@@ -2308,6 +2326,7 @@ fn serve(
     socket_gid: Option<u32>,
     admin_uid: Option<u32>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    crate::worker_scope::configured_slice()?;
     check_socket_parent(socket_path)?;
     let address = SockAddr::unix(socket_path)?;
     let control_path = socket_path.with_extension("resourced.lock");

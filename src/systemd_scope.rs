@@ -88,11 +88,21 @@ fn busctl_bounded(mut cmd: Command, timeout: Duration) -> Result<Output> {
 /// own, all VMs together weigh the same as all host services together, so the
 /// node keeps at least half the CPU however many VMs it runs. systemd creates
 /// the slice on demand the first time a scope names it.
-pub const VM_SLICE: &str = if cfg!(feature = "deep-runtime") {
-    "smolvmdeep.slice"
-} else {
-    "smolvm.slice"
-};
+#[cfg(feature = "deep-runtime")]
+pub const VM_SLICE: &str = smolvm_resourced::worker_scope::DEFAULT_SLICE;
+
+/// The official runtime slice.
+#[cfg(not(feature = "deep-runtime"))]
+pub const VM_SLICE: &str = "smolvm.slice";
+
+/// The systemd slice this runtime uses to admit its VM processes.
+pub fn vm_slice() -> Result<&'static str> {
+    #[cfg(feature = "deep-runtime")]
+    return smolvm_resourced::worker_scope::configured_slice()
+        .map_err(|error| Error::config("VM slice", error.to_string()));
+    #[cfg(not(feature = "deep-runtime"))]
+    Ok(VM_SLICE)
+}
 
 /// Share of the [`VM_SLICE`] memory limit that page cache is kept below by
 /// proactive reclaim. Cache above this line counts as free headroom for
@@ -526,7 +536,10 @@ fn deep_scope_name_owned(name: &str, instance: &str) -> bool {
 
 #[cfg(feature = "deep-runtime")]
 fn deep_scope_dir_owned(dir: &Path, instance: &str, machine: Option<&str>) -> bool {
-    let slice = Path::new("/sys/fs/cgroup").join(VM_SLICE);
+    let Ok(name) = vm_slice() else {
+        return false;
+    };
+    let slice = Path::new("/sys/fs/cgroup").join(name);
     dir.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|leaf| {
@@ -547,7 +560,7 @@ pub(crate) fn verify_boot_scope(scope: &str) -> Result<()> {
             "boot scope does not belong to this deep runtime",
         ));
     }
-    let wanted = format!("0::/{VM_SLICE}/{scope}");
+    let wanted = format!("0::/{}/{scope}", vm_slice()?);
     let limit = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if std::fs::read_to_string("/proc/self/cgroup")?
@@ -577,7 +590,7 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
     let busctl = busctl_path()
         .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot create scope"))?;
     let name = scope_name(machine_id);
-    let args = scope_start_args(machine_id, pid, caps);
+    let args = scope_start_args(machine_id, pid, caps, vm_slice()?);
     let mut cmd = Command::new(&busctl);
     cmd.args(&args);
     let mut out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
@@ -632,7 +645,7 @@ fn reset_failed_scope(busctl: &std::path::Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn scope_start_args(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Vec<String> {
+fn scope_start_args(machine_id: &str, pid: i32, caps: &ScopeCaps, slice: &str) -> Vec<String> {
     let name = scope_name(machine_id);
 
     // Build the a(sv) property list in busctl's positional encoding:
@@ -649,7 +662,7 @@ fn scope_start_args(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Vec<String>
         format!("smolvm VM {machine_id}"),
     ]);
     nprops += 1;
-    props.extend(["Slice".into(), "s".into(), VM_SLICE.into()]);
+    props.extend(["Slice".into(), "s".into(), slice.into()]);
     nprops += 1;
     if let Some(m) = caps.memory_high_bytes {
         props.extend(["MemoryHigh".into(), "t".into(), m.to_string()]);
@@ -963,7 +976,7 @@ mod tests {
                 cpu_quota_usec_per_sec: (mask & 4 != 0).then_some(300),
                 tasks_max: (mask & 8 != 0).then_some(400),
             };
-            let args = scope_start_args("test", 123, &caps);
+            let args = scope_start_args("test", 123, &caps, VM_SLICE);
             let declared: usize = args[8].parse().unwrap();
             let mut cursor = 9;
             for _ in 0..declared {
@@ -983,7 +996,7 @@ mod tests {
 
     #[test]
     fn every_vm_scope_runs_in_the_vm_slice() {
-        let args = scope_start_args("m", 1, &ScopeCaps::default());
+        let args = scope_start_args("m", 1, &ScopeCaps::default(), VM_SLICE);
         let at = args.iter().position(|a| a == "Slice").expect("Slice set");
         assert_eq!(&args[at + 1..at + 3], &["s", VM_SLICE]);
     }
