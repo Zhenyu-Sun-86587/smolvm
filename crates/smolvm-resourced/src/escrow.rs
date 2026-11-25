@@ -62,19 +62,19 @@ struct TransferId {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Acquire {
-    lease_id: String,
-    resource_id: String,
-    access: String,
+pub(crate) struct Acquire {
+    pub lease_id: String,
+    pub resource_id: String,
+    pub access: String,
     #[serde(default)]
-    offset: usize,
+    pub offset: usize,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LeaseUpdate {
-    lease_id: String,
-    expected_revision: i64,
+pub(crate) struct LeaseUpdate {
+    pub lease_id: String,
+    pub expected_revision: i64,
 }
 
 struct Backing {
@@ -628,7 +628,7 @@ impl Escrow {
         Ok(json!(updated))
     }
 
-    fn scoped_lease(
+    pub(crate) fn scoped_lease(
         catalog: &Catalog,
         request: &Request,
         execution: &Execution,

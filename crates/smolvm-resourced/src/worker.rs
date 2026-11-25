@@ -289,7 +289,7 @@ pub(crate) fn openat(parent: &File, name: &str, flags: i32) -> io::Result<File> 
     }
 }
 
-fn ofd_lock(file: &File) -> Result<()> {
+pub(crate) fn ofd_lock(file: &File) -> Result<()> {
     let lock = libc::flock {
         l_type: libc::F_WRLCK as i16,
         l_whence: libc::SEEK_SET as i16,
@@ -389,22 +389,48 @@ impl Worker {
                         self.escrow.commit(&mut self.catalog, request, &execution)
                     }
                     "ReconcileExecutionExports" => {
-                        self.escrow
-                            .reexport(&mut self.catalog, request, &execution, descriptors)
+                        if self.lease_is_block(request)? {
+                            crate::blocks::reconcile_read(
+                                &mut self.catalog,
+                                &self.objects,
+                                request,
+                                &execution,
+                                descriptors,
+                            )
+                        } else {
+                            self.escrow.reexport(
+                                &mut self.catalog,
+                                request,
+                                &execution,
+                                descriptors,
+                            )
+                        }
                     }
                     "AbortGenerationTransfer" => {
                         self.escrow.abort(&self.catalog, request, &execution)
                     }
                     "AcquireResourceLease" => {
-                        let lease = self
-                            .escrow
-                            .acquire(&mut self.catalog, request, &execution)?;
+                        let input: crate::escrow::Acquire = request.payload()?;
+                        let lease = if self.catalog.has_managed_block(&input.resource_id)? {
+                            crate::blocks::acquire_read(
+                                &mut self.catalog,
+                                &self.objects,
+                                request,
+                                &execution,
+                            )?
+                        } else {
+                            self.escrow
+                                .acquire(&mut self.catalog, request, &execution)?
+                        };
                         return Ok(Reply {
                             result: lease.result,
                             table: lease.fd_table,
                             descriptors: lease.fds,
                             delivered: Some(lease.delivered),
                         });
+                    }
+                    "AckAttached" if self.lease_is_block(request)? => {
+                        crate::blocks::ack_read(&mut self.catalog, request, &execution)
                     }
                     _ => self.escrow.update_lease(
                         &mut self.catalog,
@@ -417,6 +443,15 @@ impl Worker {
             _ => self.handle(request, peer),
         }?;
         Ok(result.into())
+    }
+
+    fn lease_is_block(&self, request: &Request) -> Result<bool> {
+        if request.payload.get("lease_id").is_none() {
+            return Ok(false);
+        }
+        let input: crate::escrow::LeaseUpdate = request.payload()?;
+        let lease = self.catalog.lease(&input.lease_id)?;
+        self.catalog.has_managed_block(&lease.resource_id)
     }
 
     fn handle(&mut self, request: &Request, peer: libc::ucred) -> Result<Value> {
@@ -543,6 +578,7 @@ impl Worker {
                     .gc(&data.resource_id, data.expected_revision, collect)?;
                 if collect {
                     self.escrow.collect(&data.resource_id);
+                    crate::blocks::collect(&self.catalog, &self.objects, &data.resource_id)?;
                 }
                 Ok(result)
             }
@@ -554,6 +590,11 @@ impl Worker {
             }
             "CreateVolumeHead" => {
                 crate::blocks::create(&mut self.catalog, &self.objects, request, None, false)
+            }
+            "AbortBlockCreation" => crate::blocks::abort(&self.catalog, &self.objects, request),
+            "SealVolumeHeads" => {
+                let data: Heads = request.payload()?;
+                crate::blocks::seal_heads(&mut self.catalog, &self.objects, request, data.heads)
             }
             "QueryBlockClosure" => {
                 let data: ResourceId = request.payload()?;
@@ -868,6 +909,7 @@ impl Worker {
         let mut locks = Vec::with_capacity(heads.len());
         let mut registered = Vec::with_capacity(heads.len());
         for head in heads {
+            self.catalog.require_unsealed_head(&head.head_resource_id)?;
             let wanted = self.catalog.volume_identity(&head)?;
             let (file, identity) = self.open_backing(&head.head_resource_id)?;
             if identity != wanted {

@@ -241,6 +241,10 @@ def orchestrate(broker, library, guest):
             observer, observer_log = launch("observer")
             following = operation("observer", GRANT_KIND)
             call("BeginOperation", {"kind": GRANT_KIND}, **following)
+            seal = dict(operation("observer", "seal", 0),
+                        expected={"instance_id": "volume-seal", "execution_epoch": 0, "incarnation_id": None})
+            call("BeginOperation", {"kind": "catalog"}, **seal)
+            expect_error("E_FENCE_UNPROVEN", "SealVolumeHeads", {"heads": heads}, **seal)
             expect_error("E_VOLUME_WRITER_CONFLICT", "ReserveWriterSet", {"heads": heads}, **following)
             expect_error("E_FENCE_UNPROVEN", "FinalizeExecutionExit", **operation("writer", "launch"))
             escaped = command(source, "leak")["pid"]
@@ -261,7 +265,26 @@ def orchestrate(broker, library, guest):
                     "writer exit was not finalized")
             require(call("QueryWriterSet", operation_id=writer["operation_id"])["state"] == "released",
                     "writer set did not release")
-            call("ReserveWriterSet", {"heads": heads}, **following)
+            receipt = call("SealVolumeHeads", {"heads": heads}, **seal)
+            require(call("SealVolumeHeads", {"heads": heads}, **seal) == receipt, "block seal replay changed")
+            require(len(receipt["generations"]) == 2 and all(layer["sealed"] for layer in receipt["generations"]),
+                    receipt)
+            next_heads = []
+            for prior in heads:
+                current = "child-" + prior["head_resource_id"]
+                call("CreateVolumeHead", {
+                    "resource_id": current, "volume_id": prior["volume_id"],
+                    "backing_id": prior["head_resource_id"], "capacity_bytes": capacity,
+                }, **seal)
+                closure = call("QueryBlockClosure", {"resource_id": current})
+                require([layer["resource_id"] for layer in closure["layers"]] ==
+                        [current, prior["head_resource_id"], "base"], closure)
+                call("DropOwnerRef", {"owner_kind": "operation", "owner_id": seal["operation_id"],
+                     "resource_id": prior["head_resource_id"], "expected_revision": 1}, **seal)
+                next_heads.append(dict(prior, head_resource_id=current))
+            call("FinishOperation", finish, **seal)
+            print("BOTH_GENERATIONS_SEALED_AND_CLONED", flush=True)
+            call("ReserveWriterSet", {"heads": next_heads}, **following)
             require(command(observer, "boot")["state"] == "attached", "observer was not attached")
             call("FinishOperation", finish, **following)
             await_guest(observer, observer_log, "BLOCK_OBSERVED_BOTH")

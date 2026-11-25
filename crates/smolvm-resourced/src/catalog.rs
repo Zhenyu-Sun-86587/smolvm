@@ -471,8 +471,10 @@ impl Catalog {
              OR (? AND EXISTS (SELECT 1 FROM executions WHERE last_operation_id=?))
              OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='operation' AND owner_id=? AND state='active')
              OR EXISTS (SELECT 1 FROM fd_transfers WHERE operation_id=? AND state='staging')
-             OR EXISTS (SELECT 1 FROM fd_leases WHERE operation_id=? AND state='pending')",
-            params![id, abort, abort, id, id, id, id], |r| r.get(0))?;
+             OR EXISTS (SELECT 1 FROM fd_leases WHERE operation_id=? AND state='pending')
+             OR EXISTS (SELECT 1 FROM managed_blocks WHERE operation_id=? AND backing_identity IS NULL)
+             OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='block_seal' AND owner_id=? AND state='active')",
+            params![id, abort, abort, id, id, id, id, id, id], |r| r.get(0))?;
         if occupied {
             return Err(conflict(
                 "E_OPERATION_HAS_EFFECTS",
@@ -711,9 +713,9 @@ impl Catalog {
         }
         let op = self.active_operation(r)?;
         identifier(kind)?;
-        if kind == "fd_lease" {
+        if matches!(kind, "fd_lease" | "block_seal") {
             return Err(Fault::invalid(
-                "descriptor lease roots are controlled by the escrow protocol",
+                "this root kind is controlled by the resource protocol",
             ));
         }
         identifier(owner)?;
@@ -793,6 +795,19 @@ impl Catalog {
 
     pub fn gc(&mut self, id: &str, revision: i64, collect: bool) -> Result<Value> {
         self.ready()?;
+        if collect {
+            let already_deleted: Option<i64> = self
+                .db
+                .query_row(
+                    "SELECT revision FROM resources WHERE resource_id=? AND state='deleted'",
+                    [identifier(id)?],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if already_deleted.is_some() && already_deleted == revision.checked_add(1) {
+                return self.resource(id);
+            }
+        }
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

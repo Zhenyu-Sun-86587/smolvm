@@ -78,13 +78,17 @@ Import a raw base with `ImportImmutableBlock` under an active catalog operation.
 
 Call `CreateVolumeHead` with a unique `resource_id`, `volume_id` and `capacity_bytes`. Pass `backing_id` to create a thin qcow2 head over the exact immutable generation. A head without a backing is sparse raw. The committed closure is available through `QueryBlockClosure`. Qcow2 headers store backing resource IDs. The VMM matches those IDs and formats to supplied ancestor FDs.
 
+Retry an interrupted object creation with the same operation and spec. Use `AbortBlockCreation` before finishing the operation if a staged import must be discarded. Once every writer has been fenced, `SealVolumeHeads` accepts an entire set of current heads and converts them to immutable generations in one catalog publication. The original resource IDs and inodes are retained. Pending seals pin the set and prevent new writer reservations until the same seal completes. The operation holds pins on the committed generations so new heads or durable references can be installed before release.
+
+`AcquireResourceLease` with `access=ro` delivers an immutable block generation and its ancestor descriptors. Ack and release use the same lease protocol as RAM. Reconcile a read lease after restart by sending the exact read-only closure with the `block_ancestor` role. An attempt to lease a mutable head for reading returns a writer conflict. Immutable objects stay on disk until a collection transaction verifies that their references are gone.
+
 1. The control process reserves a complete set of heads with `ReserveWriterSet`.
 2. The registered VMM calls `AcquireWriterSet` under that operation with a new `grant_id` and the reservation's `expected_revision`. The broker records the offer before delivering the entire set. The `block_writer` entries carry the locked `O_RDWR` descriptions. The `block_ancestor` entries carry read-only immutable descriptions.
 3. The VMM installs the full device set with `krun_attach_block_set_v1` and calls `AckWriterSetAttached` with the grant revision. This drops the broker's writer duplicates and allows the control operation to finish while the actual grant remains live. The supplied libkrun path uses the original open file descriptions and full synchronous block I/O.
 4. A surviving VMM reestablishes its process identity after restart and calls `ReconcileWriterSet` with the unknown grant revision and every exact writable descriptor. The broker verifies the inode and existing exclusive OFD for each head. A failed or partial proof preserves the grant.
 5. Finalizing a dead execution requires fresh exclusive OFD locks on all issued heads and a successful sync. An OFD inherited by another process prevents release even after the registered VMM exits.
 
-The x86-64 KVM block probe boots two distinct registered executions. The first reads the shared immutable base from two qcow2 heads and writes and flushes distinct markers. Broker restart recovers the live writer, and a deliberately inherited duplicate prevents death fencing. Once that holder exits, the second execution acquires both heads and reads both persisted markers. The immutable base stays byte-for-byte identical.
+The x86-64 KVM block probe boots two distinct registered executions. The first reads the shared immutable base from two qcow2 heads and writes and flushes distinct markers. Broker restart recovers the live writer, and a deliberately inherited duplicate prevents death fencing. Once that holder exits, the worker seals both heads and creates two new writable tips. The second execution obtains the new tips and reads both persisted markers through the captured generations. The immutable base stays byte-for-byte identical.
 
 ```sh
 cc -O2 -Wall -Wextra -Werror -static \
