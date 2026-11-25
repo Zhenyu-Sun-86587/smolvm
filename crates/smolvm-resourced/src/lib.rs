@@ -21,6 +21,12 @@ mod grants;
 #[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]
+pub mod native_client;
+#[cfg(target_os = "linux")]
+mod native_control;
+#[cfg(target_os = "linux")]
+mod native_operations;
+#[cfg(target_os = "linux")]
 pub mod network;
 #[cfg(target_os = "linux")]
 mod network_catalog;

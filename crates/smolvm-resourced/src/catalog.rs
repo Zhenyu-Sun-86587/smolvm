@@ -24,6 +24,8 @@ pub struct Operation {
     pub bundle_digest: String,
     pub expected_execution_epoch: i64,
     pub expected_incarnation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<crate::native_operations::Progress>,
     pub phase: String,
     pub decision: String,
     pub revision: i64,
@@ -39,6 +41,7 @@ fn operation_row(row: &Row<'_>) -> rusqlite::Result<Operation> {
         bundle_digest: row.get(5)?,
         expected_execution_epoch: row.get(6)?,
         expected_incarnation_id: row.get(7)?,
+        native: None,
         phase: row.get(8)?,
         decision: row.get(9)?,
         revision: row.get(10)?,
@@ -222,9 +225,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_writer_pivots.sql"))?;
                 crate::network_lease_catalog::install(&tx)?;
                 crate::activation_catalog::install(&tx)?;
-                tx.execute_batch("PRAGMA user_version=7")?;
+                tx.execute_batch(include_str!("schema_native_operations.sql"))?;
+                tx.execute_batch("PRAGMA user_version=8")?;
             }
-            1..=7 => {
+            1..=8 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -242,7 +246,10 @@ impl Catalog {
                 }
                 if version < 7 {
                     crate::activation_catalog::install(&tx)?;
-                    tx.execute_batch("PRAGMA user_version=7")?;
+                }
+                if version < 8 {
+                    tx.execute_batch(include_str!("schema_native_operations.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=8")?;
                 }
                 crate::network_lease_catalog::recover(&tx)?;
                 crate::activation_catalog::recover(&tx)?;
@@ -315,7 +322,9 @@ impl Catalog {
                 OR EXISTS (SELECT 1 FROM operations WHERE phase='NEW')
                 OR EXISTS (SELECT 1 FROM writer_reservations r LEFT JOIN writer_grants g USING(operation_id)
                     WHERE g.grant_id IS NULL OR g.state!='attached')
-                OR EXISTS (SELECT 1 FROM fd_leases WHERE state='unknown')",
+                OR EXISTS (SELECT 1 FROM fd_leases WHERE state='unknown')
+                OR EXISTS (SELECT 1 FROM network_tap_leases WHERE state='unknown')
+                OR EXISTS (SELECT 1 FROM target_activations WHERE phase='unknown')",
             [],
             |r| r.get(0),
         )?;
@@ -368,10 +377,21 @@ impl Catalog {
     }
 
     pub fn operation(&self, id: &str) -> Result<Operation> {
-        op(&self.db, id)?.ok_or_else(|| not_found("operation"))
+        let mut operation = op(&self.db, id)?.ok_or_else(|| not_found("operation"))?;
+        operation.native = crate::native_operations::progress(&self.db, id)?;
+        Ok(operation)
     }
 
     pub fn begin(&mut self, r: &Request, kind: &str) -> Result<Operation> {
+        self.begin_with(r, kind, |_| Ok(()))
+    }
+
+    pub(crate) fn begin_with(
+        &mut self,
+        r: &Request,
+        kind: &str,
+        record: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    ) -> Result<Operation> {
         let (id, digest) = r.operation()?;
         let (route, bundle, expected) = r.scope()?;
         identifier(kind)?;
@@ -422,6 +442,7 @@ impl Catalog {
         tx.execute("INSERT INTO instance_bindings(route_id,instance_id,execution_epoch,active_operation_id)
             VALUES(?,?,0,?) ON CONFLICT(route_id,instance_id) DO UPDATE SET active_operation_id=excluded.active_operation_id",
             params![route, expected.instance_id, id])?;
+        record(&tx)?;
         tx.commit()?;
         self.operation(id)
     }
@@ -460,6 +481,12 @@ impl Catalog {
     }
 
     pub fn finish(&mut self, r: &Request, abort: bool, revision: i64) -> Result<Operation> {
+        if crate::native_operations::progress(&self.db, r.operation()?.0)?.is_some() {
+            return Err(conflict(
+                "E_OPERATION_HAS_EFFECTS",
+                "native execution outcome is owned by the Worker actor",
+            ));
+        }
         let mut operation = self.matching_operation(r)?;
         let final_phase = if abort { "ABORTED" } else { "COMPLETED" };
         if operation.phase == final_phase
@@ -595,6 +622,46 @@ impl Catalog {
             params![incarnation, new.expected.execution_epoch, new.route, new.expected.instance_id])?;
         tx.commit()?;
         self.execution(incarnation)
+    }
+
+    pub fn query_binding(&self, r: &Request) -> Result<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Instance {
+            instance_id: String,
+        }
+        let input: Instance = r.payload()?;
+        let id = identifier(&input.instance_id)?;
+        let route = r
+            .route_id
+            .as_deref()
+            .ok_or_else(|| Fault::invalid("missing route"))?;
+        let bundle = r
+            .bundle_digest
+            .as_deref()
+            .ok_or_else(|| Fault::invalid("missing bundle"))?;
+        self.bundle(bundle)?;
+        let (epoch, incarnation, active) = binding(&self.db, route, id)?;
+        // A shared resource catalog must not leak another bundle's instance.
+        if let Some(incarnation) = &incarnation {
+            if self.execution(incarnation)?.bundle_digest != bundle {
+                return Err(not_found("execution"));
+            }
+        } else if epoch > 0 {
+            let prior:String=self.db.query_row("SELECT bundle_digest FROM executions WHERE route_id=? AND instance_id=? AND execution_epoch=?",
+                params![route,id,epoch], |row|row.get(0))?;
+            if prior != bundle {
+                return Err(not_found("execution"));
+            }
+        }
+        if let Some(op_id) = &active {
+            if self.operation(op_id)?.bundle_digest != bundle {
+                return Err(not_found("execution"));
+            }
+        }
+        Ok(
+            json!({"instance_id":id,"execution_epoch":epoch,"incarnation_id":incarnation,"active_operation_id":active}),
+        )
     }
 
     pub fn execution(&self, id: &str) -> Result<Execution> {

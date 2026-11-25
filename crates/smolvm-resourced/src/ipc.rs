@@ -24,7 +24,7 @@ pub struct Packet {
     pub descriptors: Vec<OwnedFd>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Expected {
     pub instance_id: String,
