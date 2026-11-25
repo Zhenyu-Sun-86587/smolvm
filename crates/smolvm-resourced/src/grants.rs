@@ -1,11 +1,11 @@
 //! Journal of writable OFD sets sent to a particular authorized VMM.
 
 use crate::catalog::{Catalog, Execution};
-use crate::ipc::{valid_id, Fault, Request, Result, MAX_FDS};
+use crate::ipc::{Fault, MAX_FDS, Request, Result, valid_id};
 use crate::pivots::ForkOrigin;
-use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -79,11 +79,11 @@ pub fn verify_restore_writer(
             "restore has no current attached writer grant",
         ));
     }
-    let exact = if let Some(lease) = &wanted.statepoint_lease_id {
-        let policy: String = catalog
+    let lease_scope = if let Some(lease) = &wanted.statepoint_lease_id {
+        let policy: (String, String) = catalog
             .db
             .query_row(
-                "SELECT l.volume_policy FROM statepoint_restore_leases l
+                "SELECT l.volume_policy,p.capture_id FROM statepoint_restore_leases l
             JOIN fd_leases f USING(lease_id) JOIN statepoints p USING(capture_id)
             WHERE l.lease_id=? AND f.operation_id=? AND f.incarnation_id=? AND f.state='attached'
                 AND p.operation_id=? AND p.representation_id=f.resource_id",
@@ -93,15 +93,15 @@ pub fn verify_restore_writer(
                     execution.incarnation_id,
                     wanted.origin.pivot_id
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| {
                 fence_unproven("StatePoint writer policy is outside this restore lease")
             })?;
-        policy == "exact"
+        Some(policy)
     } else {
-        false
+        None
     };
     let set = catalog
         .writer_set(&grant.operation_id)?
@@ -158,6 +158,27 @@ pub fn verify_restore_writer(
             ));
         }
     }
+    if let Some((policy, capture)) = &lease_scope {
+        if crate::backup_import::imported(catalog, capture)? {
+            if policy != "clone_conflicts" {
+                return Err(fence_unproven(
+                    "backup restores require independent writable volumes",
+                ));
+            }
+            crate::pivots::validate_archived_origin(
+                catalog,
+                capture,
+                &wanted.origin,
+                execution,
+                &sources,
+                &volumes,
+            )?;
+            return Ok(json!({"origin":wanted.origin,"grant":grant,"heads":wanted.heads}));
+        }
+    }
+    let exact = lease_scope
+        .as_ref()
+        .is_some_and(|(policy, _)| policy == "exact");
     crate::pivots::validate_fork_origin(
         catalog,
         &wanted.origin,

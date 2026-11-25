@@ -2,15 +2,15 @@
 
 use crate::catalog::{Catalog, Execution, Operation};
 use crate::escrow_catalog::LeaseRecord;
-use crate::ipc::{valid_id, Fault, FdEntry, Request, Result};
+use crate::ipc::{Fault, FdEntry, Request, Result, valid_id};
 use crate::managed_state_restore::{self, RestoreMode as VolumePolicy};
 use crate::native_control::Endpoint;
-use crate::statepoint_capture::{self, host_io, Export, Purpose};
+use crate::statepoint_capture::{self, Export, Purpose, host_io};
 use crate::statepoint_catalog::Record;
 use crate::statepoint_store::{self, Manifest, Point};
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -115,13 +115,16 @@ impl StatePoints {
             }
         }
         catalog.ready()?;
-        if prior.is_none() || operation.kind!="vm_snapshot" {
+        if prior.is_none() || operation.kind != "vm_snapshot" {
             catalog.active_operation(request)?;
         }
         if !self.exports.is_empty() {
             return Err(limits());
         }
-        if !matches!(operation.kind.as_str(), "statepoint" | "writer_pivot" | "vm_snapshot" | "hibernate" | "vm_rollback") {
+        if !matches!(
+            operation.kind.as_str(),
+            "statepoint" | "writer_pivot" | "vm_snapshot" | "hibernate" | "vm_rollback"
+        ) {
             return Err(Fault::invalid(
                 "StatePoint requires its own capture operation",
             ));
@@ -151,8 +154,16 @@ impl StatePoints {
             Some(_) => return Err(conflict("held capture bytes changed on export replay")),
             None => catalog.start_statepoint(&operation, &export, &point)?,
         };
-        crate::activation_catalog::pin_statepoint_tap(catalog, &record, source,
-            record.point.devices.iter().any(|device|device.is_network()))?;
+        crate::activation_catalog::pin_statepoint_tap(
+            catalog,
+            &record,
+            source,
+            record
+                .point
+                .devices
+                .iter()
+                .any(|device| device.is_network()),
+        )?;
         let directory = self.directory.clone();
         let bundle = operation.bundle_digest;
         let commit_id = operation.operation_id;
@@ -202,11 +213,11 @@ impl StatePoints {
             match self.exports.remove(capture_id).unwrap().join() {
                 Ok(Ok(manifest)) => manifest,
                 Ok(Err(error)) => {
-                    return catalog.statepoint_export_failure(&record, &error.to_string())
+                    return catalog.statepoint_export_failure(&record, &error.to_string());
                 }
                 Err(_) => {
                     return catalog
-                        .statepoint_export_failure(&record, "durable export worker exited")
+                        .statepoint_export_failure(&record, "durable export worker exited");
                 }
             }
         } else {
@@ -350,11 +361,17 @@ impl StatePoints {
         let input: Acquire = request.payload()?;
         let (point, source) = self.valid_restore(catalog, request, &input.capture_id)?;
         let operation = catalog.active_operation(request)?;
+        let imported = crate::backup_import::imported(catalog, &input.capture_id)?;
         if !valid_id(&input.lease_id)
             || operation.kind != "restore_target"
             || target.incarnation_id == point.point.incarnation_id
-            || (point.export.purpose != Purpose::Checkpoint
+            || (!imported
+                && point.export.purpose != Purpose::Checkpoint
                 && source.instance_id != target.instance_id)
+            || (imported
+                && (source.instance_id == target.instance_id
+                    || target.execution_epoch != 1
+                    || input.volume_restore_policy != VolumePolicy::CloneConflicts))
         {
             return Err(Fault::new(
                 "E_FENCE_UNPROVEN",

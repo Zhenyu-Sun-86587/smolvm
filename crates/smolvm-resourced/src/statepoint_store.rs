@@ -108,6 +108,12 @@ impl Manifest {
     pub fn digest(&self) -> io::Result<String> {
         Ok(digest(&serde_json::to_vec(self)?))
     }
+
+    pub(crate) fn disk_hashes(&self) -> impl Iterator<Item = (&str, &str, u64)> {
+        self.disk_assets
+            .iter()
+            .map(|disk| (disk.resource_id.as_str(), disk.digest.as_str(), disk.bytes))
+    }
 }
 
 fn digest(data: &[u8]) -> String {

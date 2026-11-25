@@ -206,16 +206,18 @@ fn queue(
         return catalog.begin(request, "restore_target");
     }
     let (point, original) = source(catalog, route, bundle, &input.capture_id)?;
-    if !original.instance_id.starts_with(&format!("i-{namespace}-")) {
+    let imported = crate::backup_import::imported(catalog,&input.capture_id)?;
+    if !imported && !original.instance_id.starts_with(&format!("i-{namespace}-")) {
         return Err(Fault::new(
             "E_PERMISSION_DENIED",
             "StatePoint belongs to a different Serve",
         ));
     }
     let same_machine = original.instance_id == expected.instance_id;
-    if (point.export.purpose == Purpose::Checkpoint && same_machine) != rescue_capture_id.is_some()
+    let archived_target = imported && !same_machine && expected.execution_epoch==0 && rescue_capture_id.is_none() && input.mode==RestoreMode::CloneConflicts;
+    if (imported && !archived_target) || (!imported && ((point.export.purpose == Purpose::Checkpoint && same_machine) != rescue_capture_id.is_some()
         || (point.export.purpose != Purpose::Checkpoint && !same_machine)
-        || (!same_machine && expected.execution_epoch != 0)
+        || (!same_machine && expected.execution_epoch != 0)))
     {
         return Err(Fault::new(
             "E_FENCE_UNPROVEN",
