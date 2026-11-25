@@ -99,6 +99,8 @@ impl PrivateRouter {
             router.namespace(),
             &format!("link set lo up\naddr add {gateway}/32 dev lo\n"),
         )?;
+        // Register conntrack hooks for forwarded traffic and locally dialed services.
+        nft(router.namespace(),"table ip sm_activity { chain ingress { type filter hook prerouting priority filter; policy accept; ct state established counter; } chain local { type filter hook output priority filter; policy accept; ct state established counter; } }")?;
         Ok(router)
     }
 
@@ -260,6 +262,13 @@ impl PrivateRouter {
 }
 
 impl QuarantinedPort {
+    pub(crate) fn activity(&self,address:Ipv4Addr)->io::Result<(u64,u64)> {
+        let router=self.router_link.router.clone();
+        thread::Builder::new().name("observe-network-connections".into()).spawn(move||{
+            if unsafe{libc::setns(router.namespace().as_raw_fd(),libc::CLONE_NEWNET)}!=0{return Err(io::Error::last_os_error())}
+            crate::conntrack::counts(address)
+        })?.join().map_err(|_|io::Error::other("connection collector panicked"))?
+    }
     /// Start a nonblocking connection in the private router namespace, using
     /// the attachment's routed address. The receiver owns connection polling.
     pub(crate) fn dial(&self, address: SocketAddrV4, kind: socket2::Type) -> io::Result<OwnedFd> {

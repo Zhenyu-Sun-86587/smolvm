@@ -9,6 +9,8 @@ mod activation_runtime;
 #[cfg(target_os = "linux")]
 mod admission;
 #[cfg(target_os = "linux")]
+mod lifecycle_controller;
+#[cfg(target_os = "linux")]
 mod blocks;
 #[cfg(target_os = "linux")]
 mod catalog;
@@ -45,6 +47,8 @@ mod network_catalog;
 pub mod network_client;
 #[cfg(target_os = "linux")]
 mod network_dns;
+#[cfg(target_os="linux")]
+mod conntrack;
 #[cfg(target_os = "linux")]
 mod network_lease_catalog;
 #[cfg(target_os = "linux")]

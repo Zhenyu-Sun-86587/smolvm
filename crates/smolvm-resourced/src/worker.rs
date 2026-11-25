@@ -164,6 +164,7 @@ struct Worker {
     activation: ActivationRuntime,
     statepoints: StatePoints,
     forks: crate::managed_fork::Actor,
+    lifecycle:crate::lifecycle_controller::Controller,
 }
 
 struct Reply {
@@ -901,6 +902,14 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            "QueryLifecycleEvents"|"ApplyLifecyclePolicy"|"GetLifecycleStatus"|"ReportActivity"|"AcquireActivityHold"|"ReleaseActivityHold"|"AcquireRunningLease"|"RenewRunningLease"|
+            "ReleaseRunningLease"|"RequestWake"|"AuthorizeWakeActivation"|"CancelWakeDemand"|"QueryProtection" =>
+                crate::lifecycle_controller::handle(&mut self.catalog,request),
+            "QueryHostActivity" => {
+                let source=self.scoped_execution(request)?;
+                if source.phase!="registered" || source.host_boot_id!=self.boot{return Err(stale_execution())}
+                self.network.activity(&self.catalog,&source)
+            }
             "QueryWorkerBudget" => crate::admission::status(&self.catalog.db),
             "QueryProductVolume" => crate::product_volumes::query(&self.catalog, request),
             "ApplyProductVolume" => {
@@ -1672,6 +1681,17 @@ impl Worker {
             {
                 return Err(stale_execution());
             }
+            if record.export.purpose==Purpose::Hibernate {
+                let demand:bool=self.catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_protections WHERE instance_id=? AND
+                    (kind='wake' AND state='pending' OR incarnation_id=? AND kind='hold' AND state IN ('active','suspect')))",
+                    rusqlite::params![source.instance_id,source.incarnation_id],|r|r.get(0))?;
+                if demand {
+                    let mut cancel=crate::managed_statepoint::request(&operation,json!({"expected_revision":operation.revision}));
+                    cancel.method="CancelNativeOperation".into();
+                    crate::managed_fork::cancel(&mut self.catalog,&cancel,cancel.payload()?)?;
+                    return Err(Fault::new("E_OPERATION_IN_PROGRESS","an authorized access arrived before STOP_COMMIT"));
+                }
+            }
             match (record.export.purpose, &input.restore_capture_id) {
                 (Purpose::Hibernate, None) => (),
                 (Purpose::RollbackRescue, Some(target)) if target != &input.capture_id => {
@@ -2289,6 +2309,7 @@ fn serve(
         activation: ActivationRuntime::default(),
         statepoints: StatePoints::new(statepoints),
         forks: Default::default(),
+        lifecycle: Default::default(),
     };
     worker
         .reconnect_native_endpoints()
@@ -2313,6 +2334,9 @@ fn serve(
     let mut next_stop_check = Instant::now() + Duration::from_secs(1);
     loop {
         if Instant::now() >= next_stop_check {
+            if let Err(e)=worker.lifecycle.tick(&mut worker.catalog,&worker.boot) {
+                eprintln!("resourced lifecycle controller: {} {}",e.code,e.message);
+            }
             worker
                 .forks
                 .tick(&mut worker.catalog, &mut worker.escrow, &worker.boot)

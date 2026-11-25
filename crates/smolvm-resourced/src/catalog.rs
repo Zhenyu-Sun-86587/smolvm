@@ -243,9 +243,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_managed_forks.sql"))?;
                 tx.execute_batch(include_str!("schema_capture_network.sql"))?;
                 tx.execute_batch(include_str!("schema_managed_state_restores.sql"))?;
-                tx.execute_batch("PRAGMA user_version=16")?;
+                tx.execute_batch(include_str!("schema_lifecycle.sql"))?;
+                tx.execute_batch("PRAGMA user_version=17")?;
             }
-            1..=16 => {
+            1..=17 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -293,6 +294,11 @@ impl Catalog {
                     tx.execute_batch(include_str!("schema_managed_state_restores.sql"))?;
                     tx.execute_batch("PRAGMA user_version=16")?;
                 }
+                if version < 17 {
+                    tx.execute_batch(include_str!("schema_lifecycle.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=17")?;
+                }
+                crate::lifecycle_controller::recover(&tx)?;
                 crate::network_lease_catalog::recover(&tx)?;
                 crate::activation_catalog::recover(&tx)?;
                 let old_boot: String =
@@ -839,6 +845,8 @@ impl Catalog {
             [id],
         )?;
         crate::managed_fork::source_exited(&tx,id)?;
+        tx.execute("UPDATE lifecycle_protections SET state='released',reason='execution fenced',revision=revision+1
+            WHERE incarnation_id=? AND kind IN ('hold','lease') AND state IN ('suspect','active')",[id])?;
         tx.execute("UPDATE managed_budget_holds SET state='released' WHERE incarnation_id=? AND state='running'",[id])?;
         crate::escrow_catalog::release_execution(&tx, id)?;
         tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='managed_execution' AND owner_id=? AND state='active'",[id])?;

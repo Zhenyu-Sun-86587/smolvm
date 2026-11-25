@@ -716,10 +716,11 @@ impl ServeStartCmd {
         ));
         // Branch children that outgrow the host are paused, newest first, and
         // resumed when memory comes back (see api::memory_pressure).
-        let memory_pressure_handle = tokio::spawn(smolvm::api::memory_pressure::run(
-            state.clone(),
-            shutdown_rx.clone(),
-        ));
+        let memory_pressure_handle = if cfg!(feature = "deep-runtime") {
+            None
+        } else {
+            Some(tokio::spawn(smolvm::api::memory_pressure::run(state.clone(),shutdown_rx.clone())))
+        };
         // Incremental captures publish into the node's checkpoint store; keep
         // it bounded now and after each capture (see checkpoint_retention).
         #[cfg(unix)]
@@ -809,8 +810,10 @@ impl ServeStartCmd {
         if let Err(error) = resize_controller_handle.await {
             tracing::error!(%error, "resize recovery controller failed during shutdown");
         }
-        if let Err(error) = memory_pressure_handle.await {
-            tracing::error!(%error, "memory pressure guard failed during shutdown");
+        if let Some(guard)=memory_pressure_handle {
+            if let Err(error)=guard.await {
+                tracing::error!(%error,"memory pressure guard failed during shutdown");
+            }
         }
         let mut pool_controller_handle = pool_controller_handle;
         match tokio::time::timeout(
