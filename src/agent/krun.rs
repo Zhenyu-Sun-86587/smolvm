@@ -6,7 +6,23 @@
 //! libraries and load them from the cache.
 
 use crate::util::{libkrun_filename, libkrunfw_filename};
+#[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
+
+#[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+#[repr(C)]
+struct WorkerTapSpec {
+    size: u32,
+    version: u32,
+    device_id: [u8; 64],
+    features: u32,
+    mtu: u16,
+    queue_count: u16,
+    vnet_header_size: u16,
+    mac: [u8; 6],
+    attachment_digest: [u8; 32],
+}
 
 /// Serve ownership and mode from the `user.containers.override_stat` xattr
 /// (see libkrun's `KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT`).
@@ -130,6 +146,8 @@ pub struct KrunFunctions {
     pub add_net_unixstream: Option<
         unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32,
     >,
+    #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+    add_net_tap_fd: Option<unsafe extern "C" fn(u32, *const WorkerTapSpec, libc::c_int) -> i32>,
     pub get_egress_handle: Option<unsafe extern "C" fn(u32) -> *mut libc::c_void>,
     pub set_gpu_options2: Option<unsafe extern "C" fn(u32, u32, u64) -> i32>,
     /// Expose the host's virtualization extensions to the guest so it can run
@@ -180,6 +198,49 @@ pub struct KrunFunctions {
 }
 
 impl KrunFunctions {
+    /// Register a Worker TAP prepared for this exact launch. The caller must
+    /// authenticate the Worker lease and keep its packet gate closed.
+    #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+    pub fn register_worker_tap(
+        &self,
+        context: u32,
+        tap: BorrowedFd<'_>,
+        device_id: &str,
+        mac: [u8; 6],
+        features: u32,
+        attachment_digest: [u8; 32],
+    ) -> Result<(), String> {
+        use smolvm_resourced::network::{TAP_MTU, TAP_VNET_HEADER_SIZE};
+        let mut spec = WorkerTapSpec {
+            size: std::mem::size_of::<WorkerTapSpec>() as u32,
+            version: 1,
+            device_id: [0; 64],
+            features,
+            mtu: TAP_MTU,
+            queue_count: 1,
+            vnet_header_size: TAP_VNET_HEADER_SIZE,
+            mac,
+            attachment_digest,
+        };
+        if device_id.len() >= spec.device_id.len() || device_id.as_bytes().contains(&0) {
+            return Err("invalid Worker TAP device ID".to_owned());
+        }
+        spec.device_id[..device_id.len()].copy_from_slice(device_id.as_bytes());
+        let attach = self
+            .add_net_tap_fd
+            .ok_or_else(|| "installed libkrun lacks krun_add_net_tap_fd_v1".to_owned())?;
+        // SAFETY: the spec is a complete v1 value and the fd is borrowed for
+        // the call. libkrun duplicates it and retains its own reference.
+        let status = unsafe { attach(context, &spec, tap.as_raw_fd()) };
+        if status != 0 {
+            return Err(format!(
+                "Worker TAP rejected: {}",
+                std::io::Error::from_raw_os_error(-status)
+            ));
+        }
+        Ok(())
+    }
+
     /// Load libkrun from the given library directory.
     ///
     /// libkrunfw is preloaded with `RTLD_GLOBAL` because libkrun may resolve it
@@ -263,6 +324,8 @@ impl KrunFunctions {
         let set_egress_policy = load_optional_sym!("krun_set_egress_policy");
         let set_stream_intercept = load_optional_sym!("krun_set_stream_intercept");
         let add_net_unixstream = load_optional_sym!("krun_add_net_unixstream");
+        #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+        let add_net_tap_fd = load_optional_sym!("krun_add_net_tap_fd_v1");
         let get_egress_handle = load_optional_sym!("krun_get_egress_handle");
         let set_gpu_options2 = load_optional_sym!("krun_set_gpu_options2");
         let set_nested_virt = load_optional_sym!("krun_set_nested_virt");
@@ -306,6 +369,8 @@ impl KrunFunctions {
             set_egress_policy,
             set_stream_intercept,
             add_net_unixstream,
+            #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+            add_net_tap_fd,
             get_egress_handle,
             set_gpu_options2,
             set_nested_virt,
