@@ -9,8 +9,9 @@ floor="$1"
 shift
 status=0
 for file in "$@"; do
-    newest="$(objdump -T "$file" | grep -o 'GLIBC_2\.[0-9]*' | sort -t. -k2 -n -u | tail -1)"
-    newest="${newest#GLIBC_}"
+    # sed succeeds on a valid ELF with no versioned imports. With pipefail an
+    # unreadable or malformed input still fails at objdump.
+    newest="$(objdump -T "$file" | sed -nE 's/.*GLIBC_([0-9]+(\.[0-9]+)+).*/\1/p' | sort -Vu | tail -1)"
     if [[ -z "$newest" ]]; then
         echo "$file: no versioned glibc symbols"
         continue
