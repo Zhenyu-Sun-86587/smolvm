@@ -51,7 +51,7 @@ comparison can use `--depth 0` and omit `--durable`.
 The Guest writes and verifies separate markers on two real writable block
 devices. In each restored Guest a new workload forks four readers, performs
 1,024 direct random 4 KiB reads and verifies every returned block. The
-`dirty` workload also overwrites 16 MiB of Guest memory per heartbeat.
+`dirty` workload also writes to every page in a 16 MiB range per heartbeat.
 
 The JSON report contains every successful sample, observed Worker operation
 phases and per-scenario p50 and p95 values. Source heartbeat gaps measure the
