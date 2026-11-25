@@ -42,7 +42,8 @@ fn installed_profile() -> Result<(Handshake, serde_json::Value, String), String>
             .capabilities
             .into_iter()
             .map(|(name, mut value)| {
-                if name == "boot.system" && value.supported && !launch::worker_configured() {
+                if matches!(name.as_str(), "boot.system" | "state.checkpoint" | "state.hibernate" |
+                    "state.restore" | "state.rollback") && value.supported && !launch::worker_configured() {
                     value.supported = false;
                     value.status = "unavailable".into();
                     value.reason_code = "WORKER_NOT_CONFIGURED".into();
@@ -279,6 +280,10 @@ async fn submit(
         if input.kind == "launch" {
             launch::ensure_binding(client, &input.expected.instance_id)?;
             return client.managed_submit(&input);
+        }
+        if input.kind == "vm_restore" {
+            launch::ensure_binding(client, &input.expected.instance_id)?;
+            return client.submit_state_restore(&input);
         }
         client.submit(&input)
     })

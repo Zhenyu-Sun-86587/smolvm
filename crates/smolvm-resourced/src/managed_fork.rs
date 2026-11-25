@@ -33,7 +33,7 @@ fn nonce() -> Result<String> {
 }
 pub(crate) fn restore(c: &Catalog, child: &str) -> Result<Option<Restore>> {
     Ok(c.db.query_row("SELECT b.operation_id,b.capture_id,b.anchor,b.helper_digest,b.pivot_json IS NOT NULL FROM managed_fork_children ch JOIN managed_fork_batches b ON b.operation_id=ch.batch_id WHERE ch.operation_id=? AND b.source_released=1",[child],
-        |r|Ok(Restore{batch_id:r.get(0)?,capture_id:r.get(1)?,anchor:r.get(2)?,helper_digest:r.get(3)?,source_pivot:r.get(4)?})).optional()?)
+        |r|Ok(Restore{batch_id:r.get(0)?,capture_id:r.get(1)?,anchor:r.get(2)?,helper_digest:r.get(3)?,source_pivot:r.get(4)?,durable:None})).optional()?)
 }
 pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
     let Some((stage,capture,original,released,error))=c.db.query_row(
@@ -717,6 +717,19 @@ pub(crate) fn identity_frame(
     if let Some(frame) = old {
         return Ok(frame);
     }
+    let encoded = build_identity_frame(op, &name, record)?;
+    c.db.execute(
+        "UPDATE managed_fork_children SET frame_hex=? WHERE operation_id=? AND frame_hex IS NULL",
+        params![encoded, op.operation_id],
+    )?;
+    Ok(encoded)
+}
+
+pub(crate) fn build_identity_frame(
+    op: &Operation,
+    name: &str,
+    record: &crate::activation_catalog::ActivationReceipt,
+) -> Result<String> {
     let network = record.binding.network.as_ref();
     let mut frame = vec![0u8; 192];
     frame[..5].copy_from_slice(if network.is_some() {
@@ -741,10 +754,5 @@ pub(crate) fn identity_frame(
     if let Some(network) = network {
         frame.extend_from_slice(&network.identity_bytes()?)
     }
-    let encoded = hex::encode(frame);
-    c.db.execute(
-        "UPDATE managed_fork_children SET frame_hex=? WHERE operation_id=? AND frame_hex IS NULL",
-        params![encoded, op.operation_id],
-    )?;
-    Ok(encoded)
+    Ok(hex::encode(frame))
 }

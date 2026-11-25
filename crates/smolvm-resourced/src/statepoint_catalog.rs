@@ -199,9 +199,7 @@ impl Catalog {
         manifest: &Manifest,
         digest: &str,
     ) -> Result<Record> {
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         if tx.execute("UPDATE statepoints SET phase='durable',manifest_digest=?,error=NULL,revision=revision+1
             WHERE capture_id=? AND phase='exporting' AND revision=?", params![digest, record.export.capture_id, record.revision])? != 1
         {
@@ -213,6 +211,17 @@ impl Catalog {
             "manifest_digest":digest,"commit_id":manifest.commit_id,
         }).to_string())?;
         add_disks(&tx, id, &record.point.disk_generations)?;
+        let execution = self.execution(&record.point.incarnation_id)?;
+        crate::activation_catalog::pin_source_tap(
+            self,
+            id,
+            &execution,
+            record
+                .point
+                .devices
+                .iter()
+                .any(|device| device.is_network()),
+        )?;
         tx.execute(
             "INSERT INTO root_refs VALUES(?,?,?,'active',1,?)",
             params![

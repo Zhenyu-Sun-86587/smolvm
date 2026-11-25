@@ -84,6 +84,8 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
         "state.fork_batch",
         "state.checkpoint",
         "state.hibernate",
+        "state.restore",
+        "state.rollback",
         "state.clone_ready",
         "storage.block_attach",
         "storage.multidisk_capture",
@@ -127,6 +129,17 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
                 verified_profile: Some("system-debian-v1".into()),
             },
         );
+    }
+    if contracts["managed_statepoint"].as_u64() == Some(1)
+        && contracts["managed_block_launch"].as_u64() == Some(1)
+        && artifacts.iter().any(|a| a["path"] == "guest/identity-helper")
+    {
+        for name in ["state.checkpoint", "state.hibernate", "state.restore", "state.rollback"] {
+            capabilities.insert(name.into(), Capability {
+                status: "supported".into(), supported: true, reason_code: String::new(),
+                contract_version: Some(1), verified_profile: Some("managed-block-v1".into()),
+            });
+        }
     }
     Ok(Handshake {
         schema: "runtime-ext/v1".into(),

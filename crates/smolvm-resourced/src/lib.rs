@@ -28,6 +28,7 @@ mod ipc;
 pub mod managed;
 #[cfg(target_os = "linux")]
 mod managed_fork;
+pub mod managed_state_restore;
 #[cfg(target_os = "linux")]
 pub mod native_client;
 #[cfg(target_os = "linux")]
