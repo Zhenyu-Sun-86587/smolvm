@@ -284,7 +284,10 @@ impl PrivateRouter {
 }
 
 impl QuarantinedPort {
-    pub(crate) fn forward_wake_datagram(&self, datagram: crate::packet_wake::Datagram) -> io::Result<()> {
+    pub(crate) fn forward_wake_datagram(
+        &self,
+        datagram: crate::packet_wake::Datagram,
+    ) -> io::Result<()> {
         let router = self.router_link.router.clone();
         thread::Builder::new()
             .name("forward-wake-datagram".into())
@@ -510,7 +513,8 @@ mod tests {
             second.guest_ipv4().0,
             "192.168.70.2".parse::<Ipv4Addr>().unwrap()
         );
-        for port in [&first, &second] {
+        let address = private_ipv4.to_string();
+        for (router, port) in [(&native, &first), (&fixed, &second)] {
             let link = inspect(
                 port.namespace(),
                 "ip",
@@ -533,9 +537,18 @@ mod tests {
             assert!(guard.contains("policy drop"));
             assert!(guard.contains("arp saddr ether"));
             assert!(!guard.contains("jump identity"));
+            assert!(!inspect(router.namespace(), "ip", &["route", "get", &address])
+                .status
+                .success());
 
             port.arm_identity().unwrap();
+            assert!(!inspect(router.namespace(), "ip", &["route", "get", &address])
+                .status
+                .success());
             port.publish_identity().unwrap();
+            assert!(inspect(router.namespace(), "ip", &["route", "get", &address])
+                .status
+                .success());
             let link = inspect(
                 port.namespace(),
                 "ip",
@@ -552,14 +565,18 @@ mod tests {
                 "{device}"
             );
             port.close_identity().unwrap();
+            assert!(!inspect(router.namespace(), "ip", &["route", "get", &address])
+                .status
+                .success());
         }
         assert_eq!(
             std::fs::read_link("/proc/thread-self/ns/net").unwrap(),
             host
         );
 
+        second.arm_identity().unwrap();
+        second.publish_identity().unwrap();
         drop(first);
-        let address = private_ipv4.to_string();
         assert!(
             !inspect(native.namespace(), "ip", &["route", "get", &address])
                 .status
