@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shutil
 import socket
 import subprocess
@@ -28,8 +29,11 @@ ROWS = re.compile(r"PARKED_BLOCK_TICK (\d+) (\d+) ([\w-]+) ([a-f0-9]{32}) (\d+) 
 FINISH = {"abort": False, "expected_revision": 1}
 
 
-def scope(name, kind, epoch=1):
-    return block.generation.operation(name, kind, epoch)
+def scope(name, kind, epoch=1, instance=None):
+    result = block.generation.operation(name, kind, epoch)
+    if instance is not None:
+        result["expected"]["instance_id"] = instance
+    return result
 
 
 def worker(library, path, config):
@@ -37,7 +41,7 @@ def worker(library, path, config):
     api.krun_get_last_error.restype = ct.c_char_p
     config = json.loads(Path(config).read_text())
     name, epoch = config["name"], config["epoch"]
-    launch = scope(name, "launch", epoch)
+    launch = config.get("launch") or scope(name, "launch", epoch)
     rpc(path, "RegisterExecution", {"launch_permit": input()}, **launch)
     print("registered", flush=True)
     require(input() == "start", "launcher did not authorize boot")
@@ -53,7 +57,7 @@ def worker(library, path, config):
         data = json.dumps(value).encode()
         call(method, data, ct.c_size_t(len(data)))
 
-    writers = scope(name, "writers", epoch)
+    writers = launch if "durable" in config else scope(name, "writers", epoch)
     grant_id = name + "-grant"
     offered, entries, fds = rpc(path, "AcquireWriterSet",
         {"grant_id": grant_id, "expected_revision": 1}, reply_fds=True, **writers)
@@ -104,7 +108,21 @@ def worker(library, path, config):
     call("krun_split_irqchip", False)
     config_call("krun_configure_worker_block_pivot_v1", dict(socket=path, worker_uid=os.getuid(),
         bundle_digest=launch["bundle_digest"], **launch["expected"]))
-    if "restore" in config:
+    if "durable" in config:
+        operation = {key: launch[key] for key in ("operation_id", "request_digest")}
+        config_call("krun_configure_worker_statepoint_restore_v1", dict(capture_id=config["durable"],
+            lease_id=name + "-statepoint", volume_restore_policy=config["volume_restore_policy"], **operation))
+        config_call("krun_configure_worker_block_restore_v1", dict(source_pivot_id=config["source_pivot_id"],
+            grant_id=grant_id, expected_revision=2, **operation))
+        print("statepoint_attached", flush=True)
+        authority, _, endpoints = rpc(path, "AcquireTargetAuthority", {"expected_revision": int(input())},
+            reply_fds=True, **launch)
+        require(len(endpoints) == 1, "missing Worker target authority")
+        call("krun_set_guest_target_authority_v1", endpoints[0],
+            bytes.fromhex(authority["binding"]["input"]["capture_anchor"]),
+            bytes.fromhex(authority["context_digest"]), ct.c_uint64(epoch))
+        os.close(endpoints[0])
+    elif "restore" in config:
         data = bytes.fromhex(config["descriptor"])
         backings = (ct.c_int * len(config["backings"]))(*config["backings"])
         call("krun_set_snapshot", os.fsencode(config["restore"]))
@@ -189,7 +207,7 @@ def change_source_epoch(source, destination):
                                                    + updated + data[end:])
 
 
-def orchestrate(broker, library, guest, helper):
+def orchestrate(broker, library, guest, helper, durable=False):
     broker, library, guest, helper = [Path(path).resolve(strict=True) for path in (broker, library, guest, helper)]
     with tempfile.TemporaryDirectory(prefix="parked-block-") as temporary:
         work = Path(temporary)
@@ -204,8 +222,19 @@ def orchestrate(broker, library, guest, helper):
         subprocess.run(["mke2fs", "-q", "-t", "ext4", "-d", root, disk], check=True)
         disk.chmod(0o400)
         path = work / "worker.sock"
-        service = subprocess.Popen([broker, "serve", "--socket", path, "--state-dir", work / "catalog"])
-        processes, handles, authorities = [service], [], []
+        processes, handles, authorities = [], [], []
+
+        def start_worker():
+            process = subprocess.Popen([broker, "serve", "--socket", path, "--state-dir", work / "catalog"])
+            processes.append(process)
+            def health():
+                try:
+                    return rpc(path, "Health")
+                except OSError:
+                    return None
+            return process, until(health, process, "Worker started")
+
+        service, _ = start_worker()
 
         def call(method, payload=None, **kwargs):
             return rpc(path, method, payload, **kwargs)
@@ -222,7 +251,7 @@ def orchestrate(broker, library, guest, helper):
             call("FinishOperation", FINISH, **setup)
             return heads
 
-        def launch(name, heads, epoch=1, point=None, **overrides):
+        def launch(name, heads, epoch=1, point=None, instance=None, **overrides):
             addr, log = work / (name + ".sock"), work / (name + ".log")
             options = dict(name=name, root=str(disk), helper=hashlib.sha256(helper.read_bytes()).hexdigest(),
                            epoch=epoch, control=str(addr), log=str(log))
@@ -235,6 +264,8 @@ def orchestrate(broker, library, guest, helper):
                 inherited = point["backings"] + [child.fileno()]
                 options.update(point, authority=child.fileno(), context=secrets.token_hex(32))
             options.update(overrides)
+            launch_scope = scope(name, "launch", epoch, instance)
+            options["launch"] = launch_scope
             config = work / (name + ".json")
             config.write_text(json.dumps(options))
             with (work / (name + ".stderr")).open("wb") as err:
@@ -243,15 +274,22 @@ def orchestrate(broker, library, guest, helper):
             processes.append(proc)
             if child:
                 child.close()
-            call("BeginOperation", {"kind": "launch"}, **scope(name, "launch", 0))
-            intent = scope(name, "launch", epoch)
+            recovering = "durable" in options
+            begin = scope(name, "launch", epoch - 1, instance)
+            begin["expected"]["incarnation_id"] = None
+            call("BeginOperation", {"kind": "restore_target" if recovering else "launch"}, **begin)
+            intent = launch_scope
             permit = call("IssueLaunchPermit", {"pid": proc.pid, "uid": os.getuid()}, **intent)
             proc.stdin.write(permit["launch_permit"] + "\n")
             proc.stdin.flush()
-            require(proc.stdout.readline().strip() == "registered", name, "registration failed")
-            call("FinishOperation", FINISH, **intent)
-            operation = scope(name, "writers", epoch)
-            call("BeginOperation", {"kind": "writer_reservation"}, **operation)
+            require(select.select([proc.stdout], [], [], 10)[0] and proc.stdout.readline().strip() == "registered",
+                    name, "registration failed")
+            if recovering:
+                operation = intent
+            else:
+                call("FinishOperation", FINISH, **intent)
+                operation = scope(name, "writers", epoch)
+                call("BeginOperation", {"kind": "writer_reservation"}, **operation)
             call("ReserveWriterSet", {"heads": heads}, **operation)
             proc.stdin.write("start\n")
             proc.stdin.flush()
@@ -261,7 +299,7 @@ def orchestrate(broker, library, guest, helper):
 
             return proc, addr, rows, authority, options
 
-        def park(guest, name, heads, epoch, grant_id, revision, sequence):
+        def park(guest, name, heads, epoch, grant_id, revision, sequence, instance=None):
             proc, addr, rows, _, _ = guest
             challenge, anchor = secrets.token_hex(16), secrets.token_hex(16)
             token = f"{sequence} {challenge}"
@@ -280,7 +318,7 @@ def orchestrate(broker, library, guest, helper):
             fixed = rows()
             request(addr, f"CAPTURE_EXPORT {token}", response="ERR EBUSY")
             request(addr, f"CAPTURE_FINISH {token} RETURN_STANDBY", response="ERR EBUSY")
-            pivot = scope(name, "pivot", epoch)
+            pivot = scope(name, f"pivot-{sequence}" if durable else "pivot", epoch, instance)
             call("BeginOperation", {"kind": "writer_pivot"}, **pivot)
             next_heads = {item["volume_id"]: "next-" + item["head_resource_id"] for item in heads}
             command = dict(operation_id=pivot["operation_id"], request_digest=pivot["request_digest"],
@@ -288,6 +326,8 @@ def orchestrate(broker, library, guest, helper):
             receipt = json.loads(request(addr, f"CAPTURE_BLOCK_PIVOT {token} {json.dumps(command)}")[3:])
             require(receipt["state"] == "complete" and rows() == fixed, receipt)
             request(addr, f"CAPTURE_CANCEL {token}", response="ERR EBUSY")
+            if durable:
+                return token, fixed, pivot
             directory = work / (name + "-capture")
             descriptor, backings = export(addr, token, directory)
             handles.extend(backings)
@@ -295,6 +335,15 @@ def orchestrate(broker, library, guest, helper):
                     "capture did not preserve standby")
             return token, fixed, dict(restore=str(directory), descriptor=descriptor, backings=backings,
                                       anchor=anchor, source_pivot_id=pivot["operation_id"])
+
+        def check_boundary(rows, previous, hostname, identity):
+            tick, pid, _, _, first, second = rows()[0]
+            marker = int(previous[0])
+            if previous[2] != "capture-source":
+                marker ^= ord(previous[2][0]) << 48
+            require((int(tick), pid, int(first), int(second)) == (int(previous[0]) + 1, previous[1], marker,
+                    marker ^ SALT), "RAM and disk markers do not match the same boundary", previous, rows()[0])
+            require(all(row[2:4] == (hostname, identity) for row in rows()), "inherited identity used", rows())
 
         def activate(guest, previous, hostname):
             proc, addr, rows, authority, options = guest
@@ -316,13 +365,70 @@ def orchestrate(broker, library, guest, helper):
             require(not rows(), "workload ran before activation")
             require(exchange(b"\3" + frame[8:64]) == b"OK activating", "activation failed")
             until(lambda: len(rows()) >= 2, proc, "target workload resumed")
-            tick, pid, _, _, first, second = rows()[0]
-            marker = int(previous[0])
-            if previous[2] != "capture-source":
-                marker ^= ord(previous[2][0]) << 48
-            require((int(tick), pid, int(first), int(second)) == (int(previous[0]) + 1, previous[1], marker,
-                    marker ^ SALT), "RAM and disk markers do not match the same boundary", previous, rows()[0])
-            require(all(row[2:4] == (hostname, identity) for row in rows()), "inherited identity used", rows())
+            check_boundary(rows, previous, hostname, identity)
+
+        def wait_receipt(method, fields, operation, phase, process):
+            def query():
+                result = call(method, fields, **operation)
+                require(not result.get("error"), method, result.get("error"))
+                return result if result["phase"] == phase else None
+            return until(query, process, method + " " + phase)
+
+        def publish_point(token, operation, capture_id, purpose, release=None):
+            session, hold = token.split()
+            staged = call("BeginStatePointExport", dict(capture_id=capture_id, representation_id=capture_id + "-disk",
+                purpose=purpose, session=int(session), hold_token=hold), **operation)
+            require(staged["phase"] == "exporting" and staged["manifest_digest"] is None, staged)
+            pins = call("QueryOwnerClosure", {"owner_kind": "operation", "owner_id": operation["operation_id"]})
+            require(any(ref["resource_id"].startswith("volatile-") for ref in pins["resources"]), pins)
+            if release is not None:
+                release()
+            return wait_receipt("QueryStatePoint", {"capture_id": capture_id}, operation, "durable", service)
+
+        def stop_point(record, operation, target=None):
+            capture_id = record["export"]["capture_id"]
+            stop = {"capture_id": capture_id, "expected_revision": record["revision"], "restore_capture_id": target}
+            result = call("StopCommit", stop, **operation)
+            require(result["phase"] in ("stop_committed", "hibernated"), result)
+            stopped = wait_receipt("QueryStatePoint", {"capture_id": capture_id}, operation, "hibernated", service)
+            require(call("StopCommit", stop, **operation) == stopped, "STOP_COMMIT receipt changed on replay")
+            pins = call("QueryOwnerClosure", {"owner_kind": "operation", "owner_id": operation["operation_id"]})
+            require(not pins["resources"], "completed stop retained export pins", pins)
+
+        def restore_durable(name, record, frozen, epoch, policy="clone_conflicts"):
+            capture = record["export"]["capture_id"]
+            operation = scope(name, "launch", epoch, "source")
+            prepared = wait_receipt("PrepareStatePointRestore", {"capture_id": capture, "volume_restore_policy": policy},
+                                     operation, "prepared", service)
+            branch = prepared["exact_heads"] or heads_for(name, [item for item in record["point"]["disk_generations"] if item != "root-base"])
+            target = launch(name, branch, epoch, instance="source", durable=capture,
+                            volume_restore_policy=policy, source_pivot_id=record["operation_id"])
+            proc, address, rows, _, _ = target
+            require(select.select([proc.stdout], [], [], 12)[0] and proc.stdout.readline().strip() == "statepoint_attached",
+                    "target did not attach verified StatePoint")
+            plan = call("PrepareTargetActivation", {"capture_resource_id": record["point"]["representation_id"],
+                "capture_anchor": record["point"]["capture_anchor"], "helper_digest": record["point"]["helper_digest"],
+                "profile_digest": "sha256:" + hashlib.sha256(b"parked-block-kvm").hexdigest()}, **operation)
+            proc.stdin.write(str(plan["revision"]) + "\n")
+            proc.stdin.flush()
+            until(address.exists, proc, "durable target paused")
+            request(address, "RESUME", response="ERR EBUSY")
+            offer = call("QueryTargetActivation", **operation)
+            identity = secrets.token_hex(16)
+            label = name.encode()
+            frame = (b"SGI1\x01\0\0\0" + bytes.fromhex(offer["challenge"]) + epoch.to_bytes(8, "little")
+                + bytes.fromhex(offer["context_digest"]) + secrets.token_bytes(32) + bytes.fromhex(identity)
+                + bytes([len(label)]) + label).ljust(192, b"\0")
+            call("BeginTargetIdentity", {"expected_revision": offer["revision"], "frame_hex": frame.hex()}, **operation)
+            ready = wait_receipt("PollTargetIdentity", None, operation, "identity_ready", proc)
+            require(not rows(), "durable target executed before identity commit")
+            call("CommitActivation", {"expected_revision": ready["revision"]}, **operation)
+            wait_receipt("PollTargetIdentity", None, operation, "released", proc)
+            until(lambda: len(rows()) >= 2, proc, "durable target workload")
+            check_boundary(rows, frozen[-1], name, identity)
+            call("FinishOperation", FINISH, **operation)
+            call("BindNativeControl", {"control_socket": str(address)}, **operation)
+            return target, branch
 
         try:
             until(path.exists, service, "broker listening")
@@ -336,12 +442,109 @@ def orchestrate(broker, library, guest, helper):
             with base.open("rb") as fd:
                 call("ImportImmutableBlock", dict(resource_id="base", capacity_bytes=CAPACITY, content_sha256=digest),
                     fds=[fd.fileno()], fd_table=[dict(index=0, resource_id="base", role="block_import")], **setup)
+            if durable:
+                with disk.open("rb") as fd:
+                    call("ImportImmutableBlock", dict(resource_id="root-base", capacity_bytes=disk.stat().st_size,
+                        content_sha256="sha256:" + hashlib.sha256(disk.read_bytes()).hexdigest()), fds=[fd.fileno()],
+                        fd_table=[dict(index=0, resource_id="root-base", role="block_import")], **setup)
+                disk = work / "catalog/objects/root-base/data"
             call("FinishOperation", FINISH, **setup)
             source_heads = heads_for("source", ["base", "base"])
             source = launch("source", source_heads)
             until(lambda: len(source[2]()) >= 3, source[0], "source workload")
             require(source[2]()[-1][2:4] == ("capture-source", SRC_ID), source[2]())
             call("FinishOperation", FINISH, **scope("source", "writers"))
+            if durable:
+                call("BindNativeControl", {"control_socket": str(source[1])}, **scope("source", "launch"))
+                token, old, operation = park(source, "source", source_heads, 1, "source-next-grant", 2, 1)
+
+                def resume_source():
+                    request(source[1], f"CAPTURE_FINISH {token} RETURN_STANDBY")
+                    request(source[1], f"STANDBY_WAKE {token}")
+                    until(lambda: '"source_disposition":"RUNNING"' in request(source[1], f"STANDBY_QUERY {token}"),
+                          source[0], "checkpoint source thaw acknowledged")
+                    until(lambda: len(source[2]()) > len(old), source[0], "checkpoint released its source")
+
+                checkpoint = publish_point(token, operation, "checkpoint", "checkpoint", resume_source)
+                call("FinishOperation", FINISH, **operation)
+                closure = call("QueryOwnerClosure", {"owner_kind": "statepoint_checkpoint", "owner_id": "checkpoint"})
+                require({item["resource_id"] for item in closure["resources"]} >=
+                        {"checkpoint-disk", "source-head-0", "source-head-1", "root-base"}, closure)
+                print("DURABLE_CHECKPOINT_PINS_EXACT_DISKS_AND_RELEASES_LIVE_SOURCE", flush=True)
+                second = [dict(head, head_resource_id="next-" + head["head_resource_id"]) for head in source_heads]
+                token, sleeping, stop = park(source, "source", second, 1, "source-hibernate-grant", 1, 2)
+                hibernated = publish_point(token, stop, "hibernate", "hibernate")
+                require(source[2]() == sleeping, "hibernation ran while writing chunks")
+                commit = {"capture_id": "hibernate", "expected_revision": hibernated["revision"]}
+                require(call("StopCommit", commit, **stop)["phase"] == "stop_committed",
+                        "STOP_COMMIT did not record before source exit")
+                service.terminate()
+                service.wait(10)
+                service, health = start_worker()
+                require(source[0].wait(10) == 0 and source[2]() == sleeping, "source did not exit quiesced")
+                hibernated = wait_receipt("QueryStatePoint", {"capture_id": "hibernate"}, stop, "hibernated", service)
+                require(call("StopCommit", commit, **stop) == hibernated, "STOP_COMMIT replay changed after restart")
+                call("CompleteRecovery", {"broker_session_id": health["broker_session_id"]})
+                print("STOP_COMMIT_SURVIVED_WORKER_RESTART_AND_PROVED_OLD_EXECUTION_EXIT", flush=True)
+                chunks = work / "catalog/statepoints/hibernate-disk/objects"
+                damaged = next(chunks.iterdir())
+                saved = work / "missing-object"
+                damaged.rename(saved)
+                try:
+                    wait_receipt("PrepareStatePointRestore", {"capture_id": "hibernate"},
+                                 scope("woken", "launch", 2, "source"), "prepared", service)
+                except RuntimeError as error:
+                    require("E_STATEPOINT_CORRUPT" in str(error), error)
+                else:
+                    raise RuntimeError("restore accepted a missing checkpoint object")
+                finally:
+                    saved.rename(damaged)
+                print("DURABLE_READER_REFUSED_MISSING_CHUNK_AFTER_WORKER_RESTART", flush=True)
+                backing = work / "catalog/objects/base/data"
+                backing.chmod(0o600)
+                with backing.open("rb+") as file:
+                    original = file.read(1)
+                    file.seek(0)
+                    file.write(bytes([original[0] ^ 1]))
+                    file.flush()
+                    os.fsync(file.fileno())
+                backing.chmod(0o400)
+                try:
+                    wait_receipt("PrepareStatePointRestore", {"capture_id": "hibernate"},
+                                 scope("woken", "launch", 2, "source"), "prepared", service)
+                except RuntimeError as error:
+                    require("StatePoint disk generation length or hash changed" in str(error), error)
+                else:
+                    raise RuntimeError("restore accepted changed immutable disk bytes")
+                finally:
+                    backing.chmod(0o600)
+                    with backing.open("rb+") as file:
+                        file.write(original)
+                        file.flush()
+                        os.fsync(file.fileno())
+                    backing.chmod(0o400)
+                print("DURABLE_READER_REFUSED_CHANGED_DISK_BYTES", flush=True)
+                woken, branch = restore_durable("woken", hibernated, sleeping, 2, policy="exact")
+                require([head["volume_id"] for head in source_heads] == [head["volume_id"] for head in branch], branch)
+                print("DURABLE_HIBERNATE_RESTORED_PID_RAM_AND_EXACT_VOLUMES_AFTER_RESTART", flush=True)
+
+                token, _, rescue = park(woken, "woken", branch, 2, "rescue-grant", 2, 3, instance="source")
+                saved = publish_point(token, rescue, "rescue", "rollback_rescue")
+                try:
+                    call("PrepareStatePointRestore", {"capture_id": "checkpoint", "volume_restore_policy": "exact"}, **rescue)
+                except RuntimeError as error:
+                    require("E_VOLUME_GENERATION_MISMATCH" in str(error), error)
+                else:
+                    raise RuntimeError("exact restore silently rewound active volumes")
+                wait_receipt("PrepareStatePointRestore", {"capture_id": "checkpoint"}, rescue, "prepared", service)
+                stop_point(saved, rescue, "checkpoint")
+                require(woken[0].wait(10) == 0, "rollback source did not exit quiesced")
+                rescue_root = call("QueryOwnerClosure", {"owner_kind": "statepoint_rescue", "owner_id": "rescue"})
+                require({entry["resource_id"] for entry in rescue_root["resources"]} >=
+                    {"rescue-disk", *(head["head_resource_id"] for head in branch)}, rescue_root)
+                restore_durable("rolled-back", checkpoint, old, 3)
+                print("DURABLE_ROLLBACK_KEPT_RESCUE_AND_RESTORED_EARLIER_PID_RAM_AND_DISKS", flush=True)
+                return
             token, fixed, point = park(source, "source", source_heads, 1, "source-next-grant", 2, 1)
             sealed = [head["head_resource_id"] for head in source_heads]
             objects = work / "catalog/objects"
@@ -409,5 +612,7 @@ if __name__ == "__main__":
         worker(*sys.argv[2:])
     elif len(sys.argv) == 5:
         orchestrate(*sys.argv[1:])
+    elif len(sys.argv) == 6 and sys.argv[1] == "--durable":
+        orchestrate(*sys.argv[2:], durable=True)
     else:
-        sys.exit(f"usage: {sys.argv[0]} RESOURCED LIBKRUN STATIC_GUEST IDENTITY_HELPER")
+        sys.exit(f"usage: {sys.argv[0]} [--durable] RESOURCED LIBKRUN STATIC_GUEST IDENTITY_HELPER")

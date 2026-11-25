@@ -3,6 +3,9 @@ use crate::catalog::{Catalog, Execution, NewExecution, VolumeHead};
 use crate::escrow::Escrow;
 use crate::grants::{fence_unproven, prove_live_ofd, GrantRequest};
 use crate::ipc::{self, valid_digest, valid_id, Expected, Fault, Request, Result, PROTOCOL};
+use crate::statepoint_capture::Purpose;
+use crate::statepoint_catalog::Record as StatePoint;
+use crate::statepoints::{Lookup as StatePointLookup, StatePoints, Stop as StatePointStop};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -159,6 +162,7 @@ struct Worker {
     escrow: Escrow,
     network: crate::network_runtime::NetworkRuntime,
     activation: ActivationRuntime,
+    statepoints: StatePoints,
 }
 
 struct Reply {
@@ -242,16 +246,20 @@ pub(crate) fn observe_pid(pid: i32) -> Result<(i64, OwnedFd)> {
         return Err(Fault::invalid("pid must be positive"));
     }
     let before = pid_start(pid).map_err(|_| stale_execution())?;
-    // pidfd_open yields an owned kernel reference that survives numeric PID reuse.
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
-    if raw < 0 {
-        return Err(broker_error(io::Error::last_os_error()));
-    }
-    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+    let pidfd = process_fd(pid).map_err(broker_error)?;
     if pid_start(pid).ok() != Some(before) || pid_exited(&pidfd).map_err(broker_error)? {
         return Err(stale_execution());
     }
     Ok((before, pidfd))
+}
+
+fn process_fd(pid: i32) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+    }
 }
 
 pub(crate) fn verify_executable(
@@ -374,6 +382,39 @@ impl Worker {
             ));
         }
         let result = match request.method.as_str() {
+            "AcquireStatePointRestore" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                let restore =
+                    self.statepoints
+                        .acquire_restore(&mut self.catalog, request, &execution)?;
+                return Ok(Reply {
+                    result: restore.result,
+                    table: restore.table,
+                    descriptors: restore.descriptors,
+                    delivered: Some(restore.delivered),
+                });
+            }
+            "AckStatePointAttached" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                let (input, lease) = Escrow::scoped_lease(&self.catalog, request, &execution)?;
+                let point: bool = self.catalog.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM statepoints
+                    WHERE representation_id=? AND phase IN ('durable','hibernated'))",
+                    [&lease.resource_id],
+                    |row| row.get(0),
+                )?;
+                if !point || lease.delivered != 2 {
+                    return Err(Fault::new(
+                        "E_INCOMPLETE_TRANSFER",
+                        "StatePoint lease has undelivered artifacts",
+                    ));
+                }
+                let lease = self
+                    .catalog
+                    .update_lease(&lease, input.expected_revision, false)?;
+                self.statepoints.finish_restore(&self.catalog, &lease)?;
+                Ok(json!(lease))
+            }
             "ValidateRestoreWriterSet" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 crate::grants::verify_restore_writer(
@@ -625,6 +666,37 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            "BeginStatePointExport" => {
+                let execution = self.scoped_execution(request)?;
+                Ok(json!(self.statepoints.begin(
+                    &mut self.catalog,
+                    &self.objects,
+                    &self.boot,
+                    request,
+                    &execution
+                )?))
+            }
+            "QueryStatePoint" => {
+                let input: StatePointLookup = request.payload()?;
+                let record = self.statepoints.query(
+                    &mut self.catalog,
+                    &self.objects,
+                    request,
+                    &input.capture_id,
+                )?;
+                self.release_checkpoint_export(&record);
+                Ok(json!(if record.phase == "stop_committed" {
+                    self.drive_statepoint_stop(record)?
+                } else {
+                    record
+                }))
+            }
+            "PrepareStatePointRestore" => {
+                self.statepoints
+                    .prepare_restore(&self.catalog, &self.objects, request)
+            }
+            "StopCommit" => self.stop_statepoint(request),
+            "AbortStatePoint" => self.abort_statepoint(request),
             "QueryInstanceBinding" => self.catalog.query_binding(request),
             "BindNativeControl" => {
                 let binding: crate::native_control::Binding = request.payload()?;
@@ -755,6 +827,7 @@ impl Worker {
                         | "resource_lease"
                         | "network_reservation"
                         | "writer_pivot"
+                        | "statepoint"
                 ) {
                     return Err(Fault::new(
                         "E_CAPABILITY_UNSUPPORTED",
@@ -1091,6 +1164,10 @@ impl Worker {
 
     fn finalize_execution(&mut self, r: &Request) -> Result<Value> {
         let execution = self.scoped_execution(r)?;
+        self.finalize_scoped_execution(execution)
+    }
+
+    fn finalize_scoped_execution(&mut self, execution: Execution) -> Result<Value> {
         if execution.phase == "exited" {
             return Ok(json!(execution));
         }
@@ -1142,6 +1219,213 @@ impl Worker {
         Ok(json!(result))
     }
 
+    fn stop_statepoint(&mut self, request: &Request) -> Result<Value> {
+        let input: StatePointStop = request.payload()?;
+        let mut record =
+            self.statepoints
+                .query(&mut self.catalog, &self.objects, request, &input.capture_id)?;
+        if record.export.purpose == Purpose::Checkpoint {
+            return Err(Fault::invalid(
+                "a checkpoint does not authorize stopping its source",
+            ));
+        }
+        if matches!(record.phase.as_str(), "stop_committed" | "hibernated") {
+            if record.restore_capture_id != input.restore_capture_id {
+                return Err(Fault::new(
+                    "E_IDEMPOTENCY_CONFLICT",
+                    "rollback target changed after STOP_COMMIT",
+                ));
+            }
+        } else {
+            if record.phase != "durable" || record.revision != input.expected_revision {
+                return Err(Fault::new(
+                    "E_STALE_REVISION",
+                    "STOP_COMMIT requires this durable StatePoint revision",
+                ));
+            }
+            let operation = self.catalog.active_operation(request)?;
+            let source = self.scoped_execution(request)?;
+            if record.point.incarnation_id != source.incarnation_id
+                || record.point.execution_epoch != source.execution_epoch
+            {
+                return Err(stale_execution());
+            }
+            match (record.export.purpose, &input.restore_capture_id) {
+                (Purpose::Hibernate, None) => (),
+                (Purpose::RollbackRescue, Some(target)) if target != &input.capture_id => {
+                    self.statepoints.require_rollback_target(
+                        &self.catalog,
+                        request,
+                        &operation,
+                        target,
+                    )?;
+                }
+                _ => {
+                    return Err(Fault::invalid(
+                        "STOP_COMMIT has an incompatible rollback target",
+                    ))
+                }
+            }
+            let endpoint = crate::native_control::Endpoint::load(
+                &self.catalog.db,
+                &source.incarnation_id,
+                &self.boot,
+            )?;
+            endpoint.command(&format!(
+                "CAPTURE_STOP_RESERVE {} {}",
+                record.export.session, record.export.hold_token
+            ))?;
+            record = self
+                .catalog
+                .statepoint_stop(&record, input.restore_capture_id.as_deref())?;
+        }
+        Ok(json!(if record.phase == "stop_committed" {
+            self.drive_statepoint_stop(record)?
+        } else {
+            record
+        }))
+    }
+
+    fn drive_statepoint_stop(&mut self, record: StatePoint) -> Result<StatePoint> {
+        let source = self.catalog.execution(&record.point.incarnation_id)?;
+        if source.host_boot_id == self.boot && source.phase != "exited" {
+            if let Some(pidfd) = self.executions.get(&source.incarnation_id) {
+                if !pid_exited(pidfd).map_err(broker_error)? {
+                    let result = unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            pidfd.as_raw_fd(),
+                            libc::SIGTERM,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0u32,
+                        )
+                    };
+                    if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                    {
+                        return Err(broker_error(io::Error::last_os_error()));
+                    }
+                    return Ok(record);
+                }
+            } else if pid_start(source.pid).ok() == Some(source.pid_start_time) {
+                match process_fd(source.pid) {
+                    Ok(pidfd) if pid_start(source.pid).ok() == Some(source.pid_start_time) => {
+                        if !pid_exited(&pidfd).map_err(broker_error)? {
+                            if let Err(error) = verify_executable(
+                                source.pid,
+                                source.pid_start_time,
+                                &pidfd,
+                                &self.catalog.bundle(&source.bundle_digest)?,
+                            ) {
+                                if !pid_exited(&pidfd).map_err(broker_error)? {
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        self.executions.insert(source.incarnation_id, pidfd);
+                        return self.drive_statepoint_stop(record);
+                    }
+                    Ok(_) => (),
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => (),
+                    Err(error) => return Err(broker_error(error)),
+                }
+            }
+        }
+        self.finalize_scoped_execution(source)?;
+        self.catalog.finish_statepoint_stop(&record)
+    }
+
+    fn abort_statepoint(&mut self, request: &Request) -> Result<Value> {
+        let input: StatePointLookup = request.payload()?;
+        let record =
+            self.statepoints
+                .query(&mut self.catalog, &self.objects, request, &input.capture_id)?;
+        if record.phase == "aborted" {
+            return Ok(json!(record));
+        }
+        if matches!(record.phase.as_str(), "stop_committed" | "hibernated")
+            || (record.phase == "durable" && record.export.purpose == Purpose::Checkpoint)
+            || self.statepoints.export_in_progress(&input.capture_id)
+        {
+            return Err(Fault::new(
+                "E_OPERATION_HAS_EFFECTS",
+                "StatePoint cannot abort while exporting or after its durable decision",
+            ));
+        }
+        self.catalog.active_operation(request)?;
+        let source = self.scoped_execution(request)?;
+        if source.incarnation_id != record.point.incarnation_id
+            || source.execution_epoch != record.point.execution_epoch
+        {
+            return Err(stale_execution());
+        }
+        let endpoint = crate::native_control::Endpoint::load(
+            &self.catalog.db,
+            &source.incarnation_id,
+            &self.boot,
+        )?;
+        let token = format!("{} {}", record.export.session, record.export.hold_token);
+        let command = |verb: &str| -> Result<Value> {
+            serde_json::from_str(&endpoint.command(verb)?)
+                .map_err(|_| Fault::invalid("invalid native capture state"))
+        };
+        let mut state = command(&format!("CAPTURE_QUERY {token}"))?;
+        if state["phase"] == "prepared" {
+            endpoint.command(&format!("CAPTURE_STOP_UNRESERVE {token}"))?;
+            let disposition = if state["from_standby"] == true {
+                "RETURN_STANDBY"
+            } else {
+                "CONTINUE"
+            };
+            state = command(&format!("CAPTURE_FINISH {token} {disposition}"))?;
+        }
+        if state["phase"] == "finishing" {
+            return Err(Fault::new(
+                "E_OPERATION_IN_PROGRESS",
+                "source Guest thaw is still pending",
+            ));
+        }
+        if state["phase"] != "finished" {
+            return Err(Fault::new(
+                "E_CAPTURE_NOT_HELD",
+                "source does not have a safely releasable capture",
+            ));
+        }
+        Ok(json!(self.catalog.abort_statepoint(&record)?))
+    }
+
+    fn release_checkpoint_export(&self, record: &StatePoint) {
+        if record.phase == "durable" && record.export.purpose == Purpose::Checkpoint {
+            if let Ok(endpoint) = crate::native_control::Endpoint::load(
+                &self.catalog.db,
+                &record.point.incarnation_id,
+                &self.boot,
+            ) {
+                let _ = endpoint.command(&format!(
+                    "CAPTURE_DROP_EXPORT {} {}",
+                    record.export.session, record.export.hold_token
+                ));
+            }
+        }
+    }
+
+    fn reconcile_statepoints(&mut self) -> Result<()> {
+        for record in self
+            .statepoints
+            .complete_exports(&mut self.catalog, &self.objects)?
+        {
+            self.release_checkpoint_export(&record);
+        }
+        for record in self.catalog.pending_statepoint_stops()? {
+            if let Err(fault) = self.drive_statepoint_stop(record) {
+                eprintln!(
+                    "resourced StatePoint recovery: {} {}",
+                    fault.code, fault.message
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn open_backing(&self, resource: &str) -> Result<(File, String)> {
         if !valid_id(resource) {
             return Err(Fault::invalid("invalid head resource identifier"));
@@ -1161,7 +1445,7 @@ impl Worker {
 
     fn reserve(&mut self, r: &Request) -> Result<Value> {
         let op = self.catalog.active_operation(r)?;
-        if op.kind != "writer_reservation" {
+        if !matches!(op.kind.as_str(), "writer_reservation" | "restore_target") {
             return Err(Fault::invalid(
                 "writer reservation requires a writer_reservation operation",
             ));
@@ -1481,6 +1765,8 @@ fn serve(
     let _catalog_lock = process_lock(&state.join("catalog.lock"))?;
     let objects = state.join("objects");
     private_dir(&objects)?;
+    let statepoints = state.join("statepoints");
+    private_dir(&statepoints)?;
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
         .trim()
         .to_owned();
@@ -1502,10 +1788,14 @@ fn serve(
         escrow: Escrow::default(),
         network: crate::network_runtime::NetworkRuntime::default(),
         activation: ActivationRuntime::default(),
+        statepoints: StatePoints::new(statepoints),
     };
     worker
         .reconnect_native_endpoints()
         .map_err(|f| io::Error::other(f.message))?;
+    worker
+        .reconcile_statepoints()
+        .map_err(|fault| io::Error::other(fault.message))?;
 
     let socket = ipc::new_socket()?;
     // Restrict the initial filesystem socket before applying an optional group.
@@ -1518,7 +1808,34 @@ fn serve(
         fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))?;
     }
     socket.listen(32)?;
+    let mut next_stop_check = Instant::now() + Duration::from_secs(1);
     loop {
+        if Instant::now() >= next_stop_check {
+            worker
+                .reconcile_statepoints()
+                .map_err(|fault| io::Error::other(fault.message))?;
+            next_stop_check = Instant::now() + Duration::from_secs(1);
+        }
+        let mut pending = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let wait = next_stop_check
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .max(1) as i32;
+        match unsafe { libc::poll(&mut pending, 1, wait) } {
+            0 => continue,
+            result if result < 0 => {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            _ => (),
+        }
         let (client, _) = match socket.accept() {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             result => result?,

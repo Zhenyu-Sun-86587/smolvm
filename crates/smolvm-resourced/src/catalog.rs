@@ -227,9 +227,10 @@ impl Catalog {
                 crate::activation_catalog::install(&tx)?;
                 tx.execute_batch(include_str!("schema_native_operations.sql"))?;
                 crate::network_lease_catalog::install_initial_activations(&tx)?;
-                tx.execute_batch("PRAGMA user_version=9")?;
+                tx.execute_batch(include_str!("schema_statepoints.sql"))?;
+                tx.execute_batch("PRAGMA user_version=10")?;
             }
-            1..=9 => {
+            1..=10 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -253,7 +254,10 @@ impl Catalog {
                 }
                 if version < 9 {
                     crate::network_lease_catalog::install_initial_activations(&tx)?;
-                    tx.execute_batch("PRAGMA user_version=9")?;
+                }
+                if version < 10 {
+                    tx.execute_batch(include_str!("schema_statepoints.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=10")?;
                 }
                 crate::network_lease_catalog::recover(&tx)?;
                 crate::activation_catalog::recover(&tx)?;
@@ -842,7 +846,14 @@ impl Catalog {
         }
         let op = self.active_operation(r)?;
         identifier(kind)?;
-        if matches!(kind, "fd_lease" | "block_seal") {
+        if matches!(
+            kind,
+            "fd_lease"
+                | "block_seal"
+                | "statepoint_checkpoint"
+                | "statepoint_hibernate"
+                | "statepoint_rescue"
+        ) {
             return Err(Fault::invalid(
                 "this root kind is controlled by the resource protocol",
             ));

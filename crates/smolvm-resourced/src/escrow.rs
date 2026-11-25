@@ -16,26 +16,26 @@ const MAX_ESCROW_FDS: usize = 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Region {
-    gpa: u64,
-    length: u64,
-    extents: Vec<Extent>,
+pub(crate) struct Region {
+    pub(crate) gpa: u64,
+    pub(crate) length: u64,
+    pub(crate) extents: Vec<Extent>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Extent {
-    offset: u64,
-    length: u64,
-    backing_id: String,
-    backing_offset: u64,
+pub(crate) struct Extent {
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) backing_id: String,
+    pub(crate) backing_offset: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Descriptor {
-    regions: Vec<Region>,
-    backing_sizes: BTreeMap<String, u64>,
+pub(crate) struct Descriptor {
+    pub(crate) regions: Vec<Region>,
+    pub(crate) backing_sizes: BTreeMap<String, u64>,
 }
 
 #[derive(Deserialize)]
@@ -77,15 +77,15 @@ pub(crate) struct LeaseUpdate {
     pub expected_revision: i64,
 }
 
-struct Backing {
-    file: File,
+pub(crate) struct Backing {
+    pub(crate) file: File,
     device: u64,
     inode: u64,
     length: u64,
 }
 
 impl Backing {
-    fn identity(&self) -> (u64, u64, u64) {
+    pub(crate) fn identity(&self) -> (u64, u64, u64) {
         (self.device, self.inode, self.length)
     }
 }
@@ -146,7 +146,7 @@ fn transfer_state(record: &TransferRecord, id: &str) -> Value {
 }
 
 impl Descriptor {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if page_size <= 0 {
             return Err(Fault::new("E_HOST_IO", "cannot determine host page size"));
@@ -218,7 +218,7 @@ impl Descriptor {
     }
 }
 
-fn check_backing(descriptor: OwnedFd, wanted_length: u64) -> Result<Backing> {
+pub(crate) fn check_backing(descriptor: OwnedFd, wanted_length: u64) -> Result<Backing> {
     let fd = descriptor.as_raw_fd();
     let file = File::from(descriptor);
     let info = file
