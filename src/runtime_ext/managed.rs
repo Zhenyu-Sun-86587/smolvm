@@ -236,10 +236,17 @@ fn confirm(
     child: &mut Option<Child>,
 ) -> Result<()> {
     let launch = &plan.launch;
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut bound = false;
     loop {
         if control.exists() {
-            if client.bind_control(launch, control).is_ok() {
+            if !bound && client.bind_control(launch, control).is_ok() {
+                bound = true;
+            }
+            if bound
+                && (plan.restore.is_none()
+                    || client.progress_fork_target(launch).map_err(failed)?)
+            {
                 let op = smolvm_resourced::client::query_operation(
                     client.socket,
                     client.bundle,
@@ -368,6 +375,11 @@ pub fn boot() -> Result<()> {
         client
             .ack_managed_disks(&boot.plan.launch)
             .map_err(failed)?;
+        if let Some(restore) = &boot.plan.restore {
+            let memory = client.fork_memory(&boot.plan, restore).map_err(failed)?;
+            k.managed_restore(ctx, &boot.plan, restore, &memory, work)
+                .map_err(failed)?;
+        }
         process::install_configured_seccomp_filter(false).map_err(failed)?;
         Ok(())
     })();

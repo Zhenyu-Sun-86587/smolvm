@@ -163,6 +163,7 @@ struct Worker {
     network: crate::network_runtime::NetworkRuntime,
     activation: ActivationRuntime,
     statepoints: StatePoints,
+    forks: crate::managed_fork::Actor,
 }
 
 struct Reply {
@@ -494,6 +495,28 @@ impl Worker {
                     .update_lease(&lease, input.expected_revision, false)?;
                 self.statepoints.finish_restore(&self.catalog, &lease)?;
                 Ok(json!(lease))
+            }
+            "AcquireManagedForkMetadata" => {
+                self.authenticated_execution(request, peer)?;
+                let op = self.catalog.active_operation(request)?;
+                let (result, table, descriptors) =
+                    crate::managed_fork::metadata(&self.catalog, &op)?;
+                return Ok(Reply {
+                    result,
+                    table,
+                    descriptors,
+                    delivered: None,
+                });
+            }
+            "PrepareManagedForkAuthority" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                let op = self.catalog.active_operation(request)?;
+                let input = crate::managed_fork::activation_input(&self.catalog, &op)?;
+                Ok(json!(self.activation.prepare(
+                    &self.catalog,
+                    &execution,
+                    &request.derived("PrepareTargetActivation", input)
+                )?))
             }
             "AcquireManagedLaunchDisks" => {
                 let execution = self.authenticated_execution(request, peer)?;
@@ -864,6 +887,70 @@ impl Worker {
             }
             "StopCommit" => self.stop_statepoint(request),
             "AbortStatePoint" => self.abort_statepoint(request),
+            "ProgressManagedForkTarget" => {
+                let execution = self.scoped_execution(request)?;
+                self.verify_live_execution(&execution)?;
+                let op = self.catalog.active_operation(request)?;
+                if crate::managed_fork::restore(&self.catalog, &op.operation_id)?.is_none() {
+                    return Err(Fault::invalid("missing managed target"));
+                }
+                let record = activation_runtime::receipt(&self.catalog, &execution, request)?;
+                let outcome = match record.phase.as_str() {
+                    "offered" => {
+                        let frame =
+                            crate::managed_fork::identity_frame(&self.catalog, &op, &record)?;
+                        self.activation.begin(
+                            &self.catalog,
+                            &execution,
+                            &request.derived(
+                                "BeginTargetIdentity",
+                                json!({"frame_hex":frame,"expected_revision":record.revision}),
+                            ),
+                        )?
+                    }
+                    "identity_ready" => self.activation.commit(
+                        &self.catalog,
+                        &self.network,
+                        &execution,
+                        &request.derived(
+                            "CommitActivation",
+                            json!({"expected_revision":record.revision}),
+                        ),
+                        || self.verify_live_execution(&execution),
+                    )?,
+                    "applying" | "policy_armed" | "committing" => self.activation.poll(
+                        &self.catalog,
+                        &self.network,
+                        &execution,
+                        request,
+                        || self.verify_live_execution(&execution),
+                    )?,
+                    "released" => record,
+                    _ => {
+                        return Err(Fault::new(
+                            "E_FENCE_UNPROVEN",
+                            "target has no releasable scoped authority",
+                        ))
+                    }
+                };
+                Ok(json!({"phase":outcome.phase,"execution":execution}))
+            }
+            "SubmitManagedFork" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Submit {
+                    kind: String,
+                    parameters: crate::managed_fork::Input,
+                }
+                let input: Submit = request.payload()?;
+                Ok(json!(crate::managed_fork::submit(
+                    &mut self.catalog,
+                    &self.boot,
+                    request,
+                    &input.kind,
+                    input.parameters
+                )?))
+            }
             "SubmitManagedLaunch" => Ok(json!(crate::managed::submit(
                 &mut self.catalog,
                 request,
@@ -2016,6 +2103,7 @@ fn serve(
         network: crate::network_runtime::NetworkRuntime::default(),
         activation: ActivationRuntime::default(),
         statepoints: StatePoints::new(statepoints),
+        forks: Default::default(),
     };
     worker
         .reconnect_native_endpoints()
@@ -2038,6 +2126,10 @@ fn serve(
     let mut next_stop_check = Instant::now() + Duration::from_secs(1);
     loop {
         if Instant::now() >= next_stop_check {
+            worker
+                .forks
+                .tick(&mut worker.catalog, &mut worker.escrow, &worker.boot)
+                .map_err(|e| io::Error::other(e.message))?;
             worker
                 .reconcile_statepoints()
                 .map_err(|fault| io::Error::other(fault.message))?;

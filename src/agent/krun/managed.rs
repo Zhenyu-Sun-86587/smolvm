@@ -213,3 +213,93 @@ impl KrunFunctions {
         Ok(())
     }
 }
+
+impl KrunFunctions {
+    pub(crate) fn managed_restore(
+        &self,
+        ctx: u32,
+        plan: &Plan,
+        restore: &smolvm_resourced::managed::Restore,
+        memory: &smolvm_resourced::native_client::ForkMemory,
+        directory: &Path,
+    ) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        type Ram = unsafe extern "C" fn(u32, *const u8, usize, *const i32, usize) -> i32;
+        type Authority = unsafe extern "C" fn(u32, i32, *const u8, *const u8, u64) -> i32;
+        let snapshot = directory.join("capture");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&snapshot)
+            .map_err(|e| e.to_string())?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(snapshot.join("checkpoint.bin"))
+            .map_err(|e| e.to_string())?;
+        file.write_all(&memory.checkpoint)
+            .map_err(|e| e.to_string())?;
+        drop(file);
+        let path = CString::new(snapshot.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        let fds: Vec<_> = memory.ram.iter().map(AsRawFd::as_raw_fd).collect();
+        let check = |op: &str, status: i32| {
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{op} returned {status}: {}",
+                    self.last_error_message().unwrap_or_default()
+                ))
+            }
+        };
+        unsafe {
+            let import = self
+                ._handle
+                .get::<Ram>(b"krun_set_diskless_snapshot_ram_v1\0")
+                .map_err(|e| e.to_string())?;
+            let configure = self
+                ._handle
+                .get::<Authority>(b"krun_set_guest_target_authority_v1\0")
+                .map_err(|e| e.to_string())?;
+            check(
+                "parked checkpoint",
+                self.set_snapshot.ok_or("missing snapshot loader")?(ctx, path.as_ptr()),
+            )?;
+            check(
+                "sealed RAM closure",
+                import(
+                    ctx,
+                    memory.descriptor.as_ptr(),
+                    memory.descriptor.len(),
+                    fds.as_ptr(),
+                    fds.len(),
+                ),
+            )?;
+            check(
+                "target identity authority",
+                configure(
+                    ctx,
+                    memory.authority.as_raw_fd(),
+                    memory.anchor.as_ptr(),
+                    memory.context.as_ptr(),
+                    plan.launch.execution.execution_epoch as u64,
+                ),
+            )?;
+            if restore.source_pivot {
+                let configure = self
+                    ._handle
+                    .get::<Config>(b"krun_configure_worker_block_restore_v1\0")
+                    .map_err(|e| e.to_string())?;
+                let proof=serde_json::to_vec(&serde_json::json!({"operation_id":plan.launch.operation_id,"request_digest":plan.launch.request_digest,
+                    "source_pivot_id":restore.batch_id,"grant_id":plan.grant_id,"expected_revision":2})).map_err(|e|e.to_string())?;
+                check(
+                    "restored writer set",
+                    configure(ctx, proof.as_ptr(), proof.len()),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}

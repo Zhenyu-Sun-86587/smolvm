@@ -27,6 +27,8 @@ mod ipc;
 #[cfg(target_os = "linux")]
 pub mod managed;
 #[cfg(target_os = "linux")]
+mod managed_fork;
+#[cfg(target_os = "linux")]
 pub mod native_client;
 #[cfg(target_os = "linux")]
 mod native_control;

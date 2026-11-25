@@ -47,8 +47,18 @@ pub struct Plan {
     pub machine: Machine,
     pub devices: Vec<Device>,
     pub grant_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<Restore>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Restore {
+    pub batch_id: String,
+    pub capture_id: String,
+    pub anchor: String,
+    pub helper_digest: String,
+    pub source_pivot: bool,
+}
 pub(crate) fn key(op: &str, label: &str, slot: usize) -> String {
     let digest = Sha256::digest(format!("{op}\0{label}\0{slot}").as_bytes());
     format!("{label}-{}", &hex::encode(digest)[..32])
@@ -71,7 +81,7 @@ fn serve_id(instance: &str, name: &str) -> Result<String> {
     Ok(id.to_string())
 }
 impl Machine {
-    fn devices(&self, c: &Catalog, op: &str, instance: &str) -> Result<Vec<Device>> {
+    pub(crate) fn devices(&self, c: &Catalog, op: &str, instance: &str) -> Result<Vec<Device>> {
         if !valid_id(&self.name)
             || self.cpus == 0
             || self.memory_mib < 64
@@ -245,6 +255,7 @@ pub(crate) fn plan(c: &Catalog, op: &Operation) -> Result<Option<Plan>> {
             devices: serde_json::from_str(&devices)
                 .map_err(|e| Fault::new("E_CATALOG", e.to_string()))?,
             grant_id: key(&op.operation_id, "grant", 0),
+            restore: crate::managed_fork::restore(c, &op.operation_id)?,
         })
     })
     .transpose()

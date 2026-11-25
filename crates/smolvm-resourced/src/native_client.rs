@@ -294,6 +294,17 @@ impl Client<'_> {
             _ => Err(fault("E_PROTOCOL_UNSUPPORTED", "invalid Worker result")),
         }
     }
+    pub fn submit_fork(&self, input: &Submission) -> Result<OperationReceipt, QueryError> {
+        self.recover_and_retry(|| {
+            self.receipt(
+                "SubmitManagedFork",
+                &input.operation_id,
+                &input.request_digest,
+                &input.expected,
+                json!({"kind":input.kind,"parameters":input.parameters}),
+            )
+        })
+    }
     pub fn managed_submit(&self, input: &Submission) -> Result<OperationReceipt, QueryError> {
         self.recover_and_retry(|| {
             self.receipt(
@@ -312,6 +323,156 @@ impl Client<'_> {
             None,
             json!({"serve_instance":serve}),
         )
+    }
+    pub fn fork_memory(
+        &self,
+        plan: &crate::managed::Plan,
+        restore: &crate::managed::Restore,
+    ) -> Result<ForkMemory, QueryError> {
+        use std::io::Read;
+        let launch = &plan.launch;
+        let expected = Some(&launch.execution);
+        let intent = Some((launch.operation_id.as_str(), launch.request_digest.as_str()));
+        let protocol = || fault("E_PROTOCOL_UNSUPPORTED", "invalid captured memory receipt");
+        let (meta, table, mut files): (Value, _, _) =
+            self.exchange("AcquireManagedForkMetadata", expected, intent, empty())?;
+        if meta["capture_id"] != restore.capture_id
+            || files.len() != 2
+            || table.len() != 2
+            || table[0].role != "checkpoint"
+            || table[1].role != "ram_descriptor"
+            || table.iter().any(|f| f.resource_id != restore.capture_id)
+        {
+            return Err(protocol());
+        }
+        let bytes = |fd: OwnedFd, size: &Value, limit: u64| -> Result<Vec<u8>, QueryError> {
+            use std::os::fd::AsRawFd;
+            let size = size
+                .as_u64()
+                .filter(|s| *s > 0 && *s <= limit)
+                .ok_or_else(protocol)?;
+            let file = std::fs::File::from(fd);
+            let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+            let required =
+                libc::F_SEAL_WRITE | libc::F_SEAL_SEAL | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+            if seals < 0
+                || seals & required != required
+                || file.metadata().map_err(|e| fault("E_HOST_IO", e))?.len() != size
+            {
+                return Err(protocol());
+            }
+            let mut value = Vec::new();
+            file.take(size)
+                .read_to_end(&mut value)
+                .map_err(|e| fault("E_HOST_IO", e))?;
+            if value.len() as u64 != size {
+                return Err(protocol());
+            }
+            Ok(value)
+        };
+        let descriptor = bytes(
+            files.pop().ok_or_else(protocol)?,
+            &meta["descriptor_bytes"],
+            4 << 20,
+        )?;
+        let checkpoint = bytes(
+            files.pop().ok_or_else(protocol)?,
+            &meta["checkpoint_bytes"],
+            64 << 20,
+        )?;
+        let json: Value = serde_json::from_slice(&descriptor).map_err(|_| protocol())?;
+        let ordered: Vec<_> = json["backing_sizes"]
+            .as_object()
+            .ok_or_else(protocol)?
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if ordered.is_empty() || ordered.len() > 512 {
+            return Err(protocol());
+        }
+        let lease_id = crate::managed::key(&launch.operation_id, "ram-lease", 0);
+        let mut ram = Vec::new();
+        while ram.len() < ordered.len() {
+            let offset = ram.len();
+            let (batch,table,fds):(Value,_,_)=self.exchange("AcquireResourceLease",expected,intent,json!({"lease_id":lease_id,"resource_id":restore.capture_id,"access":"ro","offset":offset}))?;
+            if batch["lease"]["lease_id"] != lease_id
+                || batch["lease"]["resource_id"] != restore.capture_id
+                || batch["offset"] != offset
+                || batch["total"] != ordered.len()
+                || fds.is_empty()
+                || table.len() != fds.len()
+                || offset + fds.len() > ordered.len()
+                || table.iter().enumerate().any(|(i, f)| {
+                    f.index != i
+                        || f.resource_id != ordered[offset + i]
+                        || f.role != "immutable_backing"
+                })
+            {
+                return Err(protocol());
+            }
+            ram.extend(fds);
+        }
+        let ack: Value = self.call(
+            "AckAttached",
+            expected,
+            intent,
+            json!({"lease_id":lease_id,"expected_revision":1}),
+        )?;
+        if ack["state"] != "attached" || ack["lease_id"] != lease_id {
+            return Err(protocol());
+        }
+        let ready: Value = self.call("PrepareManagedForkAuthority", expected, intent, empty())?;
+        if ready["binding"]["input"]["capture_resource_id"] != restore.capture_id
+            || ready["binding"]["input"]["capture_anchor"] != restore.anchor
+            || ready["binding"]["input"]["helper_digest"] != restore.helper_digest
+        {
+            return Err(protocol());
+        }
+        let (offer, table, mut fds): (Value, _, _) = self.exchange(
+            "AcquireTargetAuthority",
+            expected,
+            intent,
+            json!({"expected_revision":ready["revision"]}),
+        )?;
+        if table.len() != 1
+            || fds.len() != 1
+            || table[0].role != "target_authority"
+            || offer["context_digest"] != ready["context_digest"]
+        {
+            return Err(protocol());
+        }
+        let mut context = [0; 32];
+        hex::decode_to_slice(
+            ready["context_digest"].as_str().ok_or_else(protocol)?,
+            &mut context,
+        )
+        .map_err(|_| protocol())?;
+        let mut anchor = [0; 16];
+        hex::decode_to_slice(&restore.anchor, &mut anchor).map_err(|_| protocol())?;
+        Ok(ForkMemory {
+            descriptor,
+            checkpoint,
+            ram,
+            context,
+            anchor,
+            authority: fds.pop().ok_or_else(protocol)?,
+        })
+    }
+    pub fn progress_fork_target(&self, launch: &Launch) -> Result<bool, QueryError> {
+        let v: Value = self.call(
+            "ProgressManagedForkTarget",
+            Some(&launch.execution),
+            Some((&launch.operation_id, &launch.request_digest)),
+            empty(),
+        )?;
+        if v["execution"]["incarnation_id"].as_str() != launch.execution.incarnation_id.as_deref()
+            || v["execution"]["execution_epoch"] != launch.execution.execution_epoch
+        {
+            return Err(fault("E_STALE_EXECUTION", "fork target changed"));
+        }
+        Ok(v["phase"] == "released")
     }
     pub fn managed_disks(
         &self,
@@ -508,4 +669,13 @@ impl Client<'_> {
         }
         Ok(r)
     }
+}
+
+pub struct ForkMemory {
+    pub descriptor: Vec<u8>,
+    pub checkpoint: Vec<u8>,
+    pub ram: Vec<OwnedFd>,
+    pub context: [u8; 32],
+    pub anchor: [u8; 16],
+    pub authority: OwnedFd,
 }

@@ -98,7 +98,8 @@ pub fn worker_operations_router(socket: std::path::PathBuf) -> axum::Router {
         .route(
             "/api/v1/runtime-ext/v1/machines/{name}/execution",
             axum::routing::get(machine_execution),
-        ).merge(guest_agent::router());
+        )
+        .merge(guest_agent::router());
     #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
     let router = {
         managed::dispatch(socket.clone());
@@ -231,6 +232,9 @@ async fn submit(
 ) -> axum::response::Response {
     native(socket, move |client| {
         launch::require_own(&input.expected.instance_id)?;
+        if matches!(input.kind.as_str(), "independent_fork" | "fork_batch") {
+            return client.submit_fork(&input);
+        }
         if input.kind == "launch" {
             launch::ensure_binding(client, &input.expected.instance_id)?;
             return client.managed_submit(&input);

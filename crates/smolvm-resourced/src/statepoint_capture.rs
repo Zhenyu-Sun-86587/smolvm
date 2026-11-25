@@ -99,6 +99,12 @@ struct Attachment {
     layers: Vec<String>,
 }
 
+impl Device {
+    pub(crate) fn managed_source(&self)->Option<(&str,(&str,&str))> {
+        let a=&self.block.as_ref()?.managed_attachment;
+        Some((&a.device_id,(a.writable_head_id.as_deref().unwrap_or(&a.generation_id),&a.volume_id)))
+    }
+}
 pub(crate) struct Capture {
     pub checkpoint: Vec<u8>,
     pub descriptor: Descriptor,

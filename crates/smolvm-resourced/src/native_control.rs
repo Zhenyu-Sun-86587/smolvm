@@ -185,7 +185,11 @@ impl Endpoint {
         Ok(socket.into())
     }
     pub fn command(&self, line: &str) -> Result<String> {
+        self.command_with_timeout(line, Duration::from_secs(2))
+    }
+    pub(crate) fn command_with_timeout(&self, line: &str, timeout: Duration) -> Result<String> {
         let (socket, pidfd) = self.connect()?;
+        socket.set_read_timeout(Some(timeout)).map_err(unavailable)?;
         let mut stream = std::os::unix::net::UnixStream::from(OwnedFd::from(socket));
         writeln!(stream, "{line}").map_err(unavailable)?;
         let mut response = String::new();

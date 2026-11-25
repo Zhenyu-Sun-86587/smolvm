@@ -181,7 +181,10 @@ pub fn prepare(
     execution: &Execution,
 ) -> Result<PivotPacket> {
     let operation = catalog.active_operation(request)?;
-    if operation.kind != "writer_pivot" {
+    if !matches!(
+        operation.kind.as_str(),
+        "writer_pivot" | "independent_fork" | "fork_batch"
+    ) {
         return Err(Fault::invalid(
             "held pivot requires a writer_pivot operation",
         ));

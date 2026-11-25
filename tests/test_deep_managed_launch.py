@@ -34,7 +34,7 @@ def digest(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def verify(bundle, root, guest, system_image):
+def verify(bundle, root, guest, system_image, fork):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
@@ -158,7 +158,7 @@ def verify(bundle, root, guest, system_image):
         assert len(heads)==3, heads
         logs=root/"state/managed"
         def guest_log():
-            return next(logs.glob("*.log")).read_text(errors="replace")
+            return (logs/(ref["incarnation_id"]+".log")).read_text(errors="replace")
         if system_image:
             agent=Path("/run/smolvm-custom/managed")/handshake["runtime_instance_id"]/ref["incarnation_id"]/"agent.sock"
             def system_pid():
@@ -184,6 +184,37 @@ def verify(bundle, root, guest, system_image):
         until(lambda:http(endpoint,EXT+"/capabilities"))
         assert http(endpoint,EXT+"/operations",submit)==op and http(endpoint,inventory_url)["execution"]==record["execution"]
         assert rpc(worker,"QueryWorkerBudget")["allocated"]["vcpus"]==2
+        if fork:
+            names=["branch-a","branch-b"]
+            call=dict(operation_id="fork-counter-batch",request_digest=digest(b"counter-batch"),expected=ref,kind="fork_batch",parameters={"children":names})
+            batch=http(endpoint,EXT+"/operations",call)
+            assert batch["phase"]=="NEW" and len(batch["fork"]["children"])==2
+            capture=batch["fork"]["capture_id"]
+            latest={}
+            def forked():
+                nonlocal latest
+                latest=http(endpoint,EXT+"/operations/"+call["operation_id"])
+                progress=latest["fork"]
+                if progress.get("error"):print("capture",progress["stage"],progress["error"],flush=True)
+                assert progress["capture_id"]==capture and latest["phase"]!="ABORTED",latest
+                return latest if latest["phase"]=="COMPLETED" else None
+            try:finished=until(forked,150)
+            except TimeoutError:raise AssertionError(latest)
+            assert finished["fork"]["source_released"] and all(ch["phase"]=="COMPLETED" for ch in finished["fork"]["children"]),finished
+            assert http(endpoint,EXT+"/operations",call)==finished
+            source_ticks=[line.split() for line in guest_log().splitlines() if line.startswith("PARKED_BLOCK_TICK")]
+            boundary=None
+            for child in finished["fork"]["children"]:
+                file=logs/(child["incarnation_id"]+".log")
+                until(lambda:file.exists() and "PARKED_BLOCK_TICK" in file.read_text(errors="replace"),15)
+                first=next(line for line in file.read_text(errors="replace").splitlines() if line.startswith("PARKED_BLOCK_TICK")).split()
+                marker=int(first[1])-1
+                assert (int(first[5]),int(first[6]))==(marker,marker^0xbeef12349876),first
+                boundary=boundary or first[1]
+                assert first[1]==boundary,first
+                assert first[2]==source_ticks[0][2] and first[3]==child["name"] and first[4]!=source_ticks[0][4],first
+            print("One native parked capture restored two independently identified KVM children with live RAM and both writable disks.",flush=True)
+            return
         if not system_image:
             old=record["execution"]
             fd=os.pidfd_open(old["pid"])
@@ -215,15 +246,16 @@ def main():
     parser.add_argument("--bundle",type=Path,required=True)
     parser.add_argument("--guest",type=Path,help="prebuilt static kvm-parked-block-guest test binary")
     parser.add_argument("--system-image",type=Path,help="managed Debian ext4 image containing the systemd Guest Agent service")
+    parser.add_argument("--fork",action="store_true",help="fork a batch of two managed guests from one live capture")
     args=parser.parse_args()
     if os.geteuid()!=0:parser.error("requires root, KVM and systemd")
     if not os.environ.get("SMOLVM_MANAGED_TEST_ISOLATED"):
         os.execvpe("unshare",["unshare","--mount","--propagation","private","--net","--",sys.executable,__file__,
-                             "--bundle",str(args.bundle.resolve()),*(["--guest",str(args.guest.resolve())] if args.guest else []),*(["--system-image",str(args.system_image.resolve())] if args.system_image else [])],{**os.environ,"SMOLVM_MANAGED_TEST_ISOLATED":"1"})
+                             "--bundle",str(args.bundle.resolve()),*(["--guest",str(args.guest.resolve())] if args.guest else []),*(["--system-image",str(args.system_image.resolve())] if args.system_image else []),*(["--fork"] if args.fork else [])],{**os.environ,"SMOLVM_MANAGED_TEST_ISOLATED":"1"})
     with tempfile.TemporaryDirectory(dir="/var/tmp",prefix="smm-") as tmp:
         root=Path(tmp)
         root.chmod(0o755)
-        try: verify(args.bundle.resolve(),root,args.guest,args.system_image)
+        try: verify(args.bundle.resolve(),root,args.guest,args.system_image,args.fork)
         except BaseException:
             for log in [root/"serve.log",root/"worker.log",*(root/"state/managed").glob("*.log")]:
                 if log.exists():print(f"{log.name}\n{log.read_text(errors='replace')[-7000:]}",file=sys.stderr)

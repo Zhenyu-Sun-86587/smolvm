@@ -28,6 +28,8 @@ pub struct Operation {
     pub native: Option<crate::native_operations::Progress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<Expected>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<Value>,
     pub phase: String,
     pub decision: String,
     pub revision: i64,
@@ -45,6 +47,7 @@ fn operation_row(row: &Row<'_>) -> rusqlite::Result<Operation> {
         expected_incarnation_id: row.get(7)?,
         native: None,
         execution: None,
+        fork: None,
         phase: row.get(8)?,
         decision: row.get(9)?,
         revision: row.get(10)?,
@@ -232,9 +235,10 @@ impl Catalog {
                 crate::network_lease_catalog::install_initial_activations(&tx)?;
                 tx.execute_batch(include_str!("schema_statepoints.sql"))?;
                 tx.execute_batch(include_str!("schema_managed_launch.sql"))?;
-                tx.execute_batch("PRAGMA user_version=11")?;
+                tx.execute_batch(include_str!("schema_managed_forks.sql"))?;
+                tx.execute_batch("PRAGMA user_version=14")?;
             }
-            1..=11 => {
+            1..=11 | 14 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -266,6 +270,10 @@ impl Catalog {
                 if version < 11 {
                     tx.execute_batch(include_str!("schema_managed_launch.sql"))?;
                     tx.execute_batch("PRAGMA user_version=11")?;
+                }
+                if version < 14 {
+                    tx.execute_batch(include_str!("schema_managed_forks.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=14")?;
                 }
                 crate::network_lease_catalog::recover(&tx)?;
                 crate::activation_catalog::recover(&tx)?;
@@ -395,10 +403,13 @@ impl Catalog {
     pub fn operation(&self, id: &str) -> Result<Operation> {
         let mut operation = op(&self.db, id)?.ok_or_else(|| not_found("operation"))?;
         operation.native = crate::native_operations::progress(&self.db, id)?;
-        if operation.kind == "launch" && operation.phase == "COMPLETED" {
+        if operation.launches_execution() && operation.phase == "COMPLETED" {
             operation.execution = self.db.query_row(
                 "SELECT e.instance_id,e.incarnation_id,e.execution_epoch FROM managed_launches m JOIN executions e USING(incarnation_id) WHERE m.operation_id=? AND e.last_operation_id=m.operation_id",
                 [id], |row| Ok(Expected {instance_id:row.get(0)?, incarnation_id:row.get(1)?, execution_epoch:row.get(2)?})).optional()?;
+        }
+        if matches!(operation.kind.as_str(), "independent_fork" | "fork_batch") {
+            operation.fork = crate::managed_fork::receipt(self, &operation.operation_id)?;
         }
         Ok(operation)
     }
@@ -509,6 +520,12 @@ impl Catalog {
             ));
         }
         let mut operation = self.matching_operation(r)?;
+        if matches!(operation.kind.as_str(), "independent_fork" | "fork_batch") {
+            return Err(conflict(
+                "E_OPERATION_HAS_EFFECTS",
+                "a managed fork is owned by the capture actor",
+            ));
+        }
         let final_phase = if abort { "ABORTED" } else { "COMPLETED" };
         if operation.phase == final_phase
             && (operation.revision == revision
