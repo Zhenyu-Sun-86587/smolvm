@@ -276,6 +276,9 @@ impl ServeStartCmd {
                 ));
             }
             smolvm::deep_state::initialize(None)?;
+            if let Some(worker) = &self.worker_resource_socket {
+                smolvm::api::configure_native_launch_worker(worker)?;
+            }
             if let Some(directory) = &self.cache_disk_dir {
                 smolvm::deep_state::require_private_path(directory)?;
             }

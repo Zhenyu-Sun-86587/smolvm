@@ -182,6 +182,10 @@ pub struct KrunFunctions {
     pub get_guest_ram: Option<unsafe extern "C" fn(u32, *mut u64, u32, *mut u64) -> i32>,
     /// Register a Unix control socket for the VM (pause/resume/checkpoint/restore).
     pub set_control_socket: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
+    #[cfg(feature = "deep-runtime")]
+    pub enable_guest_gate: Option<unsafe extern "C" fn(u32) -> i32>,
+    #[cfg(feature = "deep-runtime")]
+    pub set_guest_identity_helper: Option<unsafe extern "C" fn(u32, *const u8, usize) -> i32>,
     /// Route every TSI guest DNS query to a host forwarder on loopback.
     /// `None` on libkrun builds that predate it.
     pub set_dns_forwarder: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
@@ -362,6 +366,10 @@ impl KrunFunctions {
         let add_input_device = load_optional_sym!("krun_add_input_device");
         let get_guest_ram = load_optional_sym!("krun_get_guest_ram");
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
+        #[cfg(feature = "deep-runtime")]
+        let enable_guest_gate = load_optional_sym!("krun_enable_guest_gate_v1");
+        #[cfg(feature = "deep-runtime")]
+        let set_guest_identity_helper = load_optional_sym!("krun_set_guest_identity_helper_v1");
         let set_dns_forwarder = load_optional_sym!("krun_set_dns_forwarder");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
         let set_snapshot_memory_fd = load_optional_sym!("krun_set_snapshot_memory_fd");
@@ -407,6 +415,10 @@ impl KrunFunctions {
             add_input_device,
             get_guest_ram,
             set_control_socket,
+            #[cfg(feature = "deep-runtime")]
+            enable_guest_gate,
+            #[cfg(feature = "deep-runtime")]
+            set_guest_identity_helper,
             set_dns_forwarder,
             set_snapshot,
             set_snapshot_memory_fd,

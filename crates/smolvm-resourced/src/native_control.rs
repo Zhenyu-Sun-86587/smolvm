@@ -35,6 +35,8 @@ pub(crate) struct Inventory {
     pub last_session: u32,
     pub guest_gate: String,
     pub measured_helper: bool,
+    #[serde(default)]
+    pub standby_blocker: Option<String>,
     pub devices: Vec<Value>,
 }
 

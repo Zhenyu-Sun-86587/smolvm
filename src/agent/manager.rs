@@ -4531,6 +4531,19 @@ impl AgentManager {
                 None => cmd.env_remove(var),
             };
         }
+        #[cfg(feature = "deep-runtime")]
+        let mut native_launch = crate::runtime_ext::launch::Enrollment::prepare(
+            &mut cmd,
+            deep_machine,
+            uid_env
+                .iter()
+                .find(|(key, _)| *key == "SMOLVM_VM_UID")
+                .and_then(|(_, value)| value.parse().ok()),
+            features
+                .control_socket
+                .clone()
+                .unwrap_or_else(|| self.vsock_socket.with_file_name("control.sock")),
+        )?;
         cmd.arg("_boot-vm-owned")
             .arg(&config_path)
             .arg(&launch.ticket.token)
@@ -4703,7 +4716,25 @@ impl AgentManager {
             }
         }
 
-        let launched = self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config);
+        let launched = (|| {
+            #[cfg(feature = "deep-runtime")]
+            if let Some(launch) = &mut native_launch {
+                launch.start(child_pid)?;
+            }
+            self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config)?;
+            #[cfg(feature = "deep-runtime")]
+            if let Some(launch) = &native_launch {
+                launch.commit()?;
+            }
+            Ok(())
+        })();
+        #[cfg(feature = "deep-runtime")]
+        if let (Err(_), Some(launch)) = (&launched, &native_launch) {
+            if process::is_alive(child_pid) {
+                self.abort_failed_launch(child_pid)?;
+            }
+            launch.abort_after_exit()?;
+        }
         #[cfg(target_os = "linux")]
         if let (Err(_), Some(name)) = (&launched, adopted_scope) {
             release_failed_launch_scope(name, child_pid);

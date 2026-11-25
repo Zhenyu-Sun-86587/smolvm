@@ -47,6 +47,18 @@ pub struct Client<'a> {
     pub socket: &'a Path,
     pub bundle: &'a str,
 }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Launch {
+    pub operation_id: String,
+    pub request_digest: String,
+    pub execution: ExecutionRef,
+}
+
+#[derive(Deserialize)]
+struct Permit {
+    launch_permit: String,
+}
 fn fault(code: &str, msg: impl ToString) -> QueryError {
     QueryError {
         code: code.into(),
@@ -55,6 +67,131 @@ fn fault(code: &str, msg: impl ToString) -> QueryError {
 }
 
 impl Client<'_> {
+    pub fn register_bundle(&self, exe_hash: &str) -> Result<(), QueryError> {
+        let r: Value = self.call(
+            "RegisterBundle",
+            None,
+            None,
+            json!({"executable_sha256":exe_hash}),
+        )?;
+        if r["bundle_digest"] != self.bundle || r["executable_sha256"] != exe_hash {
+            return Err(fault("E_PROTOCOL_UNSUPPORTED", "wrong registered bundle"));
+        }
+        Ok(())
+    }
+    pub fn begin_launch(
+        &self,
+        prior: &ExecutionRef,
+        launch: &Launch,
+    ) -> Result<OperationReceipt, QueryError> {
+        let begin = || {
+            self.receipt(
+                "BeginOperation",
+                &launch.operation_id,
+                &launch.request_digest,
+                prior,
+                json!({"kind":"launch"}),
+            )
+        };
+        match begin() {
+            Err(e) if e.code == "E_RECOVERING" => {
+                let health: Value = self.call("Health", None, None, empty())?;
+                let session = health["broker_session_id"]
+                    .as_str()
+                    .ok_or_else(|| fault("E_PROTOCOL_UNSUPPORTED", "missing recovery session"))?;
+                let _: Value = self.call(
+                    "CompleteRecovery",
+                    None,
+                    None,
+                    json!({"broker_session_id":session}),
+                )?;
+                begin()
+            }
+            outcome => outcome,
+        }
+    }
+    pub fn issue_permit(&self, launch: &Launch, pid: i32, uid: u32) -> Result<String, QueryError> {
+        let permit: Permit = self.call(
+            "IssueLaunchPermit",
+            Some(&launch.execution),
+            Some((&launch.operation_id, &launch.request_digest)),
+            json!({"pid":pid,"uid":uid}),
+        )?;
+        Ok(permit.launch_permit)
+    }
+    pub fn register(&self, launch: &Launch, permit: &str) -> Result<(), QueryError> {
+        let r: Value = self.call(
+            "RegisterExecution",
+            Some(&launch.execution),
+            Some((&launch.operation_id, &launch.request_digest)),
+            json!({"launch_permit":permit}),
+        )?;
+        let execution = &r["execution"];
+        if execution["pid"] != std::process::id()
+            || execution["uid"] != unsafe { libc::geteuid() }
+            || execution["bundle_digest"] != self.bundle
+            || execution["instance_id"] != launch.execution.instance_id
+            || execution["incarnation_id"].as_str() != launch.execution.incarnation_id.as_deref()
+            || execution["execution_epoch"] != launch.execution.execution_epoch
+        {
+            return Err(fault(
+                "E_PROTOCOL_UNSUPPORTED",
+                "wrong registered execution",
+            ));
+        }
+        Ok(())
+    }
+    pub fn bind_control(&self, launch: &Launch, path: &Path) -> Result<(), QueryError> {
+        let r: Value = self.call(
+            "BindNativeControl",
+            Some(&launch.execution),
+            None,
+            json!({"control_socket":path}),
+        )?;
+        if r["execution"]["incarnation_id"].as_str() != launch.execution.incarnation_id.as_deref()
+            || r["inventory"]["protocol"] != "CaptureControl/1"
+        {
+            return Err(fault(
+                "E_PROTOCOL_UNSUPPORTED",
+                "wrong native control binding",
+            ));
+        }
+        Ok(())
+    }
+    pub fn fence_exit(&self, expected: &ExecutionRef) -> Result<(), QueryError> {
+        let r: Value = self.call("FinalizeExecutionExit", Some(expected), None, empty())?;
+        if r["incarnation_id"].as_str() != expected.incarnation_id.as_deref()
+            || r["phase"] != "exited"
+        {
+            return Err(fault(
+                "E_FENCE_UNPROVEN",
+                "Worker could not confirm execution exit",
+            ));
+        }
+        Ok(())
+    }
+    pub fn finish_launch(
+        &self,
+        launch: &Launch,
+        binding: &ExecutionRef,
+        abort: bool,
+        revision: i64,
+    ) -> Result<(), QueryError> {
+        let r: OperationReceipt = self.call(
+            "FinishOperation",
+            Some(binding),
+            Some((&launch.operation_id, &launch.request_digest)),
+            json!({"abort":abort,"expected_revision":revision}),
+        )?;
+        if r.operation_id != launch.operation_id
+            || r.request_digest != launch.request_digest
+            || r.bundle_digest != self.bundle
+            || r.phase != if abort { "ABORTED" } else { "COMPLETED" }
+        {
+            return Err(fault("E_PROTOCOL_UNSUPPORTED", "wrong launch decision"));
+        }
+        Ok(())
+    }
     fn call<T: DeserializeOwned>(
         &self,
         method: &str,

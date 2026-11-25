@@ -189,6 +189,21 @@ fn response(phase: u8, frame: &[u8; FRAME], completed: u32, error: i32) -> [u8; 
     ack
 }
 
+fn identity_directory() -> io::Result<File> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/etc")?;
+    // Never enter a potentially frozen filesystem to apply a target identity.
+    let mut stat = MaybeUninit::<libc::statfs>::uninit();
+    errno(unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) })?;
+    let fs = unsafe { stat.assume_init() }.f_type as u64;
+    if fs != libc::EXT4_SUPER_MAGIC as u64 && fs != libc::TMPFS_MAGIC as u64 {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    Ok(directory)
+}
+
 pub fn run() -> io::Result<()> {
     let mut control = OpenOptions::new()
         .read(true)
@@ -198,18 +213,9 @@ pub fn run() -> io::Result<()> {
     if !control.metadata()?.file_type().is_char_device() {
         return Err(invalid());
     }
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/etc")?;
-    // A frozen userspace filesystem daemon cannot service a target identity
-    // write. Only profiles using this locally served mount may register.
-    let mut stat = MaybeUninit::<libc::statfs>::uninit();
-    errno(unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) })?;
-    let fs = unsafe { stat.assume_init() }.f_type as u64;
-    if fs != libc::EXT4_SUPER_MAGIC as u64 && fs != libc::TMPFS_MAGIC as u64 {
-        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-    }
+    // A same-execution standby never applies a target identity. Determine
+    // availability before freeze and retain the exact result for a later offer.
+    let directory = identity_directory();
     let mut rng = OpenOptions::new()
         .write(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -240,7 +246,7 @@ pub fn run() -> io::Result<()> {
     } else {
         None
     };
-    let result = apply(&frame, extension, &directory, &mut rng, &mut completed);
+    let result = directory.and_then(|dir| apply(&frame, extension, &dir, &mut rng, &mut completed));
     let ack = match &result {
         Ok(()) => response(COMPLETE, &frame, completed, 0),
         Err(error) => response(
