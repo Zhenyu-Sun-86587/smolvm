@@ -1848,12 +1848,13 @@ impl Worker {
                     epoch=execution.execution_epoch;
                     if execution.phase!="exited" {
                         if execution.host_boot_id==self.boot && pid_start(execution.pid).ok()==Some(execution.pid_start_time) {
-                            let (start,pidfd)=observe_pid(execution.pid)?;
-                            if start != execution.pid_start_time {return Err(stale_execution())}
-                            verify_executable(execution.pid,start,&pidfd,&self.catalog.bundle(&op.bundle_digest)?)?;
+                            let pidfd=process_fd(execution.pid).map_err(broker_error)?;
+                            if !pid_exited(&pidfd).map_err(broker_error)? && pid_start(execution.pid).ok()==Some(execution.pid_start_time) {
+                                verify_executable(execution.pid,execution.pid_start_time,&pidfd,&self.catalog.bundle(&op.bundle_digest)?)?;
                             let rc=unsafe{libc::syscall(libc::SYS_pidfd_send_signal,pidfd.as_raw_fd(),libc::SIGTERM,std::ptr::null::<libc::siginfo_t>(),0u32)};
                             if rc<0 && io::Error::last_os_error().raw_os_error()!=Some(libc::ESRCH) {return Err(broker_error(io::Error::last_os_error()))}
-                            continue;
+                                continue;
+                            }
                         }
                         self.finalize_scoped_execution(execution)?;
                     }
@@ -1868,6 +1869,13 @@ impl Worker {
                 operation_id:Some(id),request_digest:Some(op.request_digest.clone()),expected:Some(expected),
                 fd_table:Vec::new(),payload:Value::Null
             };
+            if let Some(attachment)=plan.network_attachment_id() {
+                let mut prior=request.derived("FenceNetworkAttachment",json!({"attachment_id":attachment}));
+                prior.expected=Some(crate::ipc::Expected{instance_id:op.instance_id.clone(),incarnation_id:None,execution_epoch:op.expected_execution_epoch});
+                if let Err(e)=self.network.fence(&self.catalog,&prior) {
+                    if e.code!="E_NOT_FOUND" {return Err(e)}
+                }
+            }
             self.catalog.finish(&request,true,op.revision)?;
         }
         Ok(())
@@ -1878,6 +1886,20 @@ impl Worker {
             .complete_exports(&mut self.catalog, &self.objects)?
         {
             self.release_checkpoint_export(&record);
+        }
+        let cancellations = {
+            let mut q=self.catalog.db.prepare("SELECT operation_id,capture_id,original FROM managed_fork_batches WHERE stage='abort_export'")?;
+            let rows=q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (id,capture,original) in cancellations {
+            let op=self.catalog.operation(&id)?;
+            let request=crate::managed_statepoint::request(&op,json!({"capture_id":capture}));
+            match self.abort_statepoint(&request) {
+                Ok(_) if original=="STANDBY" => crate::managed_fork::finish_abort(&mut self.catalog,&id,None)?,
+                Ok(_) => {self.catalog.db.execute("UPDATE managed_fork_batches SET stage='waking',error=NULL WHERE operation_id=?",[id])?;},
+                Err(error)=> {self.catalog.db.execute("UPDATE managed_fork_batches SET error=? WHERE operation_id=?",rusqlite::params![error.message,id])?;}
+            }
         }
         let stops=crate::managed_statepoint::tick(&mut self.catalog,&mut self.statepoints,&self.objects,&self.boot)?;
         for stop in stops {

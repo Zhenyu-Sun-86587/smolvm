@@ -234,7 +234,7 @@ pub(crate) struct Control {
 fn control_scope(c: &Catalog, r: &Request) -> Result<Operation> {
     let op = c.matching_operation(r)?;
     let expected = r.scope()?.2;
-    if !matches!(op.kind.as_str(), "fork_batch" | "independent_fork")
+    if !matches!(op.kind.as_str(), "fork_batch" | "independent_fork" | "vm_snapshot" | "hibernate" | "vm_rollback")
         || op.expected_execution_epoch != expected.execution_epoch
         || op.expected_incarnation_id != expected.incarnation_id {
         return Err(Fault::new("E_STALE_EXECUTION","request differs from the admitted fork source"));
@@ -244,6 +244,7 @@ fn control_scope(c: &Catalog, r: &Request) -> Result<Operation> {
 
 pub(crate) fn retry(c: &mut Catalog, r: &Request, control: Control) -> Result<Operation> {
     let op = control_scope(c,r)?;
+    if !matches!(op.kind.as_str(),"fork_batch"|"independent_fork") {return Err(conflict("only failed fork children can be retried"))}
     let id = &op.operation_id;
     let tx = c.db.transaction()?;
     let replay: bool = tx.query_row(
@@ -296,9 +297,16 @@ pub(crate) fn cancel(c: &mut Catalog, r: &Request, control: Control) -> Result<O
     if prior {return Ok(op)}
     if control.expected_revision!=op.revision {return Err(Fault::new("E_STALE_REVISION","batch cancellation revision changed"))}
     if op.phase!="NEW" {return Err(Fault::new("E_ALREADY_COMMITTED","batch already has a terminal result"))}
+    let durable=matches!(op.kind.as_str(),"vm_snapshot"|"hibernate"|"vm_rollback");
+    if durable {
+        let (stage,point):(String,Option<String>)=c.db.query_row("SELECT b.stage,p.phase FROM managed_fork_batches b LEFT JOIN statepoints p USING(capture_id) WHERE b.operation_id=?",[id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if matches!(point.as_deref(),Some("stop_committed"|"hibernated")) || op.kind=="vm_snapshot" && (point.is_some() || matches!(stage.as_str(),"source_return"|"waking"|"checkpoint_export")) {
+            return Err(Fault::new("E_OPERATION_HAS_EFFECTS","the durable capture has passed its cancellation boundary"));
+        }
+    }
     let tx=c.db.transaction()?;
     tx.execute("UPDATE managed_fork_batches SET cancel_requested=1,
-        stage=CASE WHEN stage IN ('arming','parking') THEN 'cancel_gate' ELSE stage END WHERE operation_id=?",[id])?;
+        stage=CASE WHEN stage IN ('arming','parking') THEN 'cancel_gate' WHEN stage='restore_preflight' THEN 'cancel_preflight' ELSE stage END WHERE operation_id=?",[id])?;
     tx.execute("UPDATE managed_fork_children AS ch SET cancelled=1 WHERE batch_id=?
          AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.operation_id=ch.operation_id AND o.phase='COMPLETED')
          AND NOT EXISTS(SELECT 1 FROM target_activations a WHERE a.operation_id=ch.operation_id AND a.decision='commit')", [id])?;
@@ -341,7 +349,7 @@ impl Job {
         if fields.len() != 4
             || fields[0].parse::<u32>() != Ok(self.session)
             || fields[1] != self.token
-            || fields[3] != "0"
+            || (fields[3] != "0" && !matches!(fields[2],"failed_thawed"|"expired_thawed"|"aborted"))
         {
             return Err(conflict(format!("unexpected Guest gate result {reply}")));
         }
@@ -424,7 +432,7 @@ impl Actor {
         }
         let jobs = {
             let mut q=c.db.prepare("SELECT operation_id,source_incarnation,capture_id,session,token,anchor,stage,original,network_gate,pivot_json,(SELECT kind FROM operations o WHERE o.operation_id=b.operation_id)
-                FROM managed_fork_batches b WHERE stage IN ('children','cancel_gate','arming','parking','standby','holding','pivoting','source_return','waking')
+                FROM managed_fork_batches b WHERE stage IN ('cancel_preflight','children','cancel_gate','arming','parking','standby','holding','pivoting','source_return','waking')
                 OR (stage='exporting' AND EXISTS (SELECT 1 FROM operations o WHERE o.operation_id=b.operation_id AND o.kind IN ('independent_fork','fork_batch'))) ORDER BY rowid")?;
             let result = q
                 .query_map([], |r| {
@@ -456,6 +464,7 @@ impl Actor {
         if j.stage == "children" {
             return dispatch_children(c, j);
         }
+        if j.stage=="cancel_preflight" {return finish_abort(c,&j.id,None)}
         let ep = Endpoint::load(&c.db, &j.inc, boot)?;
         let scope = j.scope();
         match j.stage.as_str() {
@@ -475,22 +484,23 @@ impl Actor {
                     }
                 };
                 if done {
-                    let tx=c.db.transaction()?;
-                    tx.execute("UPDATE managed_fork_batches SET source_released=1,stage='aborted',error=NULL WHERE operation_id=?",[&j.id])?;
-                    tx.execute("UPDATE operations SET phase='ABORTED',decision='ABORT',revision=revision+1 WHERE operation_id=?",[&j.id])?;
-                    tx.execute("UPDATE managed_budget_holds SET state='released' WHERE operation_id=? AND state='reserved'",[&j.id])?;
-                    tx.execute("UPDATE instance_bindings SET active_operation_id=NULL WHERE active_operation_id=?",[&j.id])?;
-                    tx.commit()?;
+                    finish_abort(c,&j.id,None)?;
                 }
             }
             "arming" => {
                 let state = j.gate(&ep, "PREPARE", "2500 15000")?;
+                if matches!(state.as_str(),"failed_thawed"|"expired_thawed"|"aborted") {
+                    return finish_abort(c,&j.id,Some(&state));
+                }
                 if state == "armed" {
                     j.advance(c, "parking")?
                 }
             }
             "parking" => {
                 let state = j.gate(&ep, "QUERY", "")?;
+                if matches!(state.as_str(),"failed_thawed"|"expired_thawed"|"aborted") {
+                    return finish_abort(c,&j.id,Some(&state));
+                }
                 if state == "armed" {
                     j.gate(
                         &ep,
@@ -567,7 +577,20 @@ impl Actor {
         Ok(())
     }
 }
+pub(crate) fn finish_abort(c:&mut Catalog,id:&str,error:Option<&str>)->Result<()> {
+    let tx=c.db.transaction()?;
+    tx.execute("UPDATE managed_fork_batches SET source_released=1,stage='aborted',error=? WHERE operation_id=?",params![error,id])?;
+    tx.execute("UPDATE operations SET phase='ABORTED',decision='ABORT',revision=revision+1 WHERE operation_id=? AND phase='NEW'",[id])?;
+    tx.execute("UPDATE managed_budget_holds SET state='released' WHERE operation_id=? AND state='reserved'",[id])?;
+    tx.execute("UPDATE instance_bindings SET active_operation_id=NULL WHERE active_operation_id=?",[id])?;
+    tx.commit()?;
+    Ok(())
+}
 fn release(c: &mut Catalog, j: &Job) -> Result<()> {
+    if matches!(j.kind.as_str(),"vm_snapshot"|"hibernate"|"vm_rollback") &&
+        c.db.query_row("SELECT cancel_requested FROM managed_fork_batches WHERE operation_id=?",[&j.id],|r|r.get::<_,bool>(0))? {
+        return finish_abort(c,&j.id,None);
+    }
     let tx = c.db.transaction()?;
     tx.execute(
         "UPDATE instance_bindings SET active_operation_id=NULL WHERE active_operation_id=?",

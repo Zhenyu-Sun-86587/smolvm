@@ -34,7 +34,7 @@ pub(crate) fn receipt(c: &Catalog, op: &Operation) -> Result<Option<Value>> {
     })))
 }
 
-fn request(op: &Operation, payload: Value) -> Request {
+pub(crate) fn request(op: &Operation, payload: Value) -> Request {
     Request {
         protocol:PROTOCOL.into(), method:"ManagedStatePoint".into(),request_id:"statepoint-reconcile".into(),
         operation_id:Some(op.operation_id.clone()),request_digest:Some(op.request_digest.clone()),
@@ -98,6 +98,15 @@ impl Job {
                     params![child.phase,child.decision,self.id])?;
             }
             tx.commit()?;
+            return Ok(None);
+        }
+        let cancel:bool=c.db.query_row("SELECT cancel_requested FROM managed_fork_batches WHERE operation_id=?",[&self.id],|r|r.get(0))?;
+        if cancel {
+            if c.statepoint(capture)?.is_none() {
+                self.next(c,"source_return")?;
+            } else {
+                self.next(c,"abort_export")?;
+            }
             return Ok(None);
         }
         let incarnation=op.expected_incarnation_id.as_deref().ok_or_else(||Fault::invalid("missing capture source"))?;
