@@ -1,6 +1,7 @@
 """Exercise WorkerResource/1 through the real Linux daemon and kernel sockets."""
 
 import array
+import fcntl
 import hashlib
 import json
 import os
@@ -29,6 +30,19 @@ def rpc(path, request, fds=()):
         ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))] if fds else []
         client.sendmsg([message], ancillary)
         return json.loads(client.recv(65536))
+
+
+def receive_lease(path, packet):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+        client.settimeout(3)
+        client.connect(str(path))
+        client.send(json.dumps(packet).encode())
+        body, ancillary, flags, _ = client.recvmsg(
+            65536, socket.CMSG_SPACE(array.array("i").itemsize * 64), socket.MSG_CMSG_CLOEXEC)
+    fds = array.array("i")
+    for _, _, contents in ancillary:
+        fds.frombytes(contents)
+    return json.loads(body), fds, flags
 
 
 def request(method, payload=None, **scope):
@@ -124,6 +138,7 @@ class WorkerResource(unittest.TestCase):
         token = {"launch_permit": permit["launch_permit"]}
         self.call("RegisterExecution", token, error="E_LAUNCH_PERMIT", **launch)
         result = self.peer_call(process, "RegisterExecution", token, **launch)
+        self.assertEqual(result, self.peer_call(process, "RegisterExecution", token, **launch))
         self.assertEqual(result["execution"]["pid"], process.pid)
         self.assertEqual(result["network_state"], "closed")
         self.finish(launch)
@@ -238,6 +253,84 @@ class WorkerResource(unittest.TestCase):
             self.assertEqual(rpc(self.path, request("Health"), [file.fileno()] * 65)["error"]["code"],
                              "E_PACKET_TRUNCATED")
         self.assertEqual(self.call("Health")["state"], "ready")
+
+    def test_sealed_generation_and_readonly_lease(self):
+        launch = operation(self.bundle_a, "launch-escrow", fence("escrow"))
+        self.call("BeginOperation", {"kind": "launch"}, **launch)
+        launch["expected"] = fence("escrow", 1)
+        permit = self.call("IssueLaunchPermit", {"pid": os.getpid(), "uid": os.getuid()}, **launch)
+        self.call("RegisterExecution", {"launch_permit": permit["launch_permit"]}, **launch)
+        self.finish(launch)
+
+        scope = operation(self.bundle_a, "generation-op", fence("escrow", 1))
+        self.call("BeginOperation", {"kind": "generation"}, **scope)
+        page = os.sysconf("SC_PAGE_SIZE")
+        descriptor = {"backing_sizes": {"ram-a": page, "ram-b": page}, "regions": [{
+            "gpa": 0, "length": page * 2,
+            "extents": [{"offset": n * page, "length": page, "backing_id": f"ram-{name}", "backing_offset": 0}
+                        for n, name in enumerate(("a", "b"))],
+        }]}
+        transfer = {"transfer_id": "transfer"}
+        start = {**transfer, "resource_id": "generation", "descriptor": descriptor,
+                 "descriptor_digest": digest(json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode())}
+        self.call("RegisterGenerationBegin", start, **scope)
+        self.call("RegisterGenerationCommit", transfer, error="E_INCOMPLETE_TRANSFER", **scope)
+        self.call("QueryResource", {"resource_id": "generation"}, error="E_NOT_FOUND")
+
+        seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK
+        for batch, name in enumerate(("a", "b")):
+            fd = os.memfd_create(f"ram-{name}", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+            backing = os.fdopen(fd, "wb")
+            self.addCleanup(backing.close)
+            os.ftruncate(fd, page)
+            os.pwrite(fd, name.encode(), 0)
+            packet = request("RegisterGenerationBatch", {**transfer, "batch_index": batch},
+                             fd_table=[{"index": 0, "resource_id": f"ram-{name}", "role": "immutable_backing"}], **scope)
+            self.assertEqual(rpc(self.path, packet, [fd])["error"]["code"], "E_INVALID_REQUEST")
+            fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+            receipt = rpc(self.path, packet, [fd])
+            self.assertEqual(receipt["result"]["next_batch"], batch + 1, receipt)
+            self.assertEqual(rpc(self.path, packet, [fd]), receipt)
+            backing.close()
+
+        self.assertEqual(self.call("RegisterGenerationCommit", transfer, **scope)["state"], "committed")
+        self.assertEqual(self.call("QueryResource", {"resource_id": "generation"})["fd_state"], "committed")
+        self.call("DropOwnerRef", {"owner_kind": "operation", "owner_id": "generation-op",
+                                   "resource_id": "generation", "expected_revision": 1}, **scope)
+        self.finish(scope)
+
+        lease_scope = operation(self.bundle_a, "lease-op", fence("escrow", 1))
+        self.call("BeginOperation", {"kind": "resource_lease"}, **lease_scope)
+        lease = {"lease_id": "lease", "resource_id": "generation", "access": "ro"}
+        self.call("AcquireResourceLease", {**lease, "access": "rw"}, error="E_CAPABILITY_UNSUPPORTED", **lease_scope)
+        response, held, flags = receive_lease(self.path, request("AcquireResourceLease", lease, **lease_scope))
+        holds = [os.fdopen(fd, "rb") for fd in held]
+        for backing in holds:
+            self.addCleanup(backing.close)
+        self.assertEqual(response["result"]["total"], 2, response)
+        self.assertEqual([entry["resource_id"] for entry in response["fd_table"]], ["ram-a", "ram-b"])
+        self.assertEqual(flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC), 0)
+        for key, byte in zip(held, (b"a", b"b"), strict=True):
+            self.assertEqual(os.pread(key, 1, 0), byte)
+            self.assertEqual(fcntl.fcntl(key, fcntl.F_GETFL) & os.O_ACCMODE, os.O_RDONLY)
+            self.assertEqual(fcntl.fcntl(key, fcntl.F_GETFD) & fcntl.FD_CLOEXEC, fcntl.FD_CLOEXEC)
+        self.assertEqual(self.call("AckAttached", {"lease_id": "lease", "expected_revision": 1},
+                                   **lease_scope)["state"], "attached")
+        self.finish(lease_scope)
+        self.call("MarkResourceForGC", {"resource_id": "generation", "expected_revision": 1},
+                  error="E_RESOURCE_PINNED")
+
+        self.stop(self.process)
+        self.start()
+        self.assertEqual(self.call("QueryResource", {"resource_id": "generation"})["state"], "missing")
+        self.call("ReconcileExecution", **launch)
+        session = {"broker_session_id": self.call("Health")["broker_session_id"]}
+        self.call("CompleteRecovery", session, error="E_RECOVERING")
+        for backing in holds:
+            backing.close()
+        self.call("ReleaseResourceLease", {"lease_id": "lease", "expected_revision": 3}, **lease_scope)
+        self.assertEqual(self.call("QueryResource", {"resource_id": "generation"})["state"], "lost")
+        self.assertEqual(self.call("CompleteRecovery", session)["state"], "ready")
 
 
 if __name__ == "__main__":
