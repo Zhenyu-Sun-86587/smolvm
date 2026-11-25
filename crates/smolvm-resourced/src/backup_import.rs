@@ -1,10 +1,11 @@
 //! Restore immutable backup resources into a fresh, isolated Worker catalog.
 
+use crate::activation_catalog::{self, BoundTap};
 use crate::backup_closure::{Capture, Manifest};
 use crate::blocks::{self, BlockObject};
 use crate::catalog::{Catalog, Operation};
 use crate::ipc::{Fault, Result, valid_digest, valid_id};
-use crate::managed::{self, Device, Machine};
+use crate::managed::{self, Device, Machine, NetworkMode};
 use crate::statepoint_capture::{Export, Purpose};
 use crate::statepoint_catalog::Record;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -28,6 +29,8 @@ pub(crate) struct Origin {
     hold_token_digest: String,
     machine: Machine,
     devices: Vec<Device>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    captured_tap: Option<BoundTap>,
 }
 
 fn invalid(error: impl ToString) -> Fault {
@@ -58,6 +61,9 @@ pub(crate) fn describe(
             "StatePoint execution differs from its measured launch provenance",
         ));
     }
+    let captured_tap =
+        activation_catalog::archive_bound_tap(catalog, record, plan.machine.network.is_some())?;
+    check_network(&record.point, &plan.machine, captured_tap.as_ref())?;
     Ok(Origin {
         purpose: record.export.purpose,
         instance_id: execution.instance_id,
@@ -70,7 +76,57 @@ pub(crate) fn describe(
         ),
         machine: plan.machine,
         devices: plan.devices,
+        captured_tap,
     })
+}
+
+fn check_network(
+    point: &crate::statepoint_store::Point,
+    machine: &Machine,
+    tap: Option<&BoundTap>,
+) -> Result<()> {
+    let device_count = point
+        .devices
+        .iter()
+        .filter(|device| device.is_network())
+        .count();
+    match (device_count, &machine.network, tap) {
+        (0, None, None) => Ok(()),
+        (1, Some(network), Some(tap)) => {
+            let a = &tap.attachment;
+            let expected = match network.mode {
+                NetworkMode::Native => {
+                    a.mode == "native" && a.guest_ipv4 == a.private_ipv4 && a.guest_prefix == 32
+                }
+                NetworkMode::FixedInternal => {
+                    a.mode == "fixed_internal"
+                        && network.fixed_route()
+                            == Some((a.guest_ipv4, a.gateway_ipv4, a.guest_prefix))
+                }
+            };
+            if !expected
+                || a.schema != "NetworkAttachment/1"
+                || a.route_domain_id != network.route_domain_id
+                || !valid_id(&a.attachment_id)
+                || !valid_id(&tap.lease_id)
+                || !valid_id(&a.device_id)
+                || tap.lease_revision < 1
+                || !valid_digest(&format!("sha256:{}", tap.attachment_digest))
+                || !crate::network_catalog::archived_address_is_valid(
+                    &network.cidr,
+                    a.private_ipv4,
+                )?
+            {
+                return Err(crate::network_catalog::network_recovery_fault(
+                    "archived TAP differs from its measured launch profile",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(crate::network_catalog::network_recovery_fault(
+            "backup lacks its original network capture attestation",
+        )),
+    }
 }
 
 fn serial(value: impl Serialize) -> Result<String> {
@@ -102,12 +158,7 @@ fn capture(tx: &Transaction<'_>, manifest: &Manifest, item: &Capture) -> Result<
         .origin
         .as_ref()
         .ok_or_else(|| invalid("backup lacks original managed launch provenance"))?;
-    if origin.machine.network.is_some() {
-        return Err(Fault::new(
-            "E_CAPABILITY_UNSUPPORTED",
-            "Worker catalog import requires an independently rebindable network profile",
-        ));
-    }
+    check_network(point, &origin.machine, origin.captured_tap.as_ref())?;
     let serve = managed::serve_id(&origin.instance_id, &origin.machine.name)?;
     if point.execution_epoch < 1
         || !valid_id(&point.incarnation_id)
@@ -219,6 +270,11 @@ fn capture(tx: &Transaction<'_>, manifest: &Manifest, item: &Capture) -> Result<
             manifest.state_reader_id,
             origin.hold_token_digest
         ],
+    )?;
+    activation_catalog::import_bound_tap(
+        tx,
+        &point.representation_id,
+        origin.captured_tap.as_ref(),
     )?;
     Ok(())
 }

@@ -225,6 +225,50 @@ fn store_captured_tap(
     Ok(())
 }
 
+pub(crate) fn archive_bound_tap(
+    catalog: &Catalog,
+    record: &crate::statepoint_catalog::Record,
+    configured: bool,
+) -> Result<Option<BoundTap>> {
+    let resource = &record.point.representation_id;
+    let scope = capture_origin(&catalog.db, resource)?;
+    match captured_tap(&catalog.db, resource)? {
+        Some(captured) if captured.origin == scope && captured.bound.is_some() == configured => {
+            Ok(captured.bound)
+        }
+        None if !configured => Ok(None),
+        _ => Err(tap_fence(
+            "networked backup requires the original immutable TAP attestation",
+        )),
+    }
+}
+
+pub(crate) fn import_bound_tap(
+    tx: &Transaction<'_>,
+    representation: &str,
+    bound: Option<&BoundTap>,
+) -> Result<()> {
+    let origin = capture_origin(tx, representation)?;
+    store_captured_tap(tx, representation, &origin, bound)
+}
+
+pub(crate) fn archived_network_receipt(catalog: &Catalog, op: &Operation) -> Result<Option<Value>> {
+    let binding: Option<String> = catalog.db.query_row("SELECT binding_json FROM target_activations WHERE operation_id=? AND decision='commit' AND phase='released'",
+        [&op.operation_id],|row|row.get(0)).optional()?;
+    let Some(binding) = binding else {
+        return Ok(None);
+    };
+    let binding: ActivationBinding = serde_json::from_str(&binding)
+        .map_err(|_| tap_fence("restored network activation binding changed"))?;
+    Ok(binding.network.map(|network| {
+        let source=network.source.attachment;
+        let target=network.target.attachment;
+        serde_json::json!({"mode":target.mode,"address_scope":"isolated_worker_route_domain",
+            "source":{"route_domain_id":source.route_domain_id,"attachment_id":source.attachment_id,"private_ipv4":source.private_ipv4,"guest_ipv4":source.guest_ipv4},
+            "target":{"route_domain_id":target.route_domain_id,"attachment_id":target.attachment_id,"private_ipv4":target.private_ipv4,"guest_ipv4":target.guest_ipv4}})
+    }))
+}
+
 fn statepoint_export_origin(
     db: &Connection,
     record: &crate::statepoint_catalog::Record,

@@ -233,6 +233,43 @@ impl Catalog {
         Ok(())
     }
 
+    pub(crate) fn archived_network_target(
+        &self,
+        id: &str,
+        archived: &crate::managed::Network,
+    ) -> Result<crate::managed::Network> {
+        if !valid_id(id) {
+            return Err(Fault::invalid("invalid backup recovery network ID"));
+        }
+        let (domain, cidr): (String, String) = self
+            .db
+            .query_row(
+                "SELECT route_domain_id,cidr FROM private_networks WHERE network_id=?",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                network_recovery_fault("backup restore needs a registered target network")
+            })?;
+        let original = parse_prefix(&archived.cidr)?;
+        let target = parse_prefix(&cidr)?;
+        if domain == archived.route_domain_id
+            || (target.gateway.saturating_sub(1) <= original.last.saturating_add(1)
+                && original.gateway.saturating_sub(1) <= target.last.saturating_add(1))
+        {
+            return Err(network_recovery_fault(
+                "target network overlaps the original route domain or private address block",
+            ));
+        }
+        Ok(crate::managed::Network {
+            network_id: id.into(),
+            route_domain_id: domain,
+            cidr,
+            mode: archived.mode,
+        })
+    }
+
     pub(crate) fn register_private_network(&self, data: &RegisterNetwork) -> Result<()> {
         self.ready()?;
         if !valid_id(&data.network_id) || !valid_id(&data.route_domain_id) {
@@ -507,6 +544,15 @@ impl Catalog {
         )?;
         self.scoped_network_reservation(request, &data.attachment_id)
     }
+}
+
+pub(crate) fn archived_address_is_valid(cidr: &str, address: Ipv4Addr) -> Result<bool> {
+    let prefix = parse_prefix(cidr)?;
+    Ok((prefix.first..=prefix.last).contains(&u32::from(address)))
+}
+
+pub(crate) fn network_recovery_fault(reason: &'static str) -> Fault {
+    Fault::new("E_NETWORK_RECOVERY_UNAVAILABLE", reason)
 }
 
 fn verify_epoch(request: &Request, operation: &crate::catalog::Operation) -> Result<()> {
