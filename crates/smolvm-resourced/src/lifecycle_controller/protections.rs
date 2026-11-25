@@ -53,8 +53,26 @@ fn deadline(input: &Input) -> Result<i64> {
     Ok(monotonic()? + 1000 * ttl)
 }
 
+fn running_access(tx: &Transaction<'_>, expected: &Expected) -> Result<bool> {
+    let Some(incarnation) = expected.incarnation_id.as_deref() else {
+        return Ok(false);
+    };
+    let changing: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM instance_bindings b JOIN operations o ON o.operation_id=b.active_operation_id
+         WHERE b.instance_id=? AND o.kind IN ('standby','hibernate','stop','vm_rollback'))",
+        [&expected.instance_id], |row| row.get(0))?;
+    if changing {
+        return Ok(false);
+    }
+    let boot: String = tx.query_row("SELECT host_boot_id FROM worker_state", [], |row| {
+        row.get(0)
+    })?;
+    let inventory = crate::native_control::Endpoint::load(tx, incarnation, &boot)?.inventory()?;
+    Ok(inventory.source_disposition == "RUNNING")
+}
+
 pub(super) fn receipt(db: &Connection, instance: &str, id: &str) -> Result<Value> {
-    let offset=wall()?.saturating_sub(monotonic()?);
+    let offset = wall()?.saturating_sub(monotonic()?);
     Ok(db.query_row("SELECT kind,state,revision,reason,incarnation_id,epoch,semantics,wake_operation,authorization_revision,endpoint_revision,expires_at
         FROM lifecycle_protections WHERE instance_id=? AND id=?",params![instance,id],|r|
         Ok(json!({"protection_id":id,"instance_id":instance,"kind":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"revision":r.get::<_,i64>(2)?,
@@ -105,8 +123,7 @@ pub(crate) fn mutate(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> 
                     if input.expected_binding_revision != Some(revision(expected)?) {
                         return Err(changed("wake binding changed"));
                     }
-                    if !policy.permits_wake(trigger)
-                        || input.authorization_revision.is_none_or(|n| n < 1)
+                    if input.authorization_revision.is_none_or(|n| n < 1)
                         || input.endpoint_revision.is_none_or(|n| n < 1)
                     {
                         return Err(Fault::new(
@@ -114,9 +131,20 @@ pub(crate) fn mutate(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> 
                             "wake is unauthorized for this entry point",
                         ));
                     }
-                    "wake"
+                    if policy.permits_wake(trigger) {
+                        "wake"
+                    } else if matches!(trigger, "api_access" | "service_access")
+                        && running_access(tx, expected)?
+                    {
+                        "hold"
+                    } else {
+                        return Err(Fault::new(
+                            "E_PERMISSION_DENIED",
+                            "wake is disabled for this entry point",
+                        ));
+                    }
                 }
-                _ if expected.incarnation_id.is_some() => "hold",
+                _ if running_access(tx, expected)? => "hold",
                 _ => return Err(conflict("offline access requires a wake demand")),
             };
             if kind != "wake" {
@@ -169,7 +197,9 @@ pub(crate) fn mutate(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> 
                     }
                     if r.method == "RenewRunningLease" {
                         if version == 2 && state != "active" {
-                            return Err(conflict("lease must be acquired on the current execution"));
+                            return Err(conflict(
+                                "lease must be acquired on the current execution",
+                            ));
                         }
                         tx.execute("UPDATE lifecycle_protections SET state='active',expires_at=?,expires_boot=(SELECT host_boot_id FROM worker_state),revision=revision+1
                                     WHERE instance_id=? AND id=?",params![deadline(&input)?,machine,id])?;
