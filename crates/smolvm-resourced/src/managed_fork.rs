@@ -22,6 +22,7 @@ pub(crate) struct Input {
     pub children: Vec<String>,
     pub capture_id: Option<String>,
     pub mode: Option<String>,
+    pub admission: Option<String>,
 }
 fn conflict(reason: impl ToString) -> Fault {
     Fault::new("E_STATE_CONFLICT", reason.to_string())
@@ -39,20 +40,21 @@ pub(crate) fn restore(c: &Catalog, child: &str) -> Result<Option<Restore>> {
         |r|Ok(Restore{batch_id:r.get(0)?,capture_id:r.get(1)?,anchor:r.get(2)?,helper_digest:r.get(3)?,source_pivot:r.get(4)?,durable:None})).optional()?)
 }
 pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
-    let Some((stage,capture,original,released,error))=c.db.query_row(
-        "SELECT stage,capture_id,original,source_released,error FROM managed_fork_batches WHERE operation_id=?",[id],
-        |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?))).optional()? else {return Ok(None)};
+    let Some((stage,capture,original,released,error,admission))=c.db.query_row(
+        "SELECT stage,capture_id,original,source_released,error,admission_mode FROM managed_fork_batches WHERE operation_id=?",[id],
+        |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?))).optional()? else {return Ok(None)};
     let mut stmt = c.db.prepare(
         "SELECT ch.name,ch.instance_id,ch.operation_id,
-             CASE WHEN ch.cancelled=1 AND o.operation_id IS NULL THEN 'ABORTED' ELSE COALESCE(o.phase,'RESERVED') END,
-             m.incarnation_id,ch.prior_epoch,ch.attempt,ch.cancelled
+             CASE WHEN (ch.cancelled=1 OR ch.admission_error IS NOT NULL) AND o.operation_id IS NULL THEN 'ABORTED' ELSE COALESCE(o.phase,'RESERVED') END,
+             m.incarnation_id,ch.prior_epoch,ch.attempt,ch.cancelled,ch.admission_error
          FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id
          LEFT JOIN managed_launches m ON m.operation_id=ch.operation_id
          WHERE ch.batch_id=? ORDER BY ch.ordinal")?;
     let rows = stmt.query_map([id], |r| Ok(json!({
         "name":r.get::<_,String>(0)?, "instance_id":r.get::<_,String>(1)?, "operation_id":r.get::<_,String>(2)?,
         "phase":r.get::<_,String>(3)?, "incarnation_id":r.get::<_,Option<String>>(4)?,
-        "execution_epoch":r.get::<_,i64>(5)?+1, "attempt":r.get::<_,i64>(6)?, "cancelled":r.get::<_,bool>(7)?
+        "execution_epoch":r.get::<_,i64>(5)?+1, "attempt":r.get::<_,i64>(6)?, "cancelled":r.get::<_,bool>(7)?,
+        "admission_error":r.get::<_,Option<String>>(8)?
     })))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let successful = rows.iter().filter(|r|r["phase"] == "COMPLETED").count();
     let failed = rows.iter().filter(|r|r["phase"] == "ABORTED").count();
@@ -63,7 +65,7 @@ pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
         ("complete", _, _) => "partial",
         _ => "pending",
     };
-    Ok(Some(json!({"stage":stage, "capture_id":capture, "original_source_disposition":original,
+    Ok(Some(json!({"stage":stage, "capture_id":capture, "original_source_disposition":original, "admission":admission,
         "source_released":released, "children":rows, "completed_count":successful,
         "failed_count":failed, "outcome":outcome, "error":error})))
 }
@@ -79,6 +81,10 @@ pub(crate) fn submit(
     let unique: HashSet<_> = input.children.iter().collect();
     let fork = matches!(kind,"independent_fork"|"fork_batch");
     let rollback = kind == "vm_rollback";
+    let admission = input.admission.as_deref().unwrap_or("all_or_reject");
+    if !matches!(admission, "all_or_reject" | "best_effort") || input.admission.is_some() && kind != "fork_batch" {
+        return Err(invalid("admission mode is supported only for fork batches"));
+    }
     if fork {
         if input.children.is_empty() || input.children.len()>32
             || (kind=="independent_fork" && input.children.len()!=1)
@@ -98,9 +104,9 @@ pub(crate) fn submit(
     let target = if rollback {input.capture_id.as_deref()} else {None};
     let mode = if rollback {Some(input.mode.as_deref().unwrap_or("clone_conflicts"))} else {None};
     if let Some(prior) = c.db.query_row(
-        "SELECT children,capture_id,restore_capture_id,volume_restore_policy FROM managed_fork_batches WHERE operation_id=?",
-        [id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?)) ).optional()? {
-        if prior.0!=names || prior.1!=capture || prior.2.as_deref()!=target || prior.3.as_deref()!=mode {
+        "SELECT children,capture_id,restore_capture_id,volume_restore_policy,admission_mode FROM managed_fork_batches WHERE operation_id=?",
+        [id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?)) ).optional()? {
+        if prior.0!=names || prior.1!=capture || prior.2.as_deref()!=target || prior.3.as_deref()!=mode || prior.4!=admission {
             return Err(Fault::new("E_IDEMPOTENCY_CONFLICT","capture parameters changed"));
         }
         return c.begin(r,kind);
@@ -215,14 +221,27 @@ pub(crate) fn submit(
         storage_bytes: storage,
     };
     c.begin_with(r,kind,|tx|{
-        tx.execute("INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,session,token,anchor,network_gate,original,stage,pivot_json,restore_capture_id,volume_restore_policy) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![id,incarnation,namespace,capture,template_bytes,names,session,token,anchor,network,inv.source_disposition,initial,pivot,target,mode])?;
+        tx.execute("INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,session,token,anchor,network_gate,original,stage,pivot_json,restore_capture_id,volume_restore_policy,admission_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![id,incarnation,namespace,capture,template_bytes,names,session,token,anchor,network,inv.source_disposition,initial,pivot,target,mode,admission])?;
+        let mut admitted = 0;
+        let mut last_refusal = None;
         for (i,name) in input.children.iter().enumerate(){
             let instance=machine_id(&namespace,name);
             let present:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM instance_bindings WHERE route_id=? AND instance_id=?)",params![route,instance],|r|r.get(0))?;
             if present || instance==expected.instance_id{return Err(conflict("fork child name is already allocated"))}
-            admission::reserve(tx,id,&instance,capacity)?;
-            tx.execute("INSERT INTO managed_fork_children(batch_id,ordinal,name,instance_id,operation_id,prior_epoch) VALUES(?,?,?,?,?,0)",params![id,i as i64,name,instance,key(id,"fork",i)])?;
+            let refusal = match admission::reserve(tx,id,&instance,capacity) {
+                Ok(()) => { admitted += 1; None }
+                Err(fault) if admission == "best_effort" && fault.code == "E_RESOURCE_LIMIT" => {
+                    let code = fault.code;
+                    last_refusal = Some(fault);
+                    Some(code)
+                }
+                Err(fault) => return Err(fault),
+            };
+            tx.execute("INSERT INTO managed_fork_children(batch_id,ordinal,name,instance_id,operation_id,prior_epoch,admission_error) VALUES(?,?,?,?,?,0,?)",params![id,i as i64,name,instance,key(id,"fork",i),refusal])?;
+        }
+        if fork && admitted == 0 {
+            return Err(last_refusal.unwrap_or_else(|| invalid("fork has no admissible children")));
         }
         Ok(())
     })
@@ -310,7 +329,7 @@ pub(crate) fn cancel(c: &mut Catalog, r: &Request, control: Control) -> Result<O
     let tx=c.db.transaction()?;
     tx.execute("UPDATE managed_fork_batches SET cancel_requested=1,
         stage=CASE WHEN stage IN ('arming','parking') THEN 'cancel_gate' WHEN stage='restore_preflight' THEN 'cancel_preflight' ELSE stage END WHERE operation_id=?",[id])?;
-    tx.execute("UPDATE managed_fork_children AS ch SET cancelled=1 WHERE batch_id=?
+    tx.execute("UPDATE managed_fork_children AS ch SET cancelled=1 WHERE batch_id=? AND ch.admission_error IS NULL
          AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.operation_id=ch.operation_id AND o.phase='COMPLETED')
          AND NOT EXISTS(SELECT 1 FROM target_activations a WHERE a.operation_id=ch.operation_id AND a.decision='commit')", [id])?;
     tx.execute("UPDATE operations SET revision=revision+1 WHERE operation_id=?",[id])?;
@@ -661,7 +680,7 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
     let base: Machine = serde_json::from_str(&template).map_err(invalid)?;
     let disks: BTreeMap<String, (String,String)> = serde_json::from_str(&disks).map_err(invalid)?;
     let pending = {
-        let mut q=c.db.prepare("SELECT ch.operation_id,ch.name,ch.instance_id,ch.prior_epoch FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.batch_id=? AND o.operation_id IS NULL AND ch.cancelled=0 ORDER BY ch.ordinal")?;
+        let mut q=c.db.prepare("SELECT ch.operation_id,ch.name,ch.instance_id,ch.prior_epoch FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.batch_id=? AND o.operation_id IS NULL AND ch.cancelled=0 AND ch.admission_error IS NULL ORDER BY ch.ordinal")?;
         let rows = q
             .query_map([&j.id], |r| {
                 Ok((
@@ -714,8 +733,8 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
         tx.commit()?;
     }
     let (total, done, failed, retryable): (i64,i64,i64,i64) = c.db.query_row(
-        "SELECT COUNT(*),COUNT(CASE WHEN o.phase IN ('COMPLETED','ABORTED') OR (o.phase IS NULL AND ch.cancelled=1) THEN 1 END),
-             COUNT(CASE WHEN o.phase='ABORTED' OR ch.cancelled=1 THEN 1 END),
+        "SELECT COUNT(*),COUNT(CASE WHEN o.phase IN ('COMPLETED','ABORTED') OR (o.phase IS NULL AND (ch.cancelled=1 OR ch.admission_error IS NOT NULL)) THEN 1 END),
+             COUNT(CASE WHEN o.phase='ABORTED' OR ch.cancelled=1 OR ch.admission_error IS NOT NULL THEN 1 END),
              COUNT(CASE WHEN o.phase='ABORTED' AND ch.cancelled=0 THEN 1 END)
          FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.batch_id=?",
          [&j.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;

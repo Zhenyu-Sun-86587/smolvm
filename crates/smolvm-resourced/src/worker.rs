@@ -20,6 +20,9 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "live_recovery.rs"]
+mod live_recovery;
+
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -2363,6 +2366,9 @@ fn serve(
     let mut next_stop_check = Instant::now() + Duration::from_secs(1);
     loop {
         if Instant::now() >= next_stop_check {
+            if let Err(error) = worker.recover_live_descriptors() {
+                eprintln!("resourced native recovery: {error}");
+            }
             if let Err(error) = worker.network.poll_packet_wake(&mut worker.catalog) {
                 eprintln!("resourced private packet wake: {error}");
             }

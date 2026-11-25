@@ -72,8 +72,9 @@ pub fn lose_missing_without_provider(db: &Connection) -> Result<()> {
         AND NOT EXISTS (
           SELECT 1 FROM executions e JOIN worker_state w ON w.host_boot_id=e.host_boot_id
           JOIN root_refs r ON r.resource_id=fd_transfers.resource_id
-            AND r.owner_kind='operation' AND r.owner_id=fd_transfers.operation_id AND r.state='active'
+            AND r.owner_kind IN ('operation','fork_capture') AND r.owner_id=fd_transfers.operation_id AND r.state='active'
           WHERE e.incarnation_id=fd_transfers.incarnation_id AND e.phase!='exited'
+            AND NOT EXISTS(SELECT 1 FROM native_provider_absence a WHERE a.resource_id=r.resource_id AND a.incarnation_id=e.incarnation_id)
         )",
         [],
     )?;
@@ -284,7 +285,7 @@ impl Catalog {
     pub fn provider_pinned(&self, resource: &str, operation: &str) -> Result<bool> {
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM root_refs
-            WHERE owner_kind='operation' AND owner_id=? AND resource_id=? AND state='active')",
+            WHERE owner_kind IN ('operation','fork_capture') AND owner_id=? AND resource_id=? AND state='active')",
             [operation, resource],
             |row| row.get(0),
         )?)

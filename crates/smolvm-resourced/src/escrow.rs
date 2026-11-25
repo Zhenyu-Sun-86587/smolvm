@@ -761,8 +761,10 @@ impl Escrow {
         let (key, resource_id, operation_id, lease, already_attached) =
             if request.payload.get("transfer_id").is_some() {
                 let input: TransferId = request.payload()?;
-                let record =
-                    self.scoped_transfer(catalog, request, execution, &input.transfer_id)?;
+                let op = catalog.matching_operation(request)?;
+                let record = catalog.transfer(&input.transfer_id)?
+                    .filter(|record| record.operation_id == op.operation_id && record.incarnation_id == execution.incarnation_id)
+                    .ok_or_else(|| Fault::new("E_PERMISSION_DENIED", "generation publisher scope changed"))?;
                 if !matches!(record.state.as_str(), "missing" | "committed")
                     || !catalog.provider_pinned(&record.resource_id, &record.operation_id)?
                 {
