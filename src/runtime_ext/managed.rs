@@ -158,6 +158,12 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
             .finish_launch(launch, &binding.expected(), true, op.revision)
             .map_err(failed);
     }
+    if binding.incarnation_id.is_none()
+        && plan.restore.as_ref().is_some_and(|restore| restore.durable.is_some())
+        && !client.prepare_state_restore(launch, &binding.expected()).map_err(failed)?
+    {
+        return Ok(());
+    }
     let (control, log, uid, gid) = paths(plan)?;
     let mut child = None;
     if binding.incarnation_id.is_none() {
@@ -396,9 +402,14 @@ pub fn boot() -> Result<()> {
             .ack_managed_disks(&boot.plan.launch)
             .map_err(failed)?;
         if let Some(restore) = &boot.plan.restore {
-            let memory = client.fork_memory(&boot.plan, restore).map_err(failed)?;
-            k.managed_restore(ctx, &boot.plan, restore, &memory, work)
-                .map_err(failed)?;
+            if let Some(durable) = &restore.durable {
+                k.managed_statepoint(ctx, &boot.plan, restore, durable).map_err(failed)?;
+                let authority = client.restore_authority(&boot.plan.launch, restore).map_err(failed)?;
+                k.managed_target_authority(ctx, &boot.plan, restore, &authority).map_err(failed)?;
+            } else {
+                let memory = client.fork_memory(&boot.plan, restore).map_err(failed)?;
+                k.managed_restore(ctx, &boot.plan, restore, &memory, work).map_err(failed)?;
+            }
         }
         process::install_configured_seccomp_filter(false).map_err(failed)?;
         // A cold Guest starts with carrier. The restore path opens its TAP

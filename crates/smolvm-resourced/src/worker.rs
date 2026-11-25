@@ -554,7 +554,10 @@ impl Worker {
             "PrepareManagedForkAuthority" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 let op = self.catalog.active_operation(request)?;
-                let input = crate::managed_fork::activation_input(&self.catalog, &op)?;
+                let input = match crate::managed_state_restore::plan(&self.catalog, &op)? {
+                    Some(restore) => crate::managed_state_restore::activation_input(&self.catalog, &op, &restore)?,
+                    None => crate::managed_fork::activation_input(&self.catalog, &op)?,
+                };
                 Ok(json!(self.activation.prepare(
                     &self.catalog,
                     &execution,
@@ -932,13 +935,32 @@ impl Worker {
                 self.statepoints
                     .prepare_restore(&self.catalog, &self.objects, request)
             }
+            "PrepareManagedStateRestore" => {
+                let op = self.catalog.active_operation(request)?;
+                let restore = crate::managed_state_restore::plan(&self.catalog, &op)?
+                    .ok_or_else(|| Fault::invalid("missing managed durable restore"))?;
+                let durable = restore.durable.ok_or_else(|| Fault::invalid("missing durable representation"))?;
+                let prepare = request.derived("PrepareStatePointRestore", json!({
+                    "capture_id":restore.capture_id,"volume_restore_policy":durable.mode
+                }));
+                match self.statepoints.prepare_restore(&self.catalog, &self.objects, &prepare) {
+                    Err(error) if matches!(error.code, "E_STATEPOINT_CORRUPT" | "E_VOLUME_GENERATION_MISMATCH"
+                        | "E_RESOURCE_UNAVAILABLE" | "E_BUNDLE_UNAVAILABLE" | "E_FENCE_UNPROVEN") => {
+                        crate::managed_state_restore::fail(&self.catalog, &op.operation_id, &error)?;
+                        self.catalog.finish(request, true, op.revision)?;
+                        Ok(json!({"phase":"aborted"}))
+                    }
+                    result => result,
+                }
+            }
             "StopCommit" => self.stop_statepoint(request),
             "AbortStatePoint" => self.abort_statepoint(request),
             "ProgressManagedForkTarget" => {
                 let execution = self.scoped_execution(request)?;
                 self.verify_live_execution(&execution)?;
                 let op = self.catalog.active_operation(request)?;
-                if crate::managed_fork::restore(&self.catalog, &op.operation_id)?.is_none() {
+                let durable = crate::managed_state_restore::plan(&self.catalog, &op)?.is_some();
+                if !durable && crate::managed_fork::restore(&self.catalog, &op.operation_id)?.is_none() {
                     return Err(Fault::invalid("missing managed target"));
                 }
                 if crate::managed_fork::target_cancelled(&self.catalog, &op.operation_id)? {
@@ -947,8 +969,11 @@ impl Worker {
                 let record = activation_runtime::receipt(&self.catalog, &execution, request)?;
                 let outcome = match record.phase.as_str() {
                     "offered" => {
-                        let frame =
-                            crate::managed_fork::identity_frame(&self.catalog, &op, &record)?;
+                        let frame = if durable {
+                            crate::managed_state_restore::identity_frame(&self.catalog, &op, &record)?
+                        } else {
+                            crate::managed_fork::identity_frame(&self.catalog, &op, &record)?
+                        };
                         self.activation.begin(
                             &self.catalog,
                             &execution,
@@ -1005,6 +1030,9 @@ impl Worker {
                 &mut self.catalog,
                 request,
                 request.payload()?
+            )?)),
+            "SubmitManagedStateRestore" => Ok(json!(crate::managed_state_restore::submit(
+                &mut self.catalog, request, request.payload()?
             )?)),
             "PendingManagedLaunches" => {
                 let namespace = request

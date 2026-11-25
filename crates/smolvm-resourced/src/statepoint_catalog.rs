@@ -199,9 +199,7 @@ impl Catalog {
         manifest: &Manifest,
         digest: &str,
     ) -> Result<Record> {
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         if tx.execute("UPDATE statepoints SET phase='durable',manifest_digest=?,error=NULL,revision=revision+1
             WHERE capture_id=? AND phase='exporting' AND revision=?", params![digest, record.export.capture_id, record.revision])? != 1
         {

@@ -86,25 +86,35 @@ struct Block {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct Attachment {
-    attachment_id: String,
-    device_id: String,
-    role: String,
-    volume_id: String,
-    generation_id: String,
-    writable_head_id: Option<String>,
+pub(crate) struct Attachment {
+    pub(crate) attachment_id: String,
+    pub(crate) device_id: String,
+    pub(crate) role: String,
+    pub(crate) volume_id: String,
+    pub(crate) generation_id: String,
+    pub(crate) writable_head_id: Option<String>,
     grant_id: Option<String>,
     execution_epoch: i64,
-    capacity_bytes: u64,
+    pub(crate) capacity_bytes: u64,
     layers: Vec<String>,
 }
 
 impl Device {
-    pub(crate) fn is_network(&self) -> bool { self.virtio_type == 1 }
-
-    pub(crate) fn managed_source(&self)->Option<(&str,(&str,&str))> {
-        let a=&self.block.as_ref()?.managed_attachment;
-        Some((&a.device_id,(a.writable_head_id.as_deref().unwrap_or(&a.generation_id),&a.volume_id)))
+    pub(crate) fn block(&self) -> Option<&Attachment> {
+        self.block.as_ref().map(|block| &block.managed_attachment)
+    }
+    pub(crate) fn is_network(&self) -> bool {
+        self.virtio_type == 1
+    }
+    pub(crate) fn managed_source(&self) -> Option<(&str, (&str, &str))> {
+        let a = &self.block.as_ref()?.managed_attachment;
+        Some((
+            &a.device_id,
+            (
+                a.writable_head_id.as_deref().unwrap_or(&a.generation_id),
+                &a.volume_id,
+            ),
+        ))
     }
 }
 pub(crate) struct Capture {

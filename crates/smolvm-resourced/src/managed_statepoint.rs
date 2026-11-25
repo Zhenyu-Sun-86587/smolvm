@@ -18,13 +18,18 @@ pub(crate) fn receipt(c: &Catalog, op: &Operation) -> Result<Option<Value>> {
     let Some((stage,capture,target,original,released,error,target_operation))=row else {return Ok(None)};
     let point=c.statepoint(&capture)?;
     let durable = point.as_ref().filter(|p| matches!(p.phase.as_str(),"durable"|"stop_committed"|"hibernated"));
+    let child = target_operation.as_deref().map(|id| c.operation(id)).transpose()?;
+    let target_point=target.as_deref().map(|id|c.require_statepoint(id)).transpose()?;
+    let represented=target_point.as_ref().or(durable);
     Ok(Some(json!({
         "stage":stage, "capture_id":target.as_ref().unwrap_or(&capture),
         "rescue_capture_id":target.as_ref().map(|_|&capture), "target_operation_id":target_operation,
         "original_source_disposition":original, "source_released":released,
         "phase":point.as_ref().map(|p|&p.phase),
-        "representation_id":durable.map(|p|&p.point.representation_id),
-        "manifest_digest":durable.and_then(|p|p.manifest_digest.as_ref()),
+        "volume_map":child.as_ref().and_then(|op|op.statepoint.as_ref()).and_then(|p|p.get("volume_map")),
+        "rescue_manifest_digest":target.as_ref().and_then(|_|durable).and_then(|p|p.manifest_digest.as_ref()),
+        "representation_id":represented.map(|p|&p.point.representation_id),
+        "manifest_digest":represented.and_then(|p|p.manifest_digest.as_ref()),
         "error":error.as_ref().or_else(||point.as_ref().and_then(|p|p.error.as_ref()))
     })))
 }
@@ -77,6 +82,24 @@ impl Job {
             }
             return Ok(None);
         }
+        if matches!(self.stage.as_str(),"rollback_target"|"rollback_activating") {
+            let target=self.target.as_deref().ok_or_else(||Fault::invalid("missing accepted rollback target"))?;
+            let mode=if self.mode.as_deref()==Some("exact") {crate::managed_state_restore::RestoreMode::Exact}
+                else {crate::managed_state_restore::RestoreMode::CloneConflicts};
+            let template:String=c.db.query_row("SELECT json_extract(template,'$.name') FROM managed_fork_batches WHERE operation_id=?",[&self.id],|r|r.get(0))?;
+            let child=crate::managed_state_restore::queue_rollback(c,&op,&template,target,capture,mode)?;
+            let tx=c.db.transaction()?;
+            let terminal=matches!(child.phase.as_str(),"COMPLETED"|"ABORTED");
+            tx.execute("UPDATE managed_fork_batches SET target_operation_id=?,stage=?,error=? WHERE operation_id=?",
+                params![child.operation_id, if terminal {"complete"} else {"rollback_activating"},
+                   child.statepoint.as_ref().and_then(|p|p["error"].as_str()),self.id])?;
+            if terminal {
+                tx.execute("UPDATE operations SET phase=?,decision=?,revision=revision+1 WHERE operation_id=? AND phase='NEW'",
+                    params![child.phase,child.decision,self.id])?;
+            }
+            tx.commit()?;
+            return Ok(None);
+        }
         let incarnation=op.expected_incarnation_id.as_deref().ok_or_else(||Fault::invalid("missing capture source"))?;
         let source=c.execution(incarnation)?;
         let mut record=c.statepoint(capture)?;
@@ -116,7 +139,7 @@ pub(crate) fn tick(c:&mut Catalog, points:&mut StatePoints, objects:&File, boot:
     let jobs={
         let mut stmt=c.db.prepare("SELECT b.operation_id,b.stage,b.capture_id,b.session,b.token,b.original,b.restore_capture_id,b.volume_restore_policy
           FROM managed_fork_batches b JOIN operations o USING(operation_id)
-          WHERE o.kind IN ('vm_snapshot','hibernate','vm_rollback') AND b.stage IN ('restore_preflight','exporting','checkpoint_export','durable_hold')")?;
+          WHERE o.kind IN ('vm_snapshot','hibernate','vm_rollback') AND b.stage IN ('restore_preflight','exporting','checkpoint_export','durable_hold','rollback_target','rollback_activating')")?;
         let rows=stmt.query_map([],|r|Ok(Job {id:r.get(0)?,stage:r.get(1)?,capture:r.get(2)?,session:r.get(3)?,token:r.get(4)?,
                                              original:r.get(5)?,target:r.get(6)?,mode:r.get(7)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
         rows
