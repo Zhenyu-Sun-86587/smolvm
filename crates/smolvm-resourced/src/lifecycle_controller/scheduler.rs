@@ -70,12 +70,7 @@ fn can_save(db: &Connection, expected: &Expected, unreserved_bytes: u64) -> Resu
             |r| r.get(0),
         )
         .optional()?;
-    Ok(memory.is_some_and(|mib| {
-        unreserved_bytes
-            > u64::from(mib)
-                .saturating_mul(1 << 20)
-                .saturating_add(64 << 20)
-    }))
+    Ok(memory.is_some_and(|mib| unreserved_bytes >= crate::admission::capture_storage(mib.into())))
 }
 
 fn next_action(
@@ -85,6 +80,18 @@ fn next_action(
     now: i64,
 ) -> Result<Option<Value>> {
     if let Some(d) = pending(&c.db, &m.expected.instance_id)? {
+        if d.stage == "queued"
+            && (decision_changed(m, &d, observed)
+                || d.origin == "wake" && !m.demand(&c.db)?
+                || d.kind == "hibernate"
+                    && !can_save(
+                        &c.db,
+                        &m.expected,
+                        crate::admission::unreserved_storage(&c.db)?,
+                    )?)
+        {
+            return Ok(None);
+        }
         return Ok(Some(
             json!({"kind":d.kind,"origin":d.origin,"eligible_after_ms":0}),
         ));
@@ -241,6 +248,16 @@ fn pending(db: &Connection, id: &str) -> Result<Option<Decision>> {
             id:r.get(0)?,kind:r.get(1)?,origin:r.get(2)?,stage:r.get(3)?,rev:r.get(4)?,seq:r.get(5)?,
             expected:Expected{instance_id:id.to_owned(),incarnation_id:r.get(6)?,execution_epoch:r.get(7)?}})).optional()?)
 }
+fn decision_changed(m: &Machine, d: &Decision, o: &Observation) -> bool {
+    m.expected != d.expected
+        || m.active.is_some()
+        || d.rev != m.rev
+        || d.origin != "wake"
+            && (m.seq != d.seq
+                || !o.blockers.is_empty()
+                || !matches!(o.power.as_str(), "RUNNING" | "STANDBY"))
+}
+
 fn record(
     c: &Catalog,
     m: &Machine,
@@ -374,17 +391,16 @@ fn step(
     }
     let must_wake = m.demand(&c.db)?;
     let obs = observe(c, m, boot, monotonic()?)?;
-    let invalidated = m.expected != d.expected
-        || m.active.is_some()
-        || d.rev != m.rev
+    let invalidated = decision_changed(m, d, &obs)
         || (d.origin == "wake" && !must_wake)
         || (d.origin != "wake"
-            && (m.seq != d.seq
-                || !obs.blockers.is_empty()
-                || !matches!(obs.power.as_str(), "RUNNING" | "STANDBY")
-                || d.origin == "pressure" && !p.eligible
+            && (d.origin == "pressure" && !p.eligible
                 || d.kind == "hibernate"
-                    && !can_save(&c.db, &m.expected, p.sample.disk_available)?));
+                    && !can_save(
+                        &c.db,
+                        &m.expected,
+                        crate::admission::unreserved_storage(&c.db)?,
+                    )?));
     if invalidated {
         c.db.execute("UPDATE lifecycle_decisions SET stage='cancelled',finished_at=?,error='evidence changed before dispatch' WHERE id=?",params![wall()?,d.id])?;
         c.db.execute("UPDATE lifecycle_protections SET wake_operation=NULL,revision=revision+1 WHERE wake_operation=? AND kind='wake' AND state='pending'",[&d.id])?;

@@ -25,19 +25,25 @@ the agent and VMM libraries from that Serve's verified bundle. Docker
 Engine activation is disabled for this distribution because its global
 socket and activation services are outside the Serve's namespace.
 
-Each VMM scope is placed under `smolvmdeep.slice`. Scope names include
-the installed runtime instance ID and a hash of the machine name, so two Serves
-can use the same machine name. Boot checks actual cgroup membership before
-loading the VM. Read-only Serve operations can be tested without systemd.
+Each VMM scope is placed under `smolvmdeep.slice` by default. To configure a
+dedicated top-level systemd slice, set `SMOLVM_WORKER_SLICE_NAME` on the Worker
+and all Serve processes that use its socket. The slice name has a stem of at
+most 63 ASCII letters, digits or underscores, followed by `.slice`. Serve
+checks the setting with the Worker at startup. Scope names include the
+installed runtime instance ID and a hash of the machine name, so two Serves
+can use the same machine name. Boot and Worker admission verify the actual
+cgroup membership. Read-only Serve operations can be tested without systemd.
 VMM launch requires the systemd placement and per-VM UID isolation. A
 root-owned Worker registry at `/var/lib/smolvm-custom/worker/uid-claims`
 serializes UID assignments across deep runtimes in a range separate from
 the official allocator. A Serve retains orphaned claims it cannot verify.
 
-The Worker owns the shared slice's resource policy. Deep Serve can read
-cgroup counters, but automatic slice reconfiguration, memory reclaim,
-automatic pressure pauses and pressure-driven kills are disabled. Set the
-deep slice budget independently of the official lane before deployment.
+The Worker owns the shared slice's admission and automatic lifecycle
+policy. It reads the slice's aggregate memory counters and host and slice
+pressure stall information. During pressure, it throttles admission and
+performs bounded cache reclaim before considering Hibernate for an eligible
+idle guest. Set the deep slice budget independently of the official lane
+before deployment.
 
 By default, checkpoint scratch uses each Serve's own state directory. To
 supply tmpfs scratch, mount separate, root-owned tmpfs filesystems at

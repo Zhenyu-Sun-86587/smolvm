@@ -221,6 +221,9 @@ pub(crate) fn submit(
         storage_bytes: storage,
     };
     c.begin_with(r,kind,|tx|{
+        if !fork {
+            admission::require_capture_space(tx, capacity.memory_mib)?;
+        }
         tx.execute("INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,session,token,anchor,network_gate,original,stage,pivot_json,restore_capture_id,volume_restore_policy,admission_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![id,incarnation,namespace,capture,template_bytes,names,session,token,anchor,network,inv.source_disposition,initial,pivot,target,mode,admission])?;
         let mut admitted = 0;
