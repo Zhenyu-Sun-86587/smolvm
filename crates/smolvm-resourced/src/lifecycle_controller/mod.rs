@@ -29,7 +29,7 @@ fn invalid(e:impl ToString)->Fault{Fault::invalid(e.to_string())}
 
 pub(crate) fn recover(db:&Connection)->Result<()> {
     db.execute("UPDATE lifecycle_reports SET valid_until=0",[])?;
-    db.execute("UPDATE lifecycle_policies SET idle_since=NULL,freeze_seq=NULL,grace_until=0,activity_seq=activity_seq+1",[])?;
+    db.execute("UPDATE lifecycle_policies SET idle_since=NULL,freeze_seq=NULL,last_incarnation=NULL,grace_until=0,next_attempt=0,activity_seq=activity_seq+1",[])?;
     db.execute("UPDATE lifecycle_protections SET state='suspect',revision=revision+1 WHERE kind='hold' AND state='active'",[])?;
     Ok(())
 }
@@ -52,7 +52,7 @@ fn bump(tx:&Transaction<'_>,id:&str,reset_idle:bool)->Result<()> {
     tx.execute("UPDATE lifecycle_policies SET activity_seq=activity_seq+1,
         idle_since=CASE WHEN ? THEN NULL ELSE idle_since END WHERE instance_id=?",params![reset_idle,id])?;
     tx.execute("UPDATE lifecycle_decisions SET stage='cancelled',finished_at=?,error='new activity or policy'
-        WHERE instance_id=? AND stage='queued'",params![wall()?,id])?;
+        WHERE instance_id=? AND stage='queued' AND origin<>'wake'",params![wall()?,id])?;
     Ok(())
 }
 
@@ -80,6 +80,8 @@ fn apply(tx:&Transaction<'_>,r:&Request,instance:&str,bundle:&str)->Result<Value
     tx.execute("INSERT INTO lifecycle_policies(instance_id,bundle_digest,revision,policy_json,grace_until)VALUES(?,?,?,?,?)
         ON CONFLICT(instance_id) DO UPDATE SET revision=excluded.revision,policy_json=excluded.policy_json",
         params![instance,bundle,input.new_revision,encoded,until])?;
+    tx.execute("UPDATE lifecycle_reports SET valid_until=0 WHERE instance_id=?",[instance])?;
+    tx.execute("UPDATE lifecycle_policies SET freeze_seq=NULL WHERE instance_id=?",[instance])?;
     bump(tx,instance,false)?;
     Ok(json!({"instance_id":instance,"applied_revision":input.new_revision,"effective_policy":input.effective_policy}))
 }
@@ -127,6 +129,14 @@ pub(crate) fn handle(c:&mut Catalog,r:&Request)->Result<Value> {
     let (_,bundle,expected)=r.scope()?;
     let (actual,_)=binding(c,r)?;
     if r.method=="GetLifecycleStatus" {return scheduler::status(c,&actual)}
+    if r.method=="QueryProtection" {
+        #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+        struct Query {protection_id:String,principal:String}
+        let input:Query=r.payload()?;
+        let owner:Option<String>=c.db.query_row("SELECT principal FROM lifecycle_protections WHERE instance_id=? AND id=?",params![actual.instance_id,input.protection_id],|r|r.get(0)).optional()?;
+        if owner.as_ref()!=Some(&input.principal){return Err(Fault::new("E_NOT_FOUND","protection not found"))}
+        return protections::receipt(&c.db,&actual.instance_id,&input.protection_id);
+    }
     let (id,digest)=r.operation()?;
     let scope=json!([r.method,r.route_id,bundle,expected,r.payload,digest]);
     let fingerprint=format!("sha256:{:x}",Sha256::digest(scope.to_string()));

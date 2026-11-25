@@ -27,7 +27,7 @@ fn override_limit(name: &str, physical: u64) -> Result<u64> {
         Err(e) => Err(unavailable(e)),
     }
 }
-fn limits(db: &Connection) -> Result<Capacity> {
+pub(crate) fn limits(db: &Connection) -> Result<Capacity> {
     let cpus = std::thread::available_parallelism()
         .map_err(unavailable)?
         .get() as u64;
@@ -83,6 +83,7 @@ pub(crate) fn reserve(
     instance: &str,
     request: Capacity,
 ) -> Result<()> {
+    crate::lifecycle_controller::check_admission(db,request.memory_mib)?;
     let limit = limits(db)?;
     let allocated = used(db)?;
     for (dimension, cap, held, need) in [

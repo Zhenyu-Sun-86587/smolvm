@@ -164,6 +164,7 @@ struct Worker {
     activation: ActivationRuntime,
     statepoints: StatePoints,
     forks: crate::managed_fork::Actor,
+    lifecycle:crate::lifecycle_controller::Controller,
 }
 
 struct Reply {
@@ -901,6 +902,9 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            "ApplyLifecyclePolicy"|"GetLifecycleStatus"|"ReportActivity"|"AcquireActivityHold"|"ReleaseActivityHold"|"AcquireRunningLease"|"RenewRunningLease"|
+            "ReleaseRunningLease"|"RequestWake"|"AuthorizeWakeActivation"|"CancelWakeDemand"|"QueryProtection" =>
+                crate::lifecycle_controller::handle(&mut self.catalog,request),
             "QueryWorkerBudget" => crate::admission::status(&self.catalog.db),
             "QueryProductVolume" => crate::product_volumes::query(&self.catalog, request),
             "ApplyProductVolume" => {
@@ -2289,6 +2293,7 @@ fn serve(
         activation: ActivationRuntime::default(),
         statepoints: StatePoints::new(statepoints),
         forks: Default::default(),
+        lifecycle: Default::default(),
     };
     worker
         .reconnect_native_endpoints()
@@ -2313,6 +2318,9 @@ fn serve(
     let mut next_stop_check = Instant::now() + Duration::from_secs(1);
     loop {
         if Instant::now() >= next_stop_check {
+            if let Err(e)=worker.lifecycle.tick(&mut worker.catalog,&worker.boot) {
+                eprintln!("resourced lifecycle controller: {} {}",e.code,e.message);
+            }
             worker
                 .forks
                 .tick(&mut worker.catalog, &mut worker.escrow, &worker.boot)

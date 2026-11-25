@@ -42,7 +42,7 @@ fn deadline(input:&Input)->Result<i64> {
     Ok(monotonic()?+1000*ttl)
 }
 
-fn receipt(db:&Connection,instance:&str,id:&str)->Result<Value>{
+pub(super) fn receipt(db:&Connection,instance:&str,id:&str)->Result<Value>{
     Ok(db.query_row("SELECT kind,state,revision,reason,incarnation_id,epoch,semantics,wake_operation,authorization_revision,endpoint_revision
         FROM lifecycle_protections WHERE instance_id=? AND id=?",params![instance,id],|r|
         Ok(json!({"protection_id":id,"instance_id":instance,"kind":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"revision":r.get::<_,i64>(2)?,
