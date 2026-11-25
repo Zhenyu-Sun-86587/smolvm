@@ -1,6 +1,8 @@
 //! Local worker resource service and Linux control client.
 
 #[cfg(target_os = "linux")]
+mod blocks;
+#[cfg(target_os = "linux")]
 mod catalog;
 #[cfg(target_os = "linux")]
 pub mod client;
@@ -8,6 +10,8 @@ pub mod client;
 mod escrow;
 #[cfg(target_os = "linux")]
 mod escrow_catalog;
+#[cfg(target_os = "linux")]
+mod grants;
 #[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]

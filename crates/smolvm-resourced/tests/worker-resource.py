@@ -224,7 +224,8 @@ class WorkerResource(unittest.TestCase):
         self.call("ReserveWriterSet", {"heads": [heads[0]]}, error="E_VOLUME_WRITER_CONFLICT", **second)
         self.call("ReserveWriterSet", {"heads": [heads[2], heads[1]]}, error="E_VOLUME_WRITER_CONFLICT", **second)
         self.assertEqual(self.call("QueryWriterSet", operation_id="reserve-b")["state"], "absent")
-        self.call("AcquireWriterSet", {"heads": [heads[1]]}, error="E_CAPABILITY_UNSUPPORTED", **second)
+        self.call("AcquireWriterSet", {"grant_id": "unauthorized", "expected_revision": 1},
+                  error="E_PERMISSION_DENIED", **second)
 
         self.stop(self.process)
         self.start()
@@ -414,6 +415,66 @@ class WorkerResource(unittest.TestCase):
             self.finish(scope)
             session = {"broker_session_id": self.call("Health")["broker_session_id"]}
             self.assertEqual(self.call("CompleteRecovery", session)["state"], "ready")
+
+    def test_managed_block_read_lease_recovery_and_physical_gc(self):
+        setup = operation(self.bundle_a, "prepare-blocks", fence("blocks"))
+        self.call("BeginOperation", {"kind": "catalog"}, **setup)
+        data = b"r" * 512
+        imported = self.root / "raw-base"
+        imported.write_bytes(data)
+        payload = {"resource_id": "base", "capacity_bytes": len(data), "content_sha256": digest(data)}
+        table = [{"index": 0, "resource_id": "base", "role": "block_import"}]
+        with imported.open("rb") as source:
+            wrong = request("ImportImmutableBlock", dict(payload, content_sha256=digest(b"wrong")),
+                            fd_table=table, **setup)
+            self.assertEqual(rpc(self.path, wrong, [source.fileno()])["error"]["code"], "E_CONTENT_MISMATCH")
+            self.call("FinishOperation", {"abort": False, "expected_revision": 1},
+                      error="E_OPERATION_HAS_EFFECTS", **setup)
+            self.call("AbortBlockCreation", {"resource_id": "base"}, **setup)
+            self.call("AbortBlockCreation", {"resource_id": "base"}, **setup)
+            valid = request("ImportImmutableBlock", payload, fd_table=table, **setup)
+            self.assertTrue(rpc(self.path, valid, [source.fileno()])["result"]["immutable"])
+        self.call("CreateVolumeHead", {"resource_id": "raw-head", "volume_id": "vol", "capacity_bytes": len(data)}, **setup)
+        self.finish(setup)
+        imported.unlink()
+
+        launch = operation(self.bundle_a, "launch-block-reader", fence("reader"))
+        self.call("BeginOperation", {"kind": "launch"}, **launch)
+        launch["expected"] = fence("reader", 1)
+        permit = self.call("IssueLaunchPermit", {"pid": os.getpid(), "uid": os.getuid()}, **launch)
+        self.call("RegisterExecution", {"launch_permit": permit["launch_permit"]}, **launch)
+        self.finish(launch)
+        scope = operation(self.bundle_a, "read-block", fence("reader", 1))
+        self.call("BeginOperation", {"kind": "resource_lease"}, **scope)
+        lease = {"lease_id": "read-base", "resource_id": "base", "access": "ro"}
+        self.call("AcquireResourceLease", dict(lease, resource_id="raw-head"),
+                  error="E_VOLUME_WRITER_CONFLICT", **scope)
+        reply, fds, flags = receive_lease(self.path, request("AcquireResourceLease", lease, **scope))
+        self.assertFalse(flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC))
+        self.assertEqual(reply["fd_table"][0]["role"], "block_ancestor")
+        with os.fdopen(fds[0], "rb") as held:
+            self.assertEqual(os.pread(held.fileno(), len(data), 0), data)
+            self.assertEqual(fcntl.fcntl(held.fileno(), fcntl.F_GETFL) & os.O_ACCMODE, os.O_RDONLY)
+            self.call("AckAttached", {"lease_id": "read-base", "expected_revision": 1}, **scope)
+            self.finish(scope)
+            self.call("MarkResourceForGC", {"resource_id": "base", "expected_revision": 1},
+                      error="E_RESOURCE_PINNED")
+            self.stop(self.process)
+            self.start()
+            self.call("ReconcileExecution", **launch)
+            reconcile = request("ReconcileExecutionExports", {"lease_id": "read-base", "expected_revision": 3},
+                                fd_table=reply["fd_table"], **scope)
+            receipt = rpc(self.path, reconcile, [held.fileno()])["result"]
+            self.assertEqual(receipt["lease"]["state"], "attached")
+            self.assertEqual(os.pread(held.fileno(), len(data), 0), data)
+        session = {"broker_session_id": self.call("Health")["broker_session_id"]}
+        self.assertEqual(self.call("CompleteRecovery", session)["state"], "ready")
+        self.call("ReleaseResourceLease", {"lease_id": "read-base", "expected_revision": 4}, **scope)
+        self.call("MarkResourceForGC", {"resource_id": "base", "expected_revision": 1})
+        collect = {"resource_id": "base", "expected_revision": 2}
+        self.assertEqual(self.call("CollectResource", collect)["state"], "deleted")
+        self.assertFalse((self.state / "objects/base").exists())
+        self.assertEqual(self.call("CollectResource", collect)["state"], "deleted")
 
 
 if __name__ == "__main__":
