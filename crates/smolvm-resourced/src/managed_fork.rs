@@ -156,9 +156,7 @@ pub(crate) fn submit(
             |r|Ok((r.get::<_,u32>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?.ok_or_else(||conflict("source requires managed standby"))?
     } else {
         (
-            inv.last_session
-                .checked_add(1)
-                .ok_or_else(|| conflict("Guest gate session exhausted"))?,
+            crate::native_operations::next_session(c, incarnation, inv.last_session)?,
             nonce()?,
             nonce()?,
         )
