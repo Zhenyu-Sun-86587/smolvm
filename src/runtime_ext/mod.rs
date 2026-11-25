@@ -10,6 +10,8 @@ use std::{
 
 static CAPABILITIES: tokio::sync::OnceCell<Handshake> = tokio::sync::OnceCell::const_new();
 #[cfg(feature = "deep-runtime")]
+mod guest_agent;
+#[cfg(feature = "deep-runtime")]
 pub(crate) mod launch;
 
 fn installed_profile() -> Result<(Handshake, serde_json::Value, String), String> {
@@ -80,7 +82,8 @@ pub fn worker_operations_router(socket: std::path::PathBuf) -> axum::Router {
         .route(
             "/api/v1/runtime-ext/v1/machines/{name}/execution",
             axum::routing::get(machine_execution),
-        );
+        )
+        .merge(guest_agent::router());
     router.with_state(socket)
 }
 #[cfg(feature = "deep-runtime")]

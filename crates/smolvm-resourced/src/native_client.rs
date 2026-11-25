@@ -1,9 +1,10 @@
 //! Typed Worker operations used by the local Serve and registered VMM processes.
 use crate::client::{OperationReceipt, QueryError};
 pub use crate::ipc::Expected as ExecutionRef;
-use crate::ipc::{self, valid_digest, valid_id, PROTOCOL};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{json, Value};
+use crate::ipc::{self, PROTOCOL, valid_digest, valid_id};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
+use std::os::fd::OwnedFd;
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -199,6 +200,22 @@ impl Client<'_> {
         id: Option<(&str, &str)>,
         payload: Value,
     ) -> Result<T, QueryError> {
+        let (result, table, descriptors) = self.call_packet(method, expected, id, payload)?;
+        if !table.is_empty() || !descriptors.is_empty() {
+            return Err(fault(
+                "E_PROTOCOL_UNSUPPORTED",
+                "unexpected Worker descriptor",
+            ));
+        }
+        Ok(result)
+    }
+    fn call_packet<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        expected: Option<&ExecutionRef>,
+        id: Option<(&str, &str)>,
+        payload: Value,
+    ) -> Result<(T, Vec<ipc::FdEntry>, Vec<OwnedFd>), QueryError> {
         if !self.socket.is_absolute() || !valid_digest(self.bundle) {
             return Err(fault(
                 "E_INVALID_REQUEST",
@@ -237,16 +254,18 @@ impl Client<'_> {
             ));
         }
         ipc::send(&socket, &bytes).map_err(transport)?;
-        let raw = ipc::receive(&socket).map_err(|e| fault(e.code, e.message))?;
+        let raw = ipc::receive_packet(&socket).map_err(|e| fault(e.code, e.message))?;
         #[derive(Deserialize)]
         struct Answer<T> {
             protocol: String,
             request_id: Option<String>,
             result: Option<T>,
             error: Option<QueryError>,
+            #[serde(default)]
+            fd_table: Vec<ipc::FdEntry>,
         }
         let reply: Answer<T> =
-            serde_json::from_slice(&raw).map_err(|e| fault("E_PROTOCOL_UNSUPPORTED", e))?;
+            serde_json::from_slice(&raw.body).map_err(|e| fault("E_PROTOCOL_UNSUPPORTED", e))?;
         if reply.protocol != PROTOCOL || reply.request_id.as_deref() != Some(method) {
             return Err(fault(
                 "E_PROTOCOL_UNSUPPORTED",
@@ -254,10 +273,48 @@ impl Client<'_> {
             ));
         }
         match (reply.result, reply.error) {
-            (Some(result), None) => Ok(result),
+            (Some(result), None) => Ok((result, reply.fd_table, raw.descriptors)),
             (None, Some(error)) => Err(error),
             _ => Err(fault("E_PROTOCOL_UNSUPPORTED", "invalid Worker result")),
         }
+    }
+    pub fn open_guest_agent(&self, expected: &ExecutionRef) -> Result<OwnedFd, QueryError> {
+        let incarnation = expected
+            .incarnation_id
+            .as_deref()
+            .filter(|id| valid_id(id))
+            .ok_or_else(|| {
+                fault(
+                    "E_INVALID_REQUEST",
+                    "Guest Agent requires an execution incarnation",
+                )
+            })?;
+        if expected.execution_epoch < 1 || !valid_id(&expected.instance_id) {
+            return Err(fault(
+                "E_INVALID_REQUEST",
+                "Guest Agent requires a live execution",
+            ));
+        }
+        let (execution, table, mut descriptors): (Value, _, _) =
+            self.call_packet("OpenGuestAgent", Some(expected), None, empty())?;
+        if execution["route_id"] != "deep"
+            || execution["bundle_digest"] != self.bundle
+            || execution["instance_id"] != expected.instance_id
+            || execution["incarnation_id"] != incarnation
+            || execution["execution_epoch"] != expected.execution_epoch
+            || execution["phase"] != "registered"
+            || descriptors.len() != 1
+            || table.len() != 1
+            || table[0].index != 0
+            || table[0].role != "guest_agent"
+            || table[0].resource_id != incarnation
+        {
+            return Err(fault(
+                "E_PROTOCOL_UNSUPPORTED",
+                "Guest Agent descriptor scope differs from the verified execution",
+            ));
+        }
+        Ok(descriptors.pop().expect("one checked descriptor"))
     }
     pub fn binding(&self, instance: &str) -> Result<Binding, QueryError> {
         let r: Binding = self.call(
