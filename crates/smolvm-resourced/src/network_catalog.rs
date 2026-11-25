@@ -168,6 +168,24 @@ fn unallocated_ipv4(db: &Connection, network: &str, first: u32, last: u32) -> Re
 }
 
 impl Catalog {
+    pub(crate) fn tap_network_metadata(
+        &self,
+        lease: &crate::network_lease_catalog::TapLease,
+    ) -> Result<(String, Option<String>)> {
+        let reservation = lookup(&self.db, &lease.attachment.attachment_id)?
+            .filter(|entry| {
+                entry.operation_id == lease.operation_id
+                    && entry.private_ipv4 == lease.attachment.private_ipv4
+            })
+            .ok_or_else(|| {
+                Fault::new(
+                    "E_FENCE_UNPROVEN",
+                    "TAP has no corresponding network reservation",
+                )
+            })?;
+        Ok((reservation.network_id, reservation.dns_name))
+    }
+
     pub(crate) fn reserve_managed_network(
         &mut self,
         request: &Request,
