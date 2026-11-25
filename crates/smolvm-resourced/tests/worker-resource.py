@@ -132,6 +132,96 @@ class WorkerResource(unittest.TestCase):
         self.assertEqual(released["state"], "released")
         self.assertEqual(released, self.call("ReleaseNetworkReservation", release, **a))
 
+    @unittest.skipUnless(os.geteuid() == 0 and os.path.exists("/dev/net/tun"),
+                         "requires a privileged Worker inside an isolated network namespace")
+    def test_private_tap_offer_matches_the_measured_execution_epoch(self):
+        self.exercise_tap_offer(restart=False)
+
+    @unittest.skipUnless(os.geteuid() == 0 and os.path.exists("/dev/net/tun"),
+                         "requires a privileged Worker inside an isolated network namespace")
+    def test_network_restart_holds_unknown_tap_ownership(self):
+        self.exercise_tap_offer(restart=True)
+
+    def exercise_tap_offer(self, restart):
+        code = """
+import array, fcntl, json, socket, struct, sys
+held = []
+for line in sys.stdin:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+        client.connect(sys.argv[1])
+        client.send(line.encode())
+        body, control, _, _ = client.recvmsg(65536, socket.CMSG_SPACE(16), socket.MSG_CMSG_CLOEXEC)
+    response = json.loads(body)
+    fds = array.array("i")
+    for _, _, data in control:
+        fds.frombytes(data)
+    response["received_fds"] = len(fds)
+    if fds:
+        held.extend(fds)
+        response["vnet_header"] = struct.unpack("i", fcntl.ioctl(fds[0], 0x800454d7, bytes(4)))[0]
+    print(json.dumps(response), flush=True)
+"""
+        peer = subprocess.Popen([sys.executable, "-u", "-c", code, self.path],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop, peer)
+
+        def exchange(method, data, scope):
+            peer.stdin.write(json.dumps(request(method, data, **scope)) + "\n")
+            peer.stdin.flush()
+            return json.loads(peer.stdout.readline())
+
+        self.call("RegisterPrivateNetwork", {
+            "network_id": "private", "route_domain_id": "router", "cidr": "10.22.0.0/30",
+        })
+        start = operation(self.bundle_a, "worker-tap-launch", fence("isolated-vmm"))
+        self.call("BeginOperation", {"kind": "launch"}, **start)
+        self.call("ReserveNetworkAttachment", {
+            "attachment_id": "endpoint", "network_id": "private", "device_id": "net0", "mode": "native",
+        }, **start)
+        payload = {"attachment_id": "endpoint"}
+        port = self.call("PrepareNetworkAttachment", payload, **start)
+        self.assertEqual(port["state"], "quarantined")
+        self.assertEqual(port["gate"], "closed")
+        self.assertEqual(port, self.call("PrepareNetworkAttachment", payload, **start))
+        self.call("ReleaseNetworkReservation", {**payload, "expected_revision": 1}, **start,
+                  error="E_FENCE_UNPROVEN")
+        active = {**start, "expected": fence("isolated-vmm", 1)}
+        permit = self.call("IssueLaunchPermit", {"pid": peer.pid, "uid": os.getuid()}, **active)
+        registration = exchange("RegisterExecution", {"launch_permit": permit["launch_permit"]}, active)
+        self.assertIn("result", registration)
+        self.call("AcquireNetworkAttachment", payload, **active, error="E_PERMISSION_DENIED")
+        stale = {**active, "expected": fence("isolated-vmm", 2)}
+        revoked = exchange("AcquireNetworkAttachment", payload, stale)
+        self.assertEqual(revoked["error"]["code"], "E_STALE_EXECUTION")
+        self.assertEqual(revoked["received_fds"], 0)
+        offer = exchange("AcquireNetworkAttachment", payload, active)
+        self.assertEqual(offer["received_fds"], 1)
+        self.assertEqual(offer["vnet_header"], 12)
+        lease = offer["result"]
+        self.assertEqual(lease["state"], "offered")
+        self.assertEqual(lease["execution_epoch"], 1)
+        ack = {**payload, "lease_id": lease["lease_id"], "expected_revision": lease["revision"]}
+        attached = exchange("AckNetworkAttachment", ack, active)
+        self.assertEqual(attached["result"]["state"], "attached")
+        self.assertEqual(attached["result"]["gate"], "closed")
+        self.assertEqual(attached["received_fds"], 0)
+        if restart:
+            self.stop(self.process)
+            self.start()
+            prior = self.call("QueryNetworkAttachment", payload, **start)
+            self.assertEqual(prior["lease_id"], lease["lease_id"])
+            self.assertEqual(prior["state"], "unknown")
+            self.assertEqual(prior["gate"], "unknown")
+            self.call("FenceNetworkAttachment", payload, **start, error="E_FENCE_UNPROVEN")
+            self.call("ReleaseNetworkReservation", {**payload, "expected_revision": 1}, **start,
+                      error="E_FENCE_UNPROVEN")
+            self.assertEqual(exchange("AcquireNetworkAttachment", payload, active)["received_fds"], 0)
+            return
+        self.assertTrue(self.call("FenceNetworkAttachment", payload, **start)["fenced"])
+        released = self.call("ReleaseNetworkReservation", {**payload, "expected_revision": 1}, **start)
+        self.assertEqual(released["state"], "released")
+        self.assertEqual(exchange("AcquireNetworkAttachment", payload, active)["received_fds"], 0)
+
     def process_peer(self):
         code = (
             "import json, socket, sys\n"

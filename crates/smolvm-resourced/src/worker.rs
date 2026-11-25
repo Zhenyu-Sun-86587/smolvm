@@ -155,6 +155,7 @@ struct Worker {
     executions: HashMap<String, OwnedFd>,
     reserved: HashMap<String, Vec<File>>,
     escrow: Escrow,
+    network: crate::network_runtime::NetworkRuntime,
 }
 
 struct Reply {
@@ -364,6 +365,28 @@ impl Worker {
                     descriptors,
                 )
             }
+            "AcquireNetworkAttachment" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                let (lease, fd) = self
+                    .network
+                    .acquire(&mut self.catalog, request, &execution)?;
+                return Ok(Reply {
+                    table: vec![ipc::FdEntry {
+                        index: 0,
+                        resource_id: lease.attachment.attachment_id.clone(),
+                        role: "network_tap".to_owned(),
+                    }],
+                    result: json!(lease),
+                    descriptors: vec![fd],
+                    delivered: None,
+                });
+            }
+            "AckNetworkAttachment" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                self.network
+                    .acknowledge(&self.catalog, request, &execution)
+                    .map(|lease| json!(lease))
+            }
             "AcquireWriterSet" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 return self.acquire_writer_set(request, &execution);
@@ -510,6 +533,18 @@ impl Worker {
             "ReleaseNetworkReservation" => Ok(json!(self
                 .catalog
                 .release_network_reservation(request, &request.payload()?)?)),
+            "PrepareNetworkAttachment" => self
+                .network
+                .prepare(&self.catalog, request)
+                .map(|lease| json!(lease)),
+            "QueryNetworkAttachment" => {
+                crate::network_runtime::NetworkRuntime::query(&self.catalog, request)
+                    .map(|lease| json!(lease))
+            }
+            "FenceNetworkAttachment" => {
+                self.network.fence(&self.catalog, request)?;
+                Ok(json!({"fenced": true}))
+            }
             "RegisterBundle" => {
                 let bundle = request
                     .bundle_digest
@@ -1266,6 +1301,7 @@ fn serve(
         executions: HashMap::new(),
         reserved: HashMap::new(),
         escrow: Escrow::default(),
+        network: crate::network_runtime::NetworkRuntime::default(),
     };
 
     let socket = ipc::new_socket()?;

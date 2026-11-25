@@ -198,6 +198,33 @@ pub struct KrunFunctions {
 }
 
 impl KrunFunctions {
+    /// Acquire a quarantined queue for this authenticated process, register it
+    /// with libkrun, and acknowledge attachment without opening traffic.
+    #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+    pub fn attach_prepared_worker_network(
+        &self,
+        context: u32,
+        scope: &smolvm_resourced::network_client::WorkerNetworkScope,
+    ) -> Result<(), String> {
+        use std::os::fd::AsFd;
+        let (lease, tap) = scope.acquire().map_err(|error| error.to_string())?;
+        let digest = lease
+            .attachment_digest()
+            .map_err(|error| error.to_string())?;
+        self.register_worker_tap(
+            context,
+            tap.as_fd(),
+            &lease.attachment.device_id,
+            lease.attachment.mac,
+            0,
+            digest,
+        )?;
+        scope
+            .acknowledge(&lease)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     /// Register a Worker TAP prepared for this exact launch. The caller must
     /// authenticate the Worker lease and keep its packet gate closed.
     #[cfg(all(target_os = "linux", feature = "deep-runtime"))]

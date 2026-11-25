@@ -214,9 +214,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_blocks.sql"))?;
                 crate::network_catalog::install(&tx)?;
                 tx.execute_batch(include_str!("schema_writer_pivots.sql"))?;
-                tx.execute_batch("PRAGMA user_version=5")?;
+                crate::network_lease_catalog::install(&tx)?;
+                tx.execute_batch("PRAGMA user_version=6")?;
             }
-            1..=5 => {
+            1..=6 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -228,8 +229,12 @@ impl Catalog {
                 }
                 if version < 5 {
                     tx.execute_batch(include_str!("schema_writer_pivots.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=5")?;
                 }
+                if version < 6 {
+                    crate::network_lease_catalog::install(&tx)?;
+                    tx.execute_batch("PRAGMA user_version=6")?;
+                }
+                crate::network_lease_catalog::recover(&tx)?;
                 let old_boot: String =
                     tx.query_row("SELECT host_boot_id FROM worker_state", [], |r| r.get(0))?;
                 tx.execute(

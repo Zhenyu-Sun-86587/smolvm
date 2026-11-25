@@ -649,6 +649,29 @@ pub const MEDIATED_IDENTITY_FILE: &str = "mediated-identity";
 ///
 /// This function never returns on success.
 pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
+    launch_agent_vm_inner(
+        config,
+        #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+        None,
+    )
+}
+
+/// Boot an already registered Worker execution with its quarantined network
+/// attachment. Guest identity reconfiguration and publication are separate.
+#[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+pub fn launch_agent_vm_with_worker_network(
+    config: &LaunchConfig<'_>,
+    scope: &smolvm_resourced::network_client::WorkerNetworkScope,
+) -> Result<()> {
+    launch_agent_vm_inner(config, Some(scope))
+}
+
+fn launch_agent_vm_inner(
+    config: &LaunchConfig<'_>,
+    #[cfg(all(target_os = "linux", feature = "deep-runtime"))] worker_network: Option<
+        &smolvm_resourced::network_client::WorkerNetworkScope,
+    >,
+) -> Result<()> {
     let t0 = std::time::Instant::now();
 
     // Emit boot timing to stderr (captured in the startup error log by the
@@ -693,6 +716,24 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         mediated_egress,
         mediated_parent_id,
     } = config;
+    #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+    if worker_network.is_some()
+        && (!port_mappings.is_empty()
+            || auto_ports.is_some()
+            || pod_net.is_some()
+            || credentials.is_some()
+            || external_interceptor.is_some()
+            || *dns_filter_enabled
+            || resources.network_name.is_some()
+            || resources
+                .network_backend
+                .is_some_and(|backend| backend != crate::network::NetworkBackend::VirtioNet))
+    {
+        return Err(Error::config(
+            "Worker attachment",
+            "requires a dedicated private IPv4 configuration",
+        ));
+    }
     // `pod_net` drives the Linux-only pod netns-tap datapath; on other targets the
     // field exists (cross-platform LaunchConfig) but is never read.
     #[cfg(not(target_os = "linux"))]
@@ -1140,8 +1181,31 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // exits. Only ever set on the pod datapath.
         #[cfg(target_os = "linux")]
         let mut netns_bridge: Option<smolvm_network::netns_tap::NetnsTapBridge> = None;
-        let guest_network: Option<GuestNetworkConfig> = match network_plan.backend {
-            EffectiveNetworkBackend::None => {
+        #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+        let worker_attached = if let Some(scope) = worker_network {
+            if krun_add_vsock(ctx, 0) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure Worker attachment",
+                    "krun_add_vsock failed",
+                ));
+            }
+            if let Err(error) = krun.attach_prepared_worker_network(ctx, scope) {
+                krun_free_ctx(ctx);
+                return Err(Error::agent("configure Worker attachment", error));
+            }
+            true
+        } else {
+            false
+        };
+        #[cfg(not(all(target_os = "linux", feature = "deep-runtime")))]
+        let worker_attached = false;
+        let guest_network: Option<GuestNetworkConfig> = match (
+            worker_attached,
+            network_plan.backend,
+        ) {
+            (true, _) => None,
+            (false, EffectiveNetworkBackend::None) => {
                 // Upstream libkrun no longer creates an implicit vsock (the old
                 // krun_disable_implicit_vsock is gone), so just add it explicitly.
                 if krun_add_vsock(ctx, 0) < 0 {
@@ -1152,7 +1216,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 tracing::debug!("configured vsock without guest networking");
                 None
             }
-            EffectiveNetworkBackend::Tsi => {
+            (false, EffectiveNetworkBackend::Tsi) => {
                 if krun_add_vsock(ctx, TSI_FEATURE_HIJACK_INET) < 0 {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
@@ -1219,7 +1283,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 tracing::info!("network backend: tsi");
                 None
             }
-            EffectiveNetworkBackend::Host => {
+            (false, EffectiveNetworkBackend::Host) => {
                 krun.ensure_host_network().map_err(|reason| {
                     krun_free_ctx(ctx);
                     Error::agent("configure host network", reason)
@@ -1240,7 +1304,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 tracing::info!("network backend: host");
                 None
             }
-            EffectiveNetworkBackend::VirtioNet => {
+            (false, EffectiveNetworkBackend::VirtioNet) => {
                 let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                     Error::agent(
                         "configure virtio-net",
@@ -1873,10 +1937,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // ports use the forwarder on every backend: it reaches a guest port at
         // the guest's loopback, where dev servers often listen. A socket path
         // too long for the platform only costs those live changes.
-        let live_ports_via_forwarder = matches!(
-            network_plan.backend,
-            EffectiveNetworkBackend::None | EffectiveNetworkBackend::Tsi
-        );
+        let live_ports_via_forwarder = !worker_attached
+            && matches!(
+                network_plan.backend,
+                EffectiveNetworkBackend::None | EffectiveNetworkBackend::Tsi
+            );
         let port_forward_socket = if live_ports_via_forwarder || auto_ports.is_some() {
             vsock_socket
                 .parent()

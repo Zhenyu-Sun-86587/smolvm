@@ -19,6 +19,12 @@ pub mod network;
 #[cfg(target_os = "linux")]
 mod network_catalog;
 #[cfg(target_os = "linux")]
+pub mod network_client;
+#[cfg(target_os = "linux")]
+mod network_lease_catalog;
+#[cfg(target_os = "linux")]
+mod network_runtime;
+#[cfg(target_os = "linux")]
 mod pivots;
 #[cfg(target_os = "linux")]
 mod worker;

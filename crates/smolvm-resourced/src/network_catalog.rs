@@ -54,17 +54,17 @@ pub(crate) struct ReleaseNetwork {
 
 #[derive(Serialize)]
 pub(crate) struct NetworkReservation {
-    attachment_id: String,
-    operation_id: String,
+    pub(crate) attachment_id: String,
+    pub(crate) operation_id: String,
     instance_id: String,
-    network_id: String,
-    route_domain_id: String,
-    device_id: String,
-    mode: String,
-    gateway_ipv4: Ipv4Addr,
-    private_ipv4: Ipv4Addr,
-    guest_ipv4: Ipv4Addr,
-    state: String,
+    pub(crate) network_id: String,
+    pub(crate) route_domain_id: String,
+    pub(crate) device_id: String,
+    pub(crate) mode: String,
+    pub(crate) gateway_ipv4: Ipv4Addr,
+    pub(crate) private_ipv4: Ipv4Addr,
+    pub(crate) guest_ipv4: Ipv4Addr,
+    pub(crate) state: String,
     revision: i64,
 }
 
@@ -163,6 +163,26 @@ fn unallocated_ipv4(db: &Connection, network: &str, first: u32, last: u32) -> Re
 }
 
 impl Catalog {
+    pub(crate) fn private_network_prefix(&self, network_id: &str) -> Result<u8> {
+        let cidr = self.db.query_row(
+            "SELECT cidr FROM private_networks WHERE network_id=?",
+            [network_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        cidr.split_once('/')
+            .and_then(|(_, prefix)| prefix.parse().ok())
+            .ok_or_else(|| Fault::new("E_CATALOG", "invalid private network CIDR"))
+    }
+
+    pub(crate) fn mark_network_reservation_unknown(&self, attachment_id: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE network_attachments SET state='unknown',revision=revision+1
+             WHERE attachment_id=? AND state='reserved'",
+            [attachment_id],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn register_private_network(&self, data: &RegisterNetwork) -> Result<()> {
         self.ready()?;
         if !valid_id(&data.network_id) || !valid_id(&data.route_domain_id) {
@@ -289,7 +309,7 @@ impl Catalog {
         self.scoped_network_reservation(request, &data.attachment_id)
     }
 
-    fn scoped_network_reservation(
+    pub(crate) fn scoped_network_reservation(
         &self,
         request: &Request,
         id: &str,
@@ -312,6 +332,16 @@ impl Catalog {
         data: &ReleaseNetwork,
     ) -> Result<NetworkReservation> {
         let prior = self.scoped_network_reservation(request, &data.attachment_id)?;
+        match self.tap_lease(&data.attachment_id) {
+            Ok(_) => {
+                return Err(Fault::new(
+                    "E_FENCE_UNPROVEN",
+                    "fence the prepared network lease before releasing its address",
+                ))
+            }
+            Err(error) if error.code == "E_NOT_FOUND" => {}
+            Err(error) => return Err(error),
+        }
         if prior.state == "released"
             && data.expected_revision.checked_add(1) == Some(prior.revision)
         {

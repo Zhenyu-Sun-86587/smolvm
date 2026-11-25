@@ -106,6 +106,8 @@ pub use client::{
 };
 pub use fsnotify_watch::FsNotifyWatcher;
 pub use krun::{host_layers_supported, KrunFunctions};
+#[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+pub use launcher::launch_agent_vm_with_worker_network;
 pub use launcher::{
     create_disk_overlays, find_lib_dir, launch_agent_vm, validate_external_interceptor,
     DiskOverlaySpec, LaunchConfig, LaunchFeatures, VmDisks,

@@ -103,6 +103,10 @@ impl PrivateRouter {
         self.namespace.as_ref().as_fd()
     }
 
+    pub(crate) fn idle(&self) -> bool {
+        Arc::strong_count(&self.namespace) == 1
+    }
+
     /// Connect a TAP through private Linux namespaces. The guest-facing link
     /// stays down and its ingress chain independently drops every packet.
     pub fn prepare(&self, policy: PortPolicy) -> io::Result<QuarantinedPort> {

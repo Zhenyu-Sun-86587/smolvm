@@ -123,3 +123,22 @@ and releases only an unissued reservation. Unknown reservations retain their
 address and device pins. This API reserves identifiers and addresses, while
 TAP delivery, traffic publication, and identity activation require their
 own Worker admission.
+
+### Prepared TAP handoff
+
+`PrepareNetworkAttachment` creates the private router and port namespaces for
+an active launch reservation. A privileged Linux Worker needs `ip`, `nft`,
+`nsenter`, `sysctl` and `/dev/net/tun`. Pass the attachment ID and, for
+`fixed_internal`, the Guest gateway and prefix as `guest_gateway_ipv4` and
+`guest_prefix`. Preparation keeps the device link down and the packet gate
+closed. `QueryNetworkAttachment` reads the operation's durable lease receipt.
+
+After execution registration, the measured execution process calls
+`AcquireNetworkAttachment` for the exact incarnation and epoch. The response
+carries one `network_tap` fd and a scoped receipt. The VMM places it with the
+TapFd ABI and calls `AckNetworkAttachment` with the attachment ID, lease ID
+and offer revision. Attachment acknowledgement leaves the gate closed.
+
+`FenceNetworkAttachment` removes the host router link before the address can
+be released. Broker restart retains uncertain offers as `unknown`. The
+Worker retains those addresses and requires reconciliation before reuse.
