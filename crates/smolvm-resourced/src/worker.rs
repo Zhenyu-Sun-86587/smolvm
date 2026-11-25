@@ -1209,7 +1209,10 @@ impl Worker {
                     ));
                 };
                 let operation = self.catalog.operation(&execution.last_operation_id)?;
-                Ok(json!({"lease": lease, "request_digest": operation.request_digest}))
+                let (network_id, dns_name) = self.catalog.tap_network_metadata(lease)?;
+                Ok(
+                    json!({"lease": lease, "request_digest": operation.request_digest, "network_id": network_id, "dns_name": dns_name}),
+                )
             }
             "FenceNetworkAttachment" => {
                 self.network.fence(&self.catalog, request)?;
@@ -2278,8 +2281,10 @@ fn serve(
     let bound = socket.bind(&address);
     unsafe { libc::umask(previous) };
     bound?;
-    if let Some(gid) = socket_gid {
-        std::os::unix::fs::chown(socket_path, None, Some(gid))?;
+    if admin_uid.is_some() || socket_gid.is_some() {
+        std::os::unix::fs::chown(socket_path, admin_uid, socket_gid)?;
+    }
+    if socket_gid.is_some() {
         fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))?;
     }
     socket.listen(32)?;
