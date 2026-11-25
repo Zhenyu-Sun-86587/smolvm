@@ -9,9 +9,11 @@ import os
 from pathlib import Path
 import select
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 GENERATION_TEST = Path(__file__).with_name("kvm-generation.py")
 spec = importlib.util.spec_from_file_location("kvm_generation", GENERATION_TEST)
@@ -87,6 +89,11 @@ def worker(library, path, name, root, log):
                 helper = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"],
                                           pass_fds=tuple(held[key] for key in heads))
                 result = {"pid": helper.pid}
+            elif method == "close_writers":
+                for key in heads:
+                    os.close(held.pop(key))
+                heads.clear()
+                result = {"closed": True}
             elif method == "boot":
                 offered, entries, descriptors = rpc(
                     path, "AcquireWriterSet", {"grant_id": name + "-grant", "expected_revision": 1},
@@ -115,7 +122,18 @@ def worker(library, path, name, root, log):
                 check("krun_add_virtio_console_default", inp, out, out)
                 check("krun_add_virtiofs3", b"/dev/root", os.fsencode(root), ct.c_uint64(0), ct.c_bool(True))
                 check("krun_set_workdir", b"/")
-                env = (ct.c_char_p * 2)(b"WORKER_BLOCK_OBSERVE=1", None) if name == "observer" else (ct.c_char_p * 1)()
+                value = b"WORKER_BLOCK_OBSERVE=1" if name == "observer" else None
+                if cmd.get("pivot_control"):
+                    value = b"WORKER_BLOCK_PIVOT=1"
+                    os.environ["SMOLVM_FORKABLE"] = "1"
+                    check("krun_enable_guest_gate_v1")
+                    check("krun_set_control_socket", os.fsencode(cmd["pivot_control"]))
+                    config = json.dumps({
+                        "socket": str(path), "worker_uid": os.getuid(), "bundle_digest": BUNDLE[name],
+                        "instance_id": name, "incarnation_id": name + "-exec", "execution_epoch": 1,
+                    }).encode()
+                    check("krun_configure_worker_block_pivot_v1", ct.c_char_p(config), ct.c_size_t(len(config)))
+                env = (ct.c_char_p * 2)(value, None)
                 check("krun_set_exec", b"/bin/workload", (ct.c_char_p * 1)(), env)
                 check("krun_split_irqchip", ct.c_bool(False))
                 attach(krun, ctx, offered["grant"], offered["block_sets"], held)
@@ -134,7 +152,7 @@ def worker(library, path, name, root, log):
             print(json.dumps({"error": str(error)}), flush=True)
 
 
-def orchestrate(broker, library, guest):
+def orchestrate(broker, library, guest, live_pivot=False):
     broker, library, guest = [Path(path).resolve(strict=True) for path in (broker, library, guest)]
     with tempfile.TemporaryDirectory(prefix="deep-block-kvm-") as directory:
         root = Path(directory)
@@ -193,6 +211,15 @@ def orchestrate(broker, library, guest):
             until(lambda: log.exists() and marker in log.read_text(errors="replace"), process, marker)
             print(marker, flush=True)
 
+        def native(control, command, expected="OK "):
+            with socket.socket(socket.AF_UNIX) as conn:
+                conn.settimeout(25)
+                conn.connect(str(control))
+                conn.sendall((command + "\n").encode())
+                response = conn.makefile("r").readline().strip()
+            require(response.startswith(expected), command, response)
+            return json.loads(response[3:]) if expected == "OK " else response
+
         capacity = 2 * 1024 * 1024
         raw = bytes([0xa7]) * 512 + bytes(capacity - 512)
         base = root / "raw-source"
@@ -224,9 +251,83 @@ def orchestrate(broker, library, guest):
             writer = operation("writer", GRANT_KIND)
             call("BeginOperation", {"kind": GRANT_KIND}, **writer)
             call("ReserveWriterSet", {"heads": heads}, **writer)
-            require(command(source, "boot")["state"] == "attached", "writer was not attached")
+            pivot_control = root / "pivot.sock"
+            options = {"pivot_control": str(pivot_control)} if live_pivot else {}
+            require(command(source, "boot", **options)["state"] == "attached", "writer was not attached")
             call("FinishOperation", finish, **writer)
             await_guest(source, source_log, "BLOCK_FLUSHED_BOTH")
+
+            if live_pivot:
+                await_guest(source, source_log, "BLOCK_RUNNING tick=2")
+                hold_token = "ab" * 16
+                capture = "7 " + hold_token
+                require(native(pivot_control, "CAPTURE_PREPARE " + capture + " raw")["phase"] == "prepared",
+                        "source did not hold")
+                held_ticks = source_log.read_text(errors="replace").count("BLOCK_RUNNING")
+                pivot_scope = operation("writer", "live-pivot")
+                call("BeginOperation", {"kind": "writer_pivot"}, **pivot_scope)
+                pivot = {
+                    "operation_id": pivot_scope["operation_id"], "request_digest": pivot_scope["request_digest"],
+                    "previous_grant_revision": 2, "next_grant_id": "live-successor",
+                    "destinations": {head["volume_id"]: "next-" + head["head_resource_id"] for head in heads},
+                }
+                native(pivot_control, "CAPTURE_BLOCK_PIVOT " + capture + " " + json.dumps(
+                       dict(pivot, destinations={"volume-a": "only-one"})), expected="ERR EINVAL")
+                pivot_command = "CAPTURE_BLOCK_PIVOT " + capture + " " + json.dumps(pivot)
+                native(pivot_control, pivot_command, expected="ERR E_FENCE_UNPROVEN")
+                pending = call("QueryWriterPivot", **pivot_scope)
+                require(pending["state"] == "commit", pending)
+                native(pivot_control, "CAPTURE_FINISH " + capture + " CONTINUE", expected="ERR EBUSY")
+                require(source_log.read_text(errors="replace").count("BLOCK_RUNNING") == held_ticks,
+                        "a pending writer fence released the source")
+                print("HELD_SOURCE_BLOCKED_WHILE_OLD_FDS_SURVIVE", flush=True)
+                command(source, "close_writers")
+                service.terminate()
+                service.wait(10)
+                service, health = start_service()
+                session = {"broker_session_id": health["broker_session_id"]}
+                require(call("QueryWriterPivot", **pivot_scope) == pending, "durable decision changed over restart")
+                result = native(pivot_control, pivot_command)
+                require(result["state"] == "complete", result)
+                require(native(pivot_control, pivot_command) == result, "pivot receipt replay changed")
+                native(pivot_control, "CAPTURE_CANCEL " + capture, expected="ERR EBUSY")
+                print("HELD_KVM_RECONCILED_AND_PIVOTED_BOTH", flush=True)
+                captured = [
+                    root / "state/objects" / head["head_resource_id"] / "data"
+                    for head in heads
+                ]
+                before = [hashlib.sha256(path.read_bytes()).hexdigest() for path in captured]
+                require(native(pivot_control, "CAPTURE_FINISH " + capture + " CONTINUE")["source_disposition"] == "RUNNING",
+                        "source did not resume")
+                until(lambda: source_log.read_text(errors="replace").count("BLOCK_RUNNING") > held_ticks,
+                      source, "source writes on the new heads")
+                for head in heads:
+                    call("DropOwnerRef", {"owner_kind": "operation", "owner_id": pivot_scope["operation_id"],
+                         "resource_id": head["head_resource_id"], "expected_revision": 1}, **pivot_scope)
+                call("FinishOperation", finish, **pivot_scope)
+                require(call("CompleteRecovery", session)["state"] == "ready", "writer recovery did not settle")
+
+                branch_setup = operation("observer", "branch-setup", 0)
+                call("BeginOperation", {"kind": "catalog"}, **branch_setup)
+                branch = []
+                for head in heads:
+                    resource = "branch-" + head["head_resource_id"]
+                    volume = "branch-" + head["volume_id"]
+                    call("CreateVolumeHead", {"resource_id": resource, "volume_id": volume,
+                         "capacity_bytes": capacity, "backing_id": head["head_resource_id"]}, **branch_setup)
+                    branch.append({"head_resource_id": resource, "volume_id": volume})
+                call("FinishOperation", finish, **branch_setup)
+                observer, observer_log = launch("observer")
+                following = operation("observer", GRANT_KIND)
+                call("BeginOperation", {"kind": GRANT_KIND}, **following)
+                call("ReserveWriterSet", {"heads": branch}, **following)
+                require(command(observer, "boot")["state"] == "attached", "observer was not attached")
+                call("FinishOperation", finish, **following)
+                await_guest(observer, observer_log, "BLOCK_OBSERVED_BOTH")
+                require([hashlib.sha256(path.read_bytes()).hexdigest() for path in captured] == before,
+                        "source writes changed sealed KVM capture generations")
+                print("SOURCE_AND_BRANCH_SHARED_IMMUTABLE_CAPTURE", flush=True)
+                return
 
             service.terminate()
             service.wait(10)
@@ -311,5 +412,7 @@ if __name__ == "__main__":
         worker(*sys.argv[2:])
     elif len(sys.argv) == 4:
         orchestrate(*sys.argv[1:])
+    elif len(sys.argv) == 5 and sys.argv[1] == "--live-pivot":
+        orchestrate(*sys.argv[2:], live_pivot=True)
     else:
-        sys.exit(f"usage: {sys.argv[0]} RESOURCED LIBKRUN STATIC_GUEST")
+        sys.exit(f"usage: {sys.argv[0]} [--live-pivot] RESOURCED LIBKRUN STATIC_GUEST")

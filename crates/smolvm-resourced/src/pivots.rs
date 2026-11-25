@@ -493,6 +493,19 @@ pub fn query(catalog: &Catalog, request: &Request) -> Result<Value> {
         .receipt())
 }
 
+pub fn query_execution(
+    catalog: &Catalog,
+    request: &Request,
+    execution: &Execution,
+) -> Result<Value> {
+    let operation = catalog.matching_operation(request)?;
+    let pivot = catalog
+        .writer_pivot(&operation.operation_id)?
+        .ok_or_else(missing)?;
+    pivot.check_scope(execution)?;
+    Ok(pivot.receipt())
+}
+
 impl Catalog {
     fn finish_dead_pivot(&mut self, id: &str, committed: bool) -> Result<()> {
         let tx = self
