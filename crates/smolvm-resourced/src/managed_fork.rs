@@ -349,6 +349,7 @@ impl Job {
             .map(|(d, (g,v))| (d.to_string(), (g.to_string(),v.to_string())))
             .collect();
         escrow.import_native(c, &self.resource, &op, &source, &mut capture)?;
+        crate::activation_catalog::pin_source_tap(c, &self.resource, &source, self.network)?;
         let tx = c.db.unchecked_transaction()?;
         for root in roots {
             tx.execute(
@@ -698,10 +699,8 @@ pub(crate) fn activation_input(c: &Catalog, op: &Operation) -> Result<Value> {
         ))
     );
     let mut plan = json!({"capture_resource_id":spec.capture_id,"capture_anchor":spec.anchor,"profile_digest":profile_digest,"helper_digest":spec.helper_digest});
-    let taps:Option<(String,String,String)>=c.db.query_row("SELECT src.attachment_id,dst.attachment_id,json_extract(dst.descriptor_json,'$.gateway_ipv4') FROM managed_fork_batches b JOIN network_tap_leases src ON src.incarnation_id=b.source_incarnation JOIN network_tap_leases dst ON dst.operation_id=? WHERE b.operation_id=? AND src.state='attached' AND dst.state='attached'",
-        params![op.operation_id,spec.batch_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    if let Some((source, target, dns)) = taps {
-        plan["network"] = json!({"source_attachment_id":source,"target_attachment_id":target,"dns_ipv4":dns,"uplink_name":"eth0"})
+    if let Some(network)=crate::activation_catalog::captured_network_input(c,&spec.capture_id,op)? {
+        plan["network"]=network;
     }
     Ok(plan)
 }
