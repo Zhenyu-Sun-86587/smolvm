@@ -1,5 +1,5 @@
 use crate::ipc::{valid_id, Expected, Fault, Request, Result};
-use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -94,6 +94,7 @@ pub struct NewExecution<'a> {
     pub pid: i32,
     pub start: i64,
     pub uid: u32,
+    pub permit_digest: &'a str,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -111,7 +112,7 @@ pub struct WriterSet {
 }
 
 pub struct Catalog {
-    db: Connection,
+    pub(crate) db: Connection,
 }
 
 fn conflict(code: &'static str, message: &str) -> Fault {
@@ -192,7 +193,10 @@ fn resource_available(db: &Connection, id: &str) -> Result<()> {
 
 impl Catalog {
     pub fn open(path: &Path, boot_id: &str, session_id: &str) -> Result<Self> {
-        let mut db = Connection::open(path)?;
+        let mut db = Connection::open_with_flags(
+            path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         db.busy_timeout(std::time::Duration::from_secs(2))?;
         db.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;",
@@ -206,9 +210,14 @@ impl Catalog {
                     "INSERT INTO worker_state VALUES(1,?,?,0)",
                     [boot_id, session_id],
                 )?;
-                tx.execute_batch("PRAGMA user_version=1")?;
+                tx.execute_batch(include_str!("schema_escrow.sql"))?;
+                tx.execute_batch("PRAGMA user_version=2")?;
             }
-            1 => {
+            1 | 2 => {
+                if version == 1 {
+                    tx.execute_batch(include_str!("schema_escrow.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=2")?;
+                }
                 let old_boot: String =
                     tx.query_row("SELECT host_boot_id FROM worker_state", [], |r| r.get(0))?;
                 tx.execute(
@@ -226,6 +235,7 @@ impl Catalog {
                         [],
                     )?;
                 }
+                crate::escrow_catalog::recover(&tx, old_boot != boot_id)?;
             }
             _ => {
                 return Err(conflict(
@@ -246,7 +256,7 @@ impl Catalog {
         )?;
         Ok(json!({"state":if recovering {"recovering"} else {"ready"},
             "host_boot_id":boot, "broker_session_id":session,
-            "writer_authority_supported":false, "fd_transfer_supported":false}))
+            "writer_authority_supported":false, "fd_transfer_supported":true, "fd_transfer_mode":"sealed_memfd"}))
     }
 
     pub fn ready(&self) -> Result<()> {
@@ -269,7 +279,8 @@ impl Catalog {
         let outstanding: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM executions WHERE phase='unknown')
                 OR EXISTS (SELECT 1 FROM operations WHERE phase='NEW')
-                OR EXISTS (SELECT 1 FROM writer_reservations)",
+                OR EXISTS (SELECT 1 FROM writer_reservations)
+                OR EXISTS (SELECT 1 FROM fd_leases WHERE state='unknown')",
             [],
             |r| r.get(0),
         )?;
@@ -446,8 +457,10 @@ impl Catalog {
         let occupied: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM writer_reservations WHERE operation_id=?)
              OR (? AND EXISTS (SELECT 1 FROM executions WHERE last_operation_id=?))
-             OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='operation' AND owner_id=? AND state='active')",
-            params![id, abort, id, id], |r| r.get(0))?;
+             OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='operation' AND owner_id=? AND state='active')
+             OR EXISTS (SELECT 1 FROM fd_transfers WHERE operation_id=? AND state='staging')
+             OR EXISTS (SELECT 1 FROM fd_leases WHERE operation_id=? AND state='pending')",
+            params![id, abort, id, id, id, id], |r| r.get(0))?;
         if occupied {
             return Err(conflict(
                 "E_OPERATION_HAS_EFFECTS",
@@ -497,8 +510,18 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let process_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM executions WHERE host_boot_id=? AND pid=? AND pid_start_time=? AND phase!='exited')",
+            params![new.boot,new.pid,new.start], |row| row.get(0))?;
+        if process_exists {
+            return Err(conflict(
+                "E_IDEMPOTENCY_CONFLICT",
+                "process already belongs to an execution",
+            ));
+        }
         tx.execute(
-            "INSERT INTO executions VALUES(?,?,?,?,?,?,?,?,?,'registered',?)",
+            "INSERT INTO executions(incarnation_id,route_id,instance_id,execution_epoch,bundle_digest,host_boot_id,
+             pid,pid_start_time,uid,phase,last_operation_id,launch_permit_digest) VALUES(?,?,?,?,?,?,?,?,?,'registered',?,?)",
             params![
                 incarnation,
                 new.route,
@@ -509,7 +532,8 @@ impl Catalog {
                 new.pid,
                 new.start,
                 new.uid,
-                operation.operation_id
+                operation.operation_id,
+                new.permit_digest
             ],
         )?;
         tx.execute("UPDATE instance_bindings SET incarnation_id=?,execution_epoch=? WHERE route_id=? AND instance_id=?",
@@ -520,6 +544,20 @@ impl Catalog {
 
     pub fn execution(&self, id: &str) -> Result<Execution> {
         exec(&self.db, id)?.ok_or_else(|| not_found("execution"))
+    }
+
+    pub fn execution_by_permit(&self, id: &str, permit_digest: &str) -> Result<Option<Execution>> {
+        Ok(self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT {EXEC_COLUMNS} FROM executions
+            WHERE incarnation_id=? AND launch_permit_digest=?"
+                ),
+                [id, permit_digest],
+                execution_row,
+            )
+            .optional()?)
     }
 
     pub fn reconcile_execution(&self, id: &str) -> Result<Execution> {
@@ -554,6 +592,7 @@ impl Catalog {
             "UPDATE instance_bindings SET incarnation_id=NULL WHERE incarnation_id=?",
             [id],
         )?;
+        crate::escrow_catalog::release_execution(&tx, id)?;
         tx.commit()?;
         self.execution(id)
     }
@@ -601,15 +640,21 @@ impl Catalog {
     }
 
     pub fn resource(&self, id: &str) -> Result<Value> {
-        self.db.query_row("SELECT resource_id,kind,state,durability,immutable,descriptor_json,descriptor_digest,
-            created_by_operation,revision FROM resources WHERE resource_id=?", [id], |r| {
+        self.db.query_row("SELECT r.resource_id,r.kind,CASE WHEN f.state='missing' THEN 'missing' ELSE r.state END,
+            r.durability,r.immutable,r.descriptor_json,r.descriptor_digest,r.created_by_operation,r.revision,f.state
+            FROM resources r LEFT JOIN fd_transfers f ON f.resource_id=r.resource_id AND f.state!='staging'
+            WHERE r.resource_id=?", [id], |r| {
             let descriptor: String = r.get(5)?;
             let parsed: Value = serde_json::from_str(&descriptor)
                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?;
-            Ok(json!({"resource_id":r.get::<_,String>(0)?, "kind":r.get::<_,String>(1)?,
+            let mut record = json!({"resource_id":r.get::<_,String>(0)?, "kind":r.get::<_,String>(1)?,
                 "state":r.get::<_,String>(2)?, "durability":r.get::<_,String>(3)?, "immutable":r.get::<_,bool>(4)?,
                 "descriptor":parsed, "descriptor_digest":r.get::<_,String>(6)?,
-                "created_by_operation":r.get::<_,String>(7)?, "revision":r.get::<_,i64>(8)?}))
+                "created_by_operation":r.get::<_,String>(7)?, "revision":r.get::<_,i64>(8)?});
+            if let Some(state) = r.get::<_, Option<String>>(9)? {
+                record["fd_state"] = json!(state);
+            }
+            Ok(record)
         }).optional()?.ok_or_else(|| not_found("resource"))
     }
 
@@ -654,6 +699,11 @@ impl Catalog {
         }
         let op = self.active_operation(r)?;
         identifier(kind)?;
+        if kind == "fd_lease" {
+            return Err(Fault::invalid(
+                "descriptor lease roots are controlled by the escrow protocol",
+            ));
+        }
         identifier(owner)?;
         identifier(resource)?;
         if kind == "operation" && owner != op.operation_id {
@@ -708,7 +758,9 @@ impl Catalog {
             "WITH RECURSIVE closure(id) AS (
                SELECT resource_id FROM root_refs WHERE owner_kind=? AND owner_id=? AND state='active'
                UNION SELECT e.child_resource_id FROM resource_edges e JOIN closure c ON e.owner_resource_id=c.id)
-             SELECT r.resource_id,r.state FROM closure c JOIN resources r ON r.resource_id=c.id
+             SELECT r.resource_id,CASE WHEN f.state='missing' THEN 'missing' ELSE r.state END
+             FROM closure c JOIN resources r ON r.resource_id=c.id
+             LEFT JOIN fd_transfers f ON f.resource_id=r.resource_id AND f.state!='staging'
              ORDER BY r.resource_id LIMIT 513")?;
         let rows = statement
             .query_map([identifier(kind)?, identifier(id)?], |r| {
@@ -751,6 +803,7 @@ impl Catalog {
         )?;
         if collect {
             tx.execute("DELETE FROM resource_edges WHERE owner_resource_id=?", [id])?;
+            tx.execute("UPDATE fd_transfers SET state='collected' WHERE resource_id=? AND state='committed'", [id])?;
         }
         tx.commit()?;
         self.resource(id)

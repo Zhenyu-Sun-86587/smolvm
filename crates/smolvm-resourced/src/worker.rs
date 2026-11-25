@@ -1,4 +1,5 @@
 use crate::catalog::{Catalog, Execution, NewExecution, VolumeHead};
+use crate::escrow::Escrow;
 use crate::ipc::{self, valid_digest, valid_id, Expected, Fault, Request, Result, PROTOCOL};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
@@ -152,6 +153,25 @@ struct Worker {
     permits: HashMap<String, Permit>,
     executions: HashMap<String, OwnedFd>,
     reserved: HashMap<String, Vec<File>>,
+    escrow: Escrow,
+}
+
+struct Reply {
+    result: Value,
+    table: Vec<ipc::FdEntry>,
+    descriptors: Vec<OwnedFd>,
+    delivered: Option<(String, usize)>,
+}
+
+impl From<Value> for Reply {
+    fn from(result: Value) -> Self {
+        Self {
+            result,
+            table: Vec::new(),
+            descriptors: Vec::new(),
+            delivered: None,
+        }
+    }
 }
 
 fn idempotency_fault() -> Fault {
@@ -293,8 +313,69 @@ fn ofd_lock(file: &File) -> Result<()> {
 }
 
 impl Worker {
-    fn handle(&mut self, request: &Request, peer: libc::ucred) -> Result<Value> {
+    fn packet(
+        &mut self,
+        request: &Request,
+        peer: libc::ucred,
+        descriptors: Vec<OwnedFd>,
+    ) -> Result<Reply> {
         request.check()?;
+        if request.method != "RegisterGenerationBatch"
+            && (!descriptors.is_empty() || !request.fd_table.is_empty())
+        {
+            return Err(Fault::new(
+                "E_CAPABILITY_UNSUPPORTED",
+                "this method does not accept descriptors",
+            ));
+        }
+        let result = match request.method.as_str() {
+            "RegisterGenerationBegin"
+            | "RegisterGenerationBatch"
+            | "RegisterGenerationCommit"
+            | "AbortGenerationTransfer"
+            | "AcquireResourceLease"
+            | "AckAttached"
+            | "ReleaseResourceLease" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                match request.method.as_str() {
+                    "RegisterGenerationBegin" => {
+                        self.escrow.begin(&self.catalog, request, &execution)
+                    }
+                    "RegisterGenerationBatch" => {
+                        self.escrow
+                            .batch(&self.catalog, request, &execution, descriptors)
+                    }
+                    "RegisterGenerationCommit" => {
+                        self.escrow.commit(&mut self.catalog, request, &execution)
+                    }
+                    "AbortGenerationTransfer" => {
+                        self.escrow.abort(&self.catalog, request, &execution)
+                    }
+                    "AcquireResourceLease" => {
+                        let lease = self
+                            .escrow
+                            .acquire(&mut self.catalog, request, &execution)?;
+                        return Ok(Reply {
+                            result: lease.result,
+                            table: lease.fd_table,
+                            descriptors: lease.fds,
+                            delivered: Some(lease.delivered),
+                        });
+                    }
+                    _ => self.escrow.update_lease(
+                        &mut self.catalog,
+                        request,
+                        &execution,
+                        request.method == "ReleaseResourceLease",
+                    ),
+                }
+            }
+            _ => self.handle(request, peer),
+        }?;
+        Ok(result.into())
+    }
+
+    fn handle(&mut self, request: &Request, peer: libc::ucred) -> Result<Value> {
         match request.method.as_str() {
             "RegisterExecution" => return self.register_execution(request, peer),
             "ReconcileExecution" => return self.reconcile_execution(request, peer),
@@ -324,7 +405,7 @@ impl Worker {
                 let data: Begin = request.payload()?;
                 if !matches!(
                     data.kind.as_str(),
-                    "catalog" | "launch" | "writer_reservation"
+                    "catalog" | "launch" | "writer_reservation" | "generation" | "resource_lease"
                 ) {
                     return Err(Fault::new(
                         "E_CAPABILITY_UNSUPPORTED",
@@ -406,11 +487,14 @@ impl Worker {
             }
             "MarkResourceForGC" | "CollectResource" => {
                 let data: Gc = request.payload()?;
-                self.catalog.gc(
-                    &data.resource_id,
-                    data.expected_revision,
-                    request.method == "CollectResource",
-                )
+                let collect = request.method == "CollectResource";
+                let result = self
+                    .catalog
+                    .gc(&data.resource_id, data.expected_revision, collect)?;
+                if collect {
+                    self.escrow.collect(&data.resource_id);
+                }
+                Ok(result)
             }
             "RegisterVolumeHead" => {
                 self.catalog.ready()?;
@@ -491,6 +575,25 @@ impl Worker {
         let (route, bundle, expected) = r.scope()?;
         let op = self.catalog.matching_operation(r)?;
         let supplied: Token = r.payload()?;
+        let permit_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(supplied.launch_permit.as_bytes())
+        );
+        let id = expected
+            .incarnation_id
+            .as_deref()
+            .ok_or_else(stale_execution)?;
+        if let Some(execution) = self.catalog.execution_by_permit(id, &permit_digest)? {
+            if !execution.matches(route, bundle, expected)
+                || execution.last_operation_id != op.operation_id
+            {
+                return Err(stale_execution());
+            }
+            let execution = self.confirm_execution_identity(execution, peer)?;
+            return Ok(
+                json!({"execution":execution,"network_state":"closed","network_enforcement_observed":false}),
+            );
+        }
         let permit = self
             .permits
             .get(&supplied.launch_permit)
@@ -523,6 +626,7 @@ impl Worker {
                 pid: peer.pid,
                 start: permit.start,
                 uid: peer.uid,
+                permit_digest: &permit_digest,
             },
         )?;
         let permit = self
@@ -531,7 +635,9 @@ impl Worker {
             .expect("validated permit exists");
         self.executions
             .insert(execution.incarnation_id.clone(), permit.pidfd);
-        Ok(json!({"execution":execution,"network_state":"closed"}))
+        Ok(
+            json!({"execution":execution,"network_state":"closed","network_enforcement_observed":false}),
+        )
     }
 
     fn scoped_execution(&self, r: &Request) -> Result<Execution> {
@@ -547,8 +653,41 @@ impl Worker {
         Ok(execution)
     }
 
+    fn authenticated_execution(&self, request: &Request, peer: libc::ucred) -> Result<Execution> {
+        let execution = self.scoped_execution(request)?;
+        if execution.phase != "registered"
+            || execution.host_boot_id != self.boot
+            || execution.pid != peer.pid
+            || execution.uid != peer.uid
+        {
+            return Err(Fault::new(
+                "E_PERMISSION_DENIED",
+                "descriptor operation requires the recorded execution peer",
+            ));
+        }
+        let pidfd = self
+            .executions
+            .get(&execution.incarnation_id)
+            .ok_or_else(stale_execution)?;
+        verify_executable(
+            peer.pid,
+            execution.pid_start_time,
+            pidfd,
+            &self.catalog.bundle(&execution.bundle_digest)?,
+        )?;
+        Ok(execution)
+    }
+
     fn reconcile_execution(&mut self, r: &Request, peer: libc::ucred) -> Result<Value> {
         let execution = self.scoped_execution(r)?;
+        Ok(json!(self.confirm_execution_identity(execution, peer)?))
+    }
+
+    fn confirm_execution_identity(
+        &mut self,
+        execution: Execution,
+        peer: libc::ucred,
+    ) -> Result<Execution> {
         if execution.phase == "exited"
             || execution.host_boot_id != self.boot
             || execution.pid != peer.pid
@@ -570,7 +709,7 @@ impl Worker {
             .catalog
             .reconcile_execution(&execution.incarnation_id)?;
         self.executions.insert(execution.incarnation_id, pidfd);
-        Ok(json!(result))
+        Ok(result)
     }
 
     fn finalize_execution(&mut self, r: &Request) -> Result<Value> {
@@ -593,6 +732,7 @@ impl Worker {
         }
         let result = self.catalog.finalize_execution(&execution)?;
         self.executions.remove(&execution.incarnation_id);
+        self.escrow.forget_execution(&execution.incarnation_id);
         Ok(json!(result))
     }
 
@@ -717,13 +857,24 @@ fn process_lock(path: &Path) -> io::Result<File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "lock file is not a private broker file",
+        ));
+    }
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(file)
 }
 
-fn check_socket_path(path: &Path) -> io::Result<()> {
+fn check_socket_parent(path: &Path) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -738,8 +889,12 @@ fn check_socket_path(path: &Path) -> io::Result<()> {
             "socket parent must be broker-controlled",
         ));
     }
+    Ok(())
+}
+
+fn check_socket_path(path: &Path) -> io::Result<()> {
     if let Ok(existing) = fs::symlink_metadata(path) {
-        if !existing.file_type().is_socket() || existing.uid() != metadata.uid() {
+        if !existing.file_type().is_socket() || existing.uid() != unsafe { libc::geteuid() } {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "socket path has a foreign entry",
@@ -766,6 +921,14 @@ fn serve(
     socket_gid: Option<u32>,
     admin_uid: Option<u32>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    check_socket_parent(socket_path)?;
+    let address = SockAddr::unix(socket_path)?;
+    let control_path = socket_path.with_extension("resourced.lock");
+    if control_path == socket_path {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid socket filename").into());
+    }
+    let _socket_lock = process_lock(&control_path)?;
+    check_socket_path(socket_path)?;
     private_dir(state)?;
     let _catalog_lock = process_lock(&state.join("catalog.lock"))?;
     let objects = state.join("objects");
@@ -787,18 +950,13 @@ fn serve(
         permits: HashMap::new(),
         executions: HashMap::new(),
         reserved: HashMap::new(),
+        escrow: Escrow::default(),
     };
 
-    let control_path = socket_path.with_extension("resourced.lock");
-    if control_path == socket_path {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid socket filename").into());
-    }
-    let _socket_lock = process_lock(&control_path)?;
-    check_socket_path(socket_path)?;
     let socket = ipc::new_socket()?;
     // Restrict the initial filesystem socket before applying an optional group.
     let previous = unsafe { libc::umask(0o177) };
-    let bound = socket.bind(&SockAddr::unix(socket_path)?);
+    let bound = socket.bind(&address);
     unsafe { libc::umask(previous) };
     bound?;
     if let Some(gid) = socket_gid {
@@ -820,12 +978,30 @@ fn serve(
 fn serve_packet(worker: &mut Worker, socket: &Socket) -> io::Result<()> {
     let peer = ipc::peer(socket)?;
     ipc::set_timeout(socket)?;
-    let response = match ipc::receive(socket).and_then(|packet| {
-        serde_json::from_slice::<Request>(&packet).map_err(|e| Fault::invalid(e.to_string()))
+    let response = match ipc::receive_packet(socket).and_then(|packet| {
+        serde_json::from_slice::<Request>(&packet.body)
+            .map(|request| (request, packet.descriptors))
+            .map_err(|e| Fault::invalid(e.to_string()))
     }) {
-        Ok(request) => match worker.handle(&request, peer) {
-            Ok(result) => {
-                json!({"protocol":PROTOCOL,"request_id":request.request_id,"result":result})
+        Ok((request, descriptors)) => match worker.packet(&request, peer, descriptors) {
+            Ok(reply) => {
+                let mut message = json!({"protocol":PROTOCOL,"request_id":request.request_id,"result":reply.result});
+                if !reply.table.is_empty() {
+                    message["fd_table"] = json!(reply.table);
+                }
+                let serialized = message.to_string();
+                if serialized.len() <= ipc::MAX_PACKET {
+                    ipc::send_packet(socket, serialized.as_bytes(), &reply.descriptors)?;
+                    if let Some((id, count)) = reply.delivered {
+                        worker
+                            .catalog
+                            .delivered(&id, count)
+                            .map_err(io::Error::other)?;
+                    }
+                    return Ok(());
+                }
+                Fault::new("E_RESOURCE_LIMIT", "response exceeds transport limit")
+                    .response(Some(&request.request_id))
             }
             Err(error) => error.response(Some(&request.request_id)),
         },

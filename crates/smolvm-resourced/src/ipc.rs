@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::io;
@@ -9,7 +9,20 @@ use std::time::Duration;
 
 pub const PROTOCOL: &str = "WorkerResource/1";
 pub const MAX_PACKET: usize = 64 * 1024;
-const MAX_FDS: usize = 64;
+pub const MAX_FDS: usize = 64;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FdEntry {
+    pub index: usize,
+    pub resource_id: String,
+    pub role: String,
+}
+
+pub struct Packet {
+    pub body: Vec<u8>,
+    pub descriptors: Vec<OwnedFd>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -31,7 +44,7 @@ pub struct Request {
     pub bundle_digest: Option<String>,
     pub expected: Option<Expected>,
     #[serde(default)]
-    pub fd_table: Vec<Value>,
+    pub fd_table: Vec<FdEntry>,
     #[serde(default)]
     pub payload: Value,
 }
@@ -137,11 +150,12 @@ impl Request {
         }) {
             return Err(Fault::invalid("invalid execution epoch"));
         }
-        if !self.fd_table.is_empty() {
-            return Err(Fault::new(
-                "E_CAPABILITY_UNSUPPORTED",
-                "descriptor transfer is unavailable",
-            ));
+        if self.fd_table.len() > MAX_FDS
+            || self.fd_table.iter().enumerate().any(|(index, item)| {
+                item.index != index || !valid_id(&item.resource_id) || !valid_id(&item.role)
+            })
+        {
+            return Err(Fault::invalid("invalid descriptor table"));
         }
         Ok(())
     }
@@ -208,6 +222,17 @@ pub fn peer(socket: &Socket) -> io::Result<libc::ucred> {
 }
 
 pub fn receive(socket: &Socket) -> Result<Vec<u8>> {
+    let packet = receive_packet(socket)?;
+    if !packet.descriptors.is_empty() {
+        return Err(Fault::new(
+            "E_PROTOCOL_UNSUPPORTED",
+            "unexpected response descriptors",
+        ));
+    }
+    Ok(packet.body)
+}
+
+pub fn receive_packet(socket: &Socket) -> Result<Packet> {
     let mut packet = vec![0; MAX_PACKET];
     let mut body = libc::iovec {
         iov_base: packet.as_mut_ptr().cast(),
@@ -262,35 +287,55 @@ pub fn receive(socket: &Socket) -> Result<Vec<u8>> {
     if unknown {
         return Err(Fault::invalid("unknown ancillary data"));
     }
-    if !descriptors.is_empty() {
-        return Err(Fault::new(
-            "E_CAPABILITY_UNSUPPORTED",
-            "descriptor transfer is unavailable",
-        ));
-    }
     if count == 0 {
         return Err(Fault::invalid("empty request packet"));
     }
     packet.truncate(count as usize);
-    Ok(packet)
+    Ok(Packet {
+        body: packet,
+        descriptors,
+    })
 }
 
 pub fn send(socket: &Socket, bytes: &[u8]) -> io::Result<()> {
-    if bytes.is_empty() || bytes.len() > MAX_PACKET {
+    send_packet(socket, bytes, &[])
+}
+
+pub fn send_packet(socket: &Socket, bytes: &[u8], descriptors: &[OwnedFd]) -> io::Result<()> {
+    if bytes.is_empty() || bytes.len() > MAX_PACKET || descriptors.len() > MAX_FDS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "packet exceeds the transport limit",
         ));
     }
-    // A disconnect after a durable catalog commit must not terminate the daemon.
-    let written = unsafe {
-        libc::send(
-            socket.as_raw_fd(),
-            bytes.as_ptr().cast(),
-            bytes.len(),
-            libc::MSG_NOSIGNAL,
-        )
+    let mut body = libc::iovec {
+        iov_base: bytes.as_ptr().cast_mut().cast(),
+        iov_len: bytes.len(),
     };
+    let mut message: libc::msghdr = unsafe { zeroed() };
+    message.msg_iov = &mut body;
+    message.msg_iovlen = 1;
+    let space =
+        unsafe { libc::CMSG_SPACE((descriptors.len() * size_of::<libc::c_int>()) as u32) } as usize;
+    let mut control = vec![0usize; space.div_ceil(size_of::<usize>())];
+    if !descriptors.is_empty() {
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = space;
+        // Aligned, initialized storage has space for this one SCM_RIGHTS header and its fd array.
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len =
+                libc::CMSG_LEN((descriptors.len() * size_of::<libc::c_int>()) as u32) as usize;
+            let output = libc::CMSG_DATA(header).cast::<libc::c_int>();
+            for (index, fd) in descriptors.iter().enumerate() {
+                output.add(index).write(fd.as_raw_fd());
+            }
+        }
+    }
+    // A disconnect after a durable catalog commit must not terminate the daemon.
+    let written = unsafe { libc::sendmsg(socket.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
     if written < 0 {
         Err(io::Error::last_os_error())
     } else if written as usize != bytes.len() {

@@ -5,6 +5,10 @@ mod catalog;
 #[cfg(target_os = "linux")]
 pub mod client;
 #[cfg(target_os = "linux")]
+mod escrow;
+#[cfg(target_os = "linux")]
+mod escrow_catalog;
+#[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]
 mod worker;
