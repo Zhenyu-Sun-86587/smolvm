@@ -11,6 +11,8 @@ mod escrow_catalog;
 #[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]
+pub mod network;
+#[cfg(target_os = "linux")]
 mod worker;
 
 #[cfg(target_os = "linux")]
