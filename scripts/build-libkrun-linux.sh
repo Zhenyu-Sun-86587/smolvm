@@ -117,8 +117,10 @@ else
     # which lands in MAKEFLAGS as a bare `w`; the kernel's `$(MAKE) $(MAKEFLAGS)`
     # recipe then dies with "No rule to make target 'w'". -j scales the kernel build.
     if [[ "$VERIFIED_SOURCE" == "1" ]]; then
-        ( cd libkrunfw; make --no-print-directory -o "$SMOLVM_VERIFIED_KERNEL_TREE" -j"$BUILD_JOBS" \
-            CC=gcc GUESTARCH="$ARCH" )
+        # The wrapper has already checked the patched sources and selected
+        # .config. The firmware makefile's own config hook must not replace it.
+        ( cd libkrunfw; make --no-print-directory -o "$SMOLVM_VERIFIED_KERNEL_TREE" \
+            -o "$SMOLVM_VERIFIED_KERNEL_TREE/.config" -j"$BUILD_JOBS" CC=gcc GUESTARCH="$ARCH" )
     else
         ( cd libkrunfw; make clean >/dev/null 2>&1 || true; make -j"$BUILD_JOBS" GUESTARCH="$ARCH" )
     fi

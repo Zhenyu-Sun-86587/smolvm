@@ -154,6 +154,7 @@ prepare_kernel() (
 )
 
 prepare_kernel
+cp "$KERNEL_DIR/.config" "$WORK/verified-kernel.config"
 python3 - "$BUNDLE_TOOL" "$BUILD_LOCK" "$KERNEL_DIR/.config" <<'PY'
 import json
 from pathlib import Path
@@ -176,6 +177,7 @@ cmp -s "$SOURCE_ROOT/scripts/build-libkrun-linux.sh" "$SOURCES/scripts/build-lib
 GPU=0 SKIP_DEPS=1 SKIP_LIBKRUNFW=0 SMOLVM_VERIFIED_SOURCE_BUILD=1 \
     SMOLVM_VERIFIED_KERNEL_TREE="$KERNEL_NAME" SMOLVM_BUILD_JOBS="$JOBS" \
     "$SOURCES/scripts/build-libkrun-linux.sh"
+cmp -s "$WORK/verified-kernel.config" "$KERNEL_DIR/.config" || fail "kernel build changed the verified configuration"
 
 LIBS="$SOURCES/lib/linux-x86_64"
 "$SOURCES/scripts/check-libkrun-provenance.sh"
