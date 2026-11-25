@@ -4,6 +4,8 @@ pub use crate::ipc::Expected as ExecutionRef;
 use crate::ipc::{self, valid_digest, valid_id, PROTOCOL};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -93,7 +95,13 @@ impl Client<'_> {
                 json!({"kind":"launch"}),
             )
         };
-        match begin() {
+        self.recover_and_retry(begin)
+    }
+    fn recover_and_retry<T>(
+        &self,
+        perform: impl Fn() -> Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        match perform() {
             Err(e) if e.code == "E_RECOVERING" => {
                 let health: Value = self.call("Health", None, None, empty())?;
                 let session = health["broker_session_id"]
@@ -105,7 +113,7 @@ impl Client<'_> {
                     None,
                     json!({"broker_session_id":session}),
                 )?;
-                begin()
+                perform()
             }
             outcome => outcome,
         }
@@ -199,6 +207,22 @@ impl Client<'_> {
         id: Option<(&str, &str)>,
         payload: Value,
     ) -> Result<T, QueryError> {
+        let (result, table, fds) = self.exchange(method, expected, id, payload)?;
+        if !table.is_empty() || !fds.is_empty() {
+            return Err(fault(
+                "E_PROTOCOL_UNSUPPORTED",
+                "unexpected Worker descriptors",
+            ));
+        }
+        Ok(result)
+    }
+    fn exchange<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        expected: Option<&ExecutionRef>,
+        id: Option<(&str, &str)>,
+        payload: Value,
+    ) -> Result<(T, Vec<ipc::FdEntry>, Vec<OwnedFd>), QueryError> {
         if !self.socket.is_absolute() || !valid_digest(self.bundle) {
             return Err(fault(
                 "E_INVALID_REQUEST",
@@ -219,17 +243,16 @@ impl Client<'_> {
         }
         let transport = |e| fault("E_RESOURCED_UNAVAILABLE", e);
         let socket = ipc::connect(self.socket).map_err(transport)?;
-        // The broker hashes the complete running executable for enrollment.
-        // This one-shot client can wait for that proof on a busy host without
-        // increasing the server-side timeout for untrusted inbound packets.
-        if matches!(
-            method,
-            "IssueLaunchPermit" | "RegisterExecution" | "BindNativeControl"
-        ) {
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
-                .map_err(transport)?;
-        }
+        // A cold launch hashes immutable disk ancestors and the installed VMM.
+        // Only this authenticated client's response deadline is extended.
+        let seconds = if method == "AcquireManagedLaunchDisks" {
+            90
+        } else {
+            20
+        };
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(seconds)))
+            .map_err(transport)?;
         if ipc::peer(&socket).map_err(transport)?.uid != 0 {
             return Err(fault(
                 "E_PERMISSION_DENIED",
@@ -237,16 +260,19 @@ impl Client<'_> {
             ));
         }
         ipc::send(&socket, &bytes).map_err(transport)?;
-        let raw = ipc::receive(&socket).map_err(|e| fault(e.code, e.message))?;
+        let raw = ipc::receive_packet(&socket)
+            .map_err(|e| fault(e.code, format!("{method}: {}", e.message)))?;
         #[derive(Deserialize)]
         struct Answer<T> {
             protocol: String,
             request_id: Option<String>,
             result: Option<T>,
             error: Option<QueryError>,
+            #[serde(default)]
+            fd_table: Vec<ipc::FdEntry>,
         }
         let reply: Answer<T> =
-            serde_json::from_slice(&raw).map_err(|e| fault("E_PROTOCOL_UNSUPPORTED", e))?;
+            serde_json::from_slice(&raw.body).map_err(|e| fault("E_PROTOCOL_UNSUPPORTED", e))?;
         if reply.protocol != PROTOCOL || reply.request_id.as_deref() != Some(method) {
             return Err(fault(
                 "E_PROTOCOL_UNSUPPORTED",
@@ -254,10 +280,129 @@ impl Client<'_> {
             ));
         }
         match (reply.result, reply.error) {
-            (Some(result), None) => Ok(result),
+            (Some(result), None)
+                if reply.fd_table.len() == raw.descriptors.len()
+                    && reply
+                        .fd_table
+                        .iter()
+                        .enumerate()
+                        .all(|(i, e)| i == e.index && valid_id(&e.resource_id)) =>
+            {
+                Ok((result, reply.fd_table, raw.descriptors))
+            }
             (None, Some(error)) => Err(error),
             _ => Err(fault("E_PROTOCOL_UNSUPPORTED", "invalid Worker result")),
         }
+    }
+    pub fn managed_submit(&self, input: &Submission) -> Result<OperationReceipt, QueryError> {
+        self.recover_and_retry(|| {
+            self.receipt(
+                "SubmitManagedLaunch",
+                &input.operation_id,
+                &input.request_digest,
+                &input.expected,
+                input.parameters.clone(),
+            )
+        })
+    }
+    pub fn managed_pending(&self, serve: &str) -> Result<Vec<crate::managed::Plan>, QueryError> {
+        self.call(
+            "PendingManagedLaunches",
+            None,
+            None,
+            json!({"serve_instance":serve}),
+        )
+    }
+    pub fn managed_disks(
+        &self,
+        plan: &crate::managed::Plan,
+    ) -> Result<(Vec<crate::managed::DiskSet>, BTreeMap<String, OwnedFd>), QueryError> {
+        #[derive(Deserialize)]
+        struct Disks {
+            devices: Vec<crate::managed::DiskSet>,
+            incarnation_id: String,
+            execution_epoch: i64,
+            grant: Option<Value>,
+        }
+        let launch = &plan.launch;
+        let (packet, table, fds): (Disks, _, _) = self.exchange(
+            "AcquireManagedLaunchDisks",
+            Some(&launch.execution),
+            Some((&launch.operation_id, &launch.request_digest)),
+            empty(),
+        )?;
+        let protocol = || {
+            fault(
+                "E_PROTOCOL_UNSUPPORTED",
+                "received a different managed disk set",
+            )
+        };
+        if Some(&packet.incarnation_id) != launch.execution.incarnation_id.as_ref()
+            || packet.execution_epoch != launch.execution.execution_epoch
+            || !packet
+                .devices
+                .iter()
+                .map(|set| &set.device)
+                .eq(plan.devices.iter())
+        {
+            return Err(protocol());
+        }
+        let writes = plan
+            .devices
+            .iter()
+            .filter_map(|d| d.head_id.as_deref())
+            .collect::<std::collections::HashSet<_>>();
+        if writes.is_empty() != packet.grant.is_none()
+            || packet.grant.as_ref().is_some_and(|g| {
+                g["grant_id"] != plan.grant_id
+                    || g["incarnation_id"] != packet.incarnation_id
+                    || g["execution_epoch"] != packet.execution_epoch
+                    || g["state"] != "offered"
+            })
+        {
+            return Err(protocol());
+        }
+        let required: std::collections::HashSet<_> = packet
+            .devices
+            .iter()
+            .flat_map(|d| d.layers.iter().map(|l| l.spec.resource_id.as_str()))
+            .collect();
+        let mut files = BTreeMap::new();
+        for (entry, fd) in table.into_iter().zip(fds) {
+            let role = if writes.contains(entry.resource_id.as_str()) {
+                "block_writer"
+            } else {
+                "block_ancestor"
+            };
+            if entry.role != role
+                || !required.contains(entry.resource_id.as_str())
+                || files.insert(entry.resource_id, fd).is_some()
+            {
+                return Err(protocol());
+            }
+        }
+        if files.len() != required.len() {
+            return Err(protocol());
+        }
+        Ok((packet.devices, files))
+    }
+    pub fn ack_managed_disks(&self, launch: &Launch) -> Result<(), QueryError> {
+        let result: Value = self.call(
+            "AckManagedLaunchDisks",
+            Some(&launch.execution),
+            Some((&launch.operation_id, &launch.request_digest)),
+            empty(),
+        )?;
+        if result["disks_attached"] != true
+            || result["incarnation_id"].as_str() != launch.execution.incarnation_id.as_deref()
+            || result["execution_epoch"] != launch.execution.execution_epoch
+        {
+            return Err(fault(
+                "E_PROTOCOL_UNSUPPORTED",
+                "incorrect disk acknowledgement",
+            ));
+        }
+        Ok(())
     }
     pub fn binding(&self, instance: &str) -> Result<Binding, QueryError> {
         let r: Binding = self.call(

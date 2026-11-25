@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Boot a Worker-owned three-disk KVM through the installed private Serve."""
+
+import argparse
+import array
+import base64
+from contextlib import ExitStack, suppress
+import grp
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import struct
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import shutil
+
+from test_deep_native_standby import EXT, http, until, worker_ready
+
+RESOURCES = Path(__file__).resolve().parents[1] / "crates/smolvm-resourced/tests"
+module = importlib.util.spec_from_file_location("worker_resource", RESOURCES / "kvm-generation.py")
+worker_resource = importlib.util.module_from_spec(module)
+module.loader.exec_module(worker_resource)
+rpc = worker_resource.rpc
+
+
+def digest(data):
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def verify(bundle, root, guest, system_image):
+    for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
+        (root / name).mkdir(mode=0o755)
+    subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
+    subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
+    staged = root / "bundle"
+    shutil.copytree(bundle, staged, symlinks=True)
+    bundle = staged
+    Path("/run/smolvm-custom").mkdir(exist_ok=True)
+    subprocess.run(["mount","--bind",root/"local-run","/run/smolvm-custom"],check=True)
+    tree = root / "root-tree"
+    for name in ("sbin", "dev", "etc", "proc", "sys", "tmp", "run"):
+        (tree / name).mkdir()
+    if guest:
+        shutil.copy2(guest, tree / "counter")
+    else:
+        subprocess.run(["cc", "-static", "-Os", RESOURCES / "kvm-parked-block-guest.c", "-o", tree / "counter"], check=True)
+    shutil.copy2(bundle / "guest/identity-helper", tree / "sbin/smolvm-identity-helper")
+    root_disk = root / "root.ext4"
+    data_disk = root / "data.raw"
+    for path, size in ((root_disk, 32 << 20), (data_disk, 8 << 20)):
+        with path.open("wb") as f:
+            f.truncate(size)
+    subprocess.run(["mke2fs", "-q", "-t", "ext4", "-d", tree, root_disk], check=True)
+    if system_image:
+        root_disk=system_image
+    worker = root / "ipc/worker.sock"
+    endpoint = root / "api/s.sock"
+    binary = bundle / "smolvm-bin"
+    env = {**os.environ, "HOME": str(root / "home"), "SMOLVM_LIB_DIR": str(bundle / "lib"),
+           "LD_LIBRARY_PATH": str(bundle / "lib")}
+    with ExitStack() as stack:
+        def spawn(command, log):
+            file = stack.enter_context((root / log).open("ab"))
+            proc = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=file, stderr=file)
+            def stop():
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+            stack.callback(stop)
+            return proc
+
+        broker = spawn([bundle / "smolvm-resourced", "serve", "--socket", worker, "--state-dir", root / "catalog",
+                        "--socket-gid", str(grp.getgrnam("kvm").gr_gid)], "worker.log")
+        until(lambda: worker_ready(worker))
+        serve_command = [binary, "--state-dir", root / "state", "serve", "start", "--listen", f"unix://{endpoint}",
+                         "--worker-resource-socket", worker, "--guest-rollout-port", "37226", "--shutdown-grace", "0"]
+        serve = spawn(serve_command, "serve.log")
+        handshake = until(lambda: http(endpoint, EXT + "/capabilities"))
+        name = "test-managed"
+        def binding():
+            return http(endpoint, f"{EXT}/machines/{name}/binding")
+        before = binding()
+        assert before["execution_epoch"] == 0 and before["incarnation_id"] is None
+        bundle_id = handshake["bundle_digest"]
+        setup = dict(route_id="deep", bundle_digest=bundle_id, operation_id="catalog-import",
+                     request_digest=digest(b"import"), expected=dict(instance_id="import", incarnation_id=None, execution_epoch=0))
+        rpc(worker, "BeginOperation", {"kind": "catalog"}, **setup)
+        for ident, file in (("base-ext4", root_disk), ("empty-data", data_disk)):
+            with file.open("rb") as source:
+                h=hashlib.sha256()
+                for chunk in iter(lambda:source.read(1<<20),b""):h.update(chunk)
+                source.seek(0)
+                payload=dict(protocol="WorkerResource/1",method="ImportImmutableBlock",request_id="import-block",
+                    payload=dict(resource_id=ident,capacity_bytes=file.stat().st_size,content_sha256="sha256:"+h.hexdigest()),
+                    fd_table=[dict(index=0,resource_id=ident,role="block_import")],**setup)
+                with socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET) as conn:
+                    conn.settimeout(240)
+                    conn.connect(str(worker))
+                    conn.sendmsg([json.dumps(payload).encode()],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array("i",[source.fileno()]))])
+                    result=json.loads(conn.recv(65536))
+                    assert "result" in result,result
+        rpc(worker, "FinishOperation", dict(abort=False, expected_revision=1), **setup)
+        disks = [dict(attachment_id="attach-"+role,device_id=role,role=role,generation_id=generation,read_only=readonly)
+                 for role, generation, readonly in (("root","base-ext4",not system_image),("storage","empty-data",False),("data","empty-data",False))]
+        parameters = dict(name=name,boot_profile="oci-v1",cpus=2,memory_mib=512,disks=disks,init="/counter",args=[])
+        if system_image:parameters.update(boot_profile="system-debian-v1",init="/sbin/init",args=["--unit=multi-user.target","--log-target=console"])
+        submit = dict(operation_id="launch-managed", request_digest=digest(json.dumps(parameters).encode()),
+                      expected={k: before[k] for k in ("instance_id","incarnation_id","execution_epoch")},kind="launch",parameters=parameters)
+        limits=rpc(worker,"QueryWorkerBudget")
+        assert limits["allocated"]=={"vcpus":0,"memory_mib":0,"storage_bytes":0}
+        expensive={**submit,"operation_id":"too-large","parameters":{**parameters,"memory_mib":4294967295}}
+        try:http(endpoint,EXT+"/operations",expensive)
+        except RuntimeError as error:assert "E_RESOURCE_LIMIT" in str(error)
+        else:raise AssertionError("over-budget launch admitted")
+        assert rpc(worker,"QueryWorkerBudget")["allocated"]==limits["allocated"]
+        original = http(endpoint, EXT+"/operations",submit)
+        assert original["phase"] == "NEW"
+        def final():
+            try:
+                v = http(endpoint, EXT+"/operations/launch-managed")
+            except RuntimeError as err:
+                if "E_RESOURCED_UNAVAILABLE" in str(err):return None
+                raise
+            if v["phase"]=="ABORTED":
+                raise RuntimeError(v)
+            return v if v["phase"]=="COMPLETED" else None
+        def cleanup_vm():
+            for dbfile in (root/"catalog").glob("*.sqlite*"):
+                if dbfile.suffix not in (".sqlite",".sqlite3"):continue
+                with suppress(Exception),sqlite3.connect(dbfile) as db:
+                    for pid, start in db.execute("select pid,pid_start_time from executions"):
+                        pidfd = os.pidfd_open(pid)
+                        try:
+                            actual=int(Path(f"/proc/{pid}/stat").read_text().rsplit(")",1)[1].split()[19])
+                            if actual==start: signal.pidfd_send_signal(pidfd,signal.SIGKILL)
+                        finally:
+                            os.close(pidfd)
+        stack.callback(cleanup_vm)
+        op = until(final,55)
+        ref = http(endpoint,f"{EXT}/machines/{name}/execution")
+        assert op["execution"]==ref and ref["execution_epoch"]==1
+        assert http(endpoint, EXT+"/operations",submit)==op
+        changed={**submit,"parameters":{**parameters,"memory_mib":768}}
+        try: http(endpoint, EXT+"/operations",changed)
+        except RuntimeError as err: assert "E_IDEMPOTENCY_CONFLICT" in str(err)
+        else: raise AssertionError("mutated launch intent was accepted")
+        inventory_url=f"{EXT}/instances/{ref['instance_id']}/inventory"
+        record=http(endpoint, inventory_url)
+        assert record["execution"]["uid"]>0
+        heads=[d for d in record["inventory"]["devices"] if d.get("block")]
+        assert len(heads)==3, heads
+        logs=root/"state/managed"
+        def guest_log():
+            return next(logs.glob("*.log")).read_text(errors="replace")
+        if system_image:
+            agent=Path("/run/smolvm-custom/managed")/handshake["runtime_instance_id"]/ref["incarnation_id"]/"agent.sock"
+            def system_pid():
+                message=json.dumps({"method":"vm_exec","command":["/bin/cat","/proc/1/comm"]}).encode()
+                try:
+                    with socket.socket(socket.AF_UNIX) as conn:
+                        conn.settimeout(1)
+                        conn.connect(str(agent))
+                        conn.sendall(struct.pack(">I",len(message))+message)
+                        with conn.makefile("rb") as payload:
+                            length=struct.unpack(">I",payload.read(4))[0]
+                            response=json.loads(payload.read(length))
+                            return base64.b64decode(response.get("stdout",""))==b"systemd\n"
+                except (OSError,struct.error,ValueError):
+                    return False
+            until(system_pid,90)
+            print("The managed Debian Guest Agent reported systemd as PID 1 over its incarnation-scoped socket.",flush=True)
+        else:
+            until(lambda:"PARKED_BLOCK_TICK " in guest_log(),20)
+        serve.kill()
+        serve.wait()
+        serve=spawn(serve_command,"serve.log")
+        until(lambda:http(endpoint,EXT+"/capabilities"))
+        assert http(endpoint,EXT+"/operations",submit)==op and http(endpoint,inventory_url)["execution"]==record["execution"]
+        assert rpc(worker,"QueryWorkerBudget")["allocated"]["vcpus"]==2
+        if not system_image:
+            old=record["execution"]
+            fd=os.pidfd_open(old["pid"])
+            try:signal.pidfd_send_signal(fd,signal.SIGKILL)
+            finally:os.close(fd)
+            prior=until(lambda:(v if (v:=binding())["incarnation_id"] is None else None),20)
+            assert prior["execution_epoch"]==1
+            assert rpc(worker,"QueryWorkerBudget")["allocated"]==limits["allocated"]
+            restarted={**submit,"operation_id":"restart-managed","request_digest":digest(b"restart"),
+                       "expected":{k:prior[k] for k in ("instance_id","incarnation_id","execution_epoch")}}
+            http(endpoint,EXT+"/operations",restarted)
+            def second():
+                value=http(endpoint,EXT+"/operations/restart-managed")
+                assert value["phase"]!="ABORTED",value
+                return value if value["phase"]=="COMPLETED" else None
+            second_ref=until(second,55)["execution"]
+            assert second_ref["execution_epoch"]==2 and second_ref["incarnation_id"]!=ref["incarnation_id"]
+            new=http(endpoint,inventory_url)
+            old_blocks=[d["block"]["managed_attachment"] for d in heads]
+            new_blocks=[d["block"]["managed_attachment"] for d in new["inventory"]["devices"] if d.get("block")]
+            for x,y in zip(old_blocks,new_blocks,strict=True):
+                assert (x["volume_id"],x["writable_head_id"])==(y["volume_id"],y["writable_head_id"])
+            print("Fenced exit released the budget; a new epoch reopened the same independent writable heads.",flush=True)
+        print(f"Managed launch {ref['incarnation_id']} on real KVM, UID {record['execution']['uid']}, three block attachments and two writers; private Serve restart and exact replay passed.", flush=True)
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bundle",type=Path,required=True)
+    parser.add_argument("--guest",type=Path,help="prebuilt static kvm-parked-block-guest test binary")
+    parser.add_argument("--system-image",type=Path,help="managed Debian ext4 image containing the systemd Guest Agent service")
+    args=parser.parse_args()
+    if os.geteuid()!=0:parser.error("requires root, KVM and systemd")
+    if not os.environ.get("SMOLVM_MANAGED_TEST_ISOLATED"):
+        os.execvpe("unshare",["unshare","--mount","--propagation","private","--net","--",sys.executable,__file__,
+                             "--bundle",str(args.bundle.resolve()),*(["--guest",str(args.guest.resolve())] if args.guest else []),*(["--system-image",str(args.system_image.resolve())] if args.system_image else [])],{**os.environ,"SMOLVM_MANAGED_TEST_ISOLATED":"1"})
+    with tempfile.TemporaryDirectory(dir="/var/tmp",prefix="smm-") as tmp:
+        root=Path(tmp)
+        root.chmod(0o755)
+        try: verify(args.bundle.resolve(),root,args.guest,args.system_image)
+        except BaseException:
+            for log in [root/"serve.log",root/"worker.log",*(root/"state/managed").glob("*.log")]:
+                if log.exists():print(f"{log.name}\n{log.read_text(errors='replace')[-7000:]}",file=sys.stderr)
+            raise
+
+
+if __name__=="__main__":main()

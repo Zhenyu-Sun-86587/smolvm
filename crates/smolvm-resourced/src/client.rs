@@ -59,6 +59,11 @@ pub fn query_operation(
     let transport =
         |error: std::io::Error| QueryError::new("E_RESOURCED_UNAVAILABLE", error.to_string());
     let socket = ipc::connect(socket_path).map_err(transport)?;
+    // One Worker serializes catalog mutations and executable measurement. A
+    // read can legitimately queue behind a VMM registration or a disk import.
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .map_err(transport)?;
     ipc::send(&socket, request.to_string().as_bytes()).map_err(transport)?;
     let bytes = ipc::receive(&socket).map_err(|e| {
         let code = if e.code == "E_TRANSPORT" {

@@ -16,6 +16,10 @@ pub struct Capability {
     pub status: String,
     pub supported: bool,
     pub reason_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_profile: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,7 +77,7 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
         protocols.insert(name.to_owned(), 1);
     }
     protocols.insert("RuntimeBundle".to_owned(), 1);
-    let capabilities = [
+    let mut capabilities: BTreeMap<String, Capability> = [
         "lifecycle.standby",
         "state.live_fork",
         "state.independent_fork",
@@ -99,10 +103,31 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
                 status: "unknown".into(),
                 supported: false,
                 reason_code: "CAPABILITY_NOT_VERIFIED".into(),
+                contract_version: None,
+                verified_profile: None,
             },
         )
     })
     .collect();
+    if contracts["managed_block_launch"].as_u64() == Some(1)
+        && manifest["guest"]["boot_profiles"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|v| v == "system-debian-v1"))
+        && artifacts
+            .iter()
+            .any(|a| a["path"] == "guest/identity-helper")
+    {
+        capabilities.insert(
+            "boot.system".into(),
+            Capability {
+                status: "supported".into(),
+                supported: true,
+                reason_code: String::new(),
+                contract_version: Some(1),
+                verified_profile: Some("system-debian-v1".into()),
+            },
+        );
+    }
     Ok(Handshake {
         schema: "runtime-ext/v1".into(),
         route_id: "deep".into(),

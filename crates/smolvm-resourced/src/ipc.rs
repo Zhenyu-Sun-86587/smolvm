@@ -110,6 +110,20 @@ pub fn valid_digest(value: &str) -> bool {
 }
 
 impl Request {
+    pub(crate) fn derived(&self, method: &str, payload: Value) -> Self {
+        Self {
+            protocol: self.protocol.clone(),
+            method: method.into(),
+            request_id: self.request_id.clone(),
+            operation_id: self.operation_id.clone(),
+            request_digest: self.request_digest.clone(),
+            route_id: self.route_id.clone(),
+            bundle_digest: self.bundle_digest.clone(),
+            expected: self.expected.clone(),
+            fd_table: vec![],
+            payload,
+        }
+    }
     pub fn check(&self) -> Result<()> {
         if self.protocol != PROTOCOL {
             return Err(Fault::new(

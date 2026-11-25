@@ -315,7 +315,13 @@ pub fn create(
         ));
     }
     let operation = catalog.active_operation(request)?;
-    if operation.kind != "catalog" {
+    if operation.kind != "catalog"
+        && (importing
+            || crate::managed::plan(catalog, &operation)?
+                .and_then(|p| p.head_spec(&spec.resource_id))
+                .as_ref()
+                != Some(&spec))
+    {
         return Err(Fault::invalid(
             "managed block creation requires a catalog operation",
         ));
