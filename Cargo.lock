@@ -4364,6 +4364,7 @@ dependencies = [
  "smolvm-paths",
  "smolvm-protocol",
  "smolvm-registry",
+ "smolvm-resourced",
  "smolvm-runtime-protocol",
  "smolvm-tar",
  "socket2",

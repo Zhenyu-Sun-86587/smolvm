@@ -57,6 +57,8 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use self::error::ApiError;
+#[cfg(target_os = "linux")]
+pub use crate::runtime_ext::worker_operations_router;
 use state::ApiState;
 
 /// OpenAPI documentation for the smolvm API.
