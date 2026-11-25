@@ -1,0 +1,49 @@
+name: Inspect deep runtime upstream changes
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_commit:
+        description: Full smol-machines/smolvm candidate commit ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Inspect the pinned candidate and submodule trees
+        env:
+          UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$UPSTREAM_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          upstream=https://github.com/smol-machines
+          git fetch --no-tags --no-recurse-submodules "$upstream/smolvm.git" "$UPSTREAM_COMMIT"
+          for library in libkrun libkrunfw; do
+            pinned=$(git rev-parse "$UPSTREAM_COMMIT:$library")
+            [[ "$pinned" =~ ^[0-9a-f]{40}$ ]]
+            git -C "$library" fetch --no-tags "$upstream/$library.git" "$pinned"
+            git -C "$library" fetch --no-tags "$upstream/$library.git" HEAD
+            git -C "$library" rev-parse FETCH_HEAD > "${RUNNER_TEMP}/$library-tip"
+          done
+          python3 scripts/deep/upstream-sync.py --smolvm . \
+            --downstream "$(git rev-parse HEAD)" --upstream "$UPSTREAM_COMMIT" \
+            --libkrun-tip "$(cat "${RUNNER_TEMP}/libkrun-tip")" \
+            --libkrunfw-tip "$(cat "${RUNNER_TEMP}/libkrunfw-tip")" > "${RUNNER_TEMP}/deep-upstream-report.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deep-upstream-report
+          path: ${{ runner.temp }}/deep-upstream-report.json
+          if-no-files-found: error
