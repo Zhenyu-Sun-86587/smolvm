@@ -18,7 +18,10 @@ use std::{
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Input {
+    #[serde(default)]
     pub children: Vec<String>,
+    pub capture_id: Option<String>,
+    pub mode: Option<String>,
 }
 fn conflict(reason: impl ToString) -> Fault {
     Fault::new("E_STATE_CONFLICT", reason.to_string())
@@ -74,28 +77,46 @@ pub(crate) fn submit(
     let (id, _) = r.operation()?;
     let (route, bundle, expected) = r.scope()?;
     let unique: HashSet<_> = input.children.iter().collect();
-    if !matches!(kind, "independent_fork" | "fork_batch")
-        || input.children.is_empty()
-        || input.children.len() > 32
-        || kind == "independent_fork" && input.children.len() != 1
-        || unique.len() != input.children.len()
-        || input.children.iter().any(|n| !valid_id(n) || n.len() > 63)
-    {
-        return Err(invalid("invalid child names or batch size"));
+    let fork = matches!(kind,"independent_fork"|"fork_batch");
+    let rollback = kind == "vm_rollback";
+    if fork {
+        if input.children.is_empty() || input.children.len()>32
+            || (kind=="independent_fork" && input.children.len()!=1)
+            || unique.len()!=input.children.len() || input.children.iter().any(|n| !valid_id(n)|| n.len()>63)
+            || input.capture_id.is_some() || input.mode.is_some() {
+            return Err(invalid("invalid fork parameters or child set"));
+        }
+    } else if !matches!(kind,"vm_snapshot"|"hibernate"|"vm_rollback")
+        || !input.children.is_empty() || input.capture_id.as_deref().is_some_and(|id|!valid_id(id))
+        || rollback && input.capture_id.is_none() || !rollback && input.mode.is_some()
+        || input.mode.as_deref().is_some_and(|m| !matches!(m,"exact"|"clone_conflicts")) {
+        return Err(invalid("invalid StatePoint operation parameters"));
     }
     let names = serde_json::to_string(&input.children).map_err(invalid)?;
-    if let Some(prior) =
-        c.db.query_row(
-            "SELECT children FROM managed_fork_batches WHERE operation_id=?",
-            [id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        if names != prior {
-            return Err(Fault::new("E_IDEMPOTENCY_CONFLICT", "child set changed"));
+    let capture = if fork {key(id,"ram",0)} else if rollback {key(id,"rescue",0)}
+        else {input.capture_id.clone().unwrap_or_else(||key(id,"point",0))};
+    let target = if rollback {input.capture_id.as_deref()} else {None};
+    let mode = if rollback {Some(input.mode.as_deref().unwrap_or("clone_conflicts"))} else {None};
+    if let Some(prior) = c.db.query_row(
+        "SELECT children,capture_id,restore_capture_id,volume_restore_policy FROM managed_fork_batches WHERE operation_id=?",
+        [id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?)) ).optional()? {
+        if prior.0!=names || prior.1!=capture || prior.2.as_deref()!=target || prior.3.as_deref()!=mode {
+            return Err(Fault::new("E_IDEMPOTENCY_CONFLICT","capture parameters changed"));
         }
-        return c.begin(r, kind);
+        return c.begin(r,kind);
+    }
+    if route!="deep" {return Err(invalid("managed capture requires the deep route"))}
+    if !fork && (c.statepoint(&capture)?.is_some() || c.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_fork_batches WHERE capture_id=?)",[&capture],|r|r.get::<_,bool>(0))?) {
+        return Err(conflict("capture ID is already allocated"));
+    }
+    if let Some(target)=target {
+        let record=c.require_statepoint(target)?;
+        let original=c.operation(&record.operation_id)?;
+        if original.instance_id!=expected.instance_id || original.bundle_digest!=bundle || original.route_id!=route
+            || record.phase!="durable" || record.export.purpose!=Purpose::Checkpoint {
+            return Err(conflict("rollback requires a durable checkpoint of this instance and bundle"));
+        }
     }
     let incarnation = expected
         .incarnation_id
@@ -108,7 +129,7 @@ pub(crate) fn submit(
     {
         return Err(Fault::new("E_STALE_EXECUTION", "fork source changed"));
     }
-    crate::product_volumes::require_capture_policy(c, &source, true)?;
+    crate::product_volumes::require_capture_policy(c, &source, fork)?;
     let start = c.operation(&source.last_operation_id)?;
     let template = crate::managed::plan(c, &start)?.ok_or_else(|| {
         Fault::new(
@@ -176,7 +197,7 @@ pub(crate) fn submit(
         Ok(json!({"operation_id":id,"request_digest":r.operation()?.1,"previous_grant_revision":previous.revision,"next_grant_id":key(id,"grant",0),"destinations":dest}).to_string())
     }).transpose()?;
     let network = inv.devices.iter().any(|dev| dev["virtio_type"] == 1);
-    let initial = if inv.source_disposition == "STANDBY" {
+    let initial = if rollback { "restore_preflight" } else if inv.source_disposition == "STANDBY" {
         "holding"
     } else {
         "arming"
@@ -193,8 +214,8 @@ pub(crate) fn submit(
         storage_bytes: storage,
     };
     c.begin_with(r,kind,|tx|{
-        tx.execute("INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,session,token,anchor,network_gate,original,stage,pivot_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![id,incarnation,namespace,key(id,"ram",0),template_bytes,names,session,token,anchor,network,inv.source_disposition,initial,pivot])?;
+        tx.execute("INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,session,token,anchor,network_gate,original,stage,pivot_json,restore_capture_id,volume_restore_policy) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![id,incarnation,namespace,capture,template_bytes,names,session,token,anchor,network,inv.source_disposition,initial,pivot,target,mode])?;
         for (i,name) in input.children.iter().enumerate(){
             let instance=machine_id(&namespace,name);
             let present:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM instance_bindings WHERE route_id=? AND instance_id=?)",params![route,instance],|r|r.get(0))?;
@@ -249,7 +270,7 @@ pub(crate) fn retry(c: &mut Catalog, r: &Request, control: Control) -> Result<Op
             WHERE ch.batch_id=? AND ch.cancelled=0 AND o.phase='ABORTED' AND h.state='released'
               AND b.incarnation_id IS NULL AND b.active_operation_id IS NULL")?;
         let rows=stmt.query_map([id],|row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,
-            row.get::<_,String>(2)?,row.get::<_,i64>(3)?,Capacity { vcpus:row.get(4)?,memory_mib:row.get(5)?,storage_bytes:row.get(6)? })))?
+            row.get::<_,String>(2)?,row.get::<_,i64>(3)?,Capacity { vcpus:row.get::<_,i64>(4)? as u64,memory_mib:row.get::<_,i64>(5)? as u64,storage_bytes:row.get::<_,i64>(6)? as u64 })))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
@@ -301,6 +322,7 @@ struct Job {
     anchor: String,
     stage: String,
     original: String,
+    kind: String,
     network: bool,
     pivot: Option<String>,
 }
@@ -403,7 +425,9 @@ impl Actor {
             }
         }
         let jobs = {
-            let mut q=c.db.prepare("SELECT operation_id,source_incarnation,capture_id,session,token,anchor,stage,original,network_gate,pivot_json FROM managed_fork_batches WHERE stage NOT IN ('complete','aborted') ORDER BY rowid")?;
+            let mut q=c.db.prepare("SELECT operation_id,source_incarnation,capture_id,session,token,anchor,stage,original,network_gate,pivot_json,(SELECT kind FROM operations o WHERE o.operation_id=b.operation_id)
+                FROM managed_fork_batches b WHERE stage IN ('children','cancel_gate','arming','parking','standby','holding','pivoting','source_return','waking')
+                OR (stage='exporting' AND EXISTS (SELECT 1 FROM operations o WHERE o.operation_id=b.operation_id AND o.kind IN ('independent_fork','fork_batch'))) ORDER BY rowid")?;
             let result = q
                 .query_map([], |r| {
                     Ok(Job {
@@ -417,6 +441,7 @@ impl Actor {
                         original: r.get(7)?,
                         network: r.get(8)?,
                         pivot: r.get(9)?,
+                        kind: r.get(10)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -550,7 +575,8 @@ fn release(c: &mut Catalog, j: &Job) -> Result<()> {
         "UPDATE instance_bindings SET active_operation_id=NULL WHERE active_operation_id=?",
         [&j.id],
     )?;
-    tx.execute("UPDATE managed_fork_batches SET source_released=1,stage='children',error=NULL WHERE operation_id=?",[&j.id])?;
+    let next=if j.kind=="vm_snapshot" {"checkpoint_export"} else {"children"};
+    tx.execute("UPDATE managed_fork_batches SET source_released=1,stage=?,error=NULL WHERE operation_id=?",params![next,j.id])?;
     tx.commit()?;
     Ok(())
 }

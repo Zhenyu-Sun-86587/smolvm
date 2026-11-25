@@ -266,15 +266,14 @@ impl Catalog {
             return Err(Fault::new("E_FENCE_UNPROVEN", "StatePoint source exit has not been proved"));
         }
         release_export(&tx, record, true)?;
+        tx.execute("UPDATE managed_fork_batches SET source_released=1,error=NULL,
+                    stage=CASE WHEN restore_capture_id IS NULL THEN 'complete' ELSE 'rollback_target' END
+                    WHERE operation_id=?", [&record.operation_id])?;
         tx.execute(
             "UPDATE operations SET phase='COMPLETED',revision=revision+1
-            WHERE operation_id=? AND phase='NEW'",
-            [&record.operation_id],
-        )?;
-        tx.execute(
-            "UPDATE instance_bindings SET active_operation_id=NULL WHERE active_operation_id=?",
-            [&record.operation_id],
-        )?;
+            WHERE operation_id=? AND phase='NEW' AND kind<>'vm_rollback'", [&record.operation_id])?;
+        tx.execute("UPDATE instance_bindings SET active_operation_id=NULL WHERE active_operation_id=?1
+                   AND NOT EXISTS(SELECT 1 FROM operations WHERE operation_id=?1 AND kind='vm_rollback')",[&record.operation_id])?;
         tx.commit()?;
         self.require_statepoint(&record.export.capture_id)
     }

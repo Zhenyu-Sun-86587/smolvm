@@ -273,7 +273,7 @@ async fn submit(
 ) -> axum::response::Response {
     native(socket, move |client| {
         launch::require_own(&input.expected.instance_id)?;
-        if matches!(input.kind.as_str(), "independent_fork" | "fork_batch") {
+        if matches!(input.kind.as_str(), "independent_fork" | "fork_batch" | "hibernate" | "vm_snapshot" | "vm_rollback") {
             return client.submit_fork(&input);
         }
         if input.kind == "launch" {

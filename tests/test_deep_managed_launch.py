@@ -239,7 +239,7 @@ def verify(bundle, root, guest, system_image, fork, product_volumes):
         assert http(endpoint,EXT+"/operations",submit)==op and http(endpoint,inventory_url)["execution"]==record["execution"]
         assert rpc(worker,"QueryWorkerBudget")["allocated"]["vcpus"]==2
         if fork:
-            names=["branch-a","branch-b"]
+            names=["alpha-branch","beta-branch"]
             call=dict(operation_id="fork-counter-batch",request_digest=digest(b"counter-batch"),expected=ref,kind="fork_batch",parameters={"children":names})
             batch=http(endpoint,EXT+"/operations",call)
             assert batch["phase"]=="NEW" and len(batch["fork"]["children"])==2
@@ -305,7 +305,10 @@ def verify(bundle, root, guest, system_image, fork, product_volumes):
             prior=count()
             until(lambda:count()>prior+2,10)
             last=next(line for line in reversed(logfile.read_text(errors="replace").splitlines()) if line.startswith("PARKED_BLOCK_TICK ")).split()
-            marker=int(last[1])-1
+            inherited=next(line for line in logfile.read_text(errors="replace").splitlines() if line.startswith("PARKED_BLOCK_TICK ")).split()
+            inherited_marker=(int(inherited[1])-1)^(ord(first_name[0])<<48)
+            assert (int(inherited[5]),int(inherited[6]))==(inherited_marker,inherited_marker^0xbeef12349876),inherited
+            marker=(int(last[1])-1)^(ord("g")<<48)
             assert last[2]==source_ticks[0][2] and last[3]=="grandchild"
             assert (int(last[5]),int(last[6]))==(marker,marker^0xbeef12349876),last
             print("A parked child forked after its parent exited. The grandchild continued its captured process and both disks after fencing both ancestors and the sibling.",flush=True)

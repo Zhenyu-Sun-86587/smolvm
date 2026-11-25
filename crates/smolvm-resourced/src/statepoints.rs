@@ -128,11 +128,13 @@ impl StatePoints {
             }
         }
         catalog.ready()?;
-        catalog.active_operation(request)?;
+        if prior.is_none() || operation.kind!="vm_snapshot" {
+            catalog.active_operation(request)?;
+        }
         if !self.exports.is_empty() {
             return Err(limits());
         }
-        if !matches!(operation.kind.as_str(), "statepoint" | "writer_pivot") {
+        if !matches!(operation.kind.as_str(), "statepoint" | "writer_pivot" | "vm_snapshot" | "hibernate" | "vm_rollback") {
             return Err(Fault::invalid(
                 "StatePoint requires its own capture operation",
             ));

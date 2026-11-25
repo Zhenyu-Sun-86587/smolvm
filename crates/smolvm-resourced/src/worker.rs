@@ -263,6 +263,17 @@ fn process_fd(pid: i32) -> io::Result<OwnedFd> {
     }
 }
 
+struct MeasuredExecutable {
+    file: File,
+    digest: String,
+    ctime: (i64,i64),
+    size: u64,
+}
+
+thread_local! {
+    static MEASURED_EXECUTABLE: std::cell::RefCell<Option<MeasuredExecutable>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn verify_executable(
     pid: i32,
     start: i64,
@@ -272,21 +283,31 @@ pub(crate) fn verify_executable(
     let path = format!("/proc/{pid}/exe");
     let mut file = File::open(&path).map_err(broker_error)?;
     let original = file.metadata().map_err(broker_error)?;
-    let mut digest = Sha256::new();
-    io::copy(&mut file, &mut digest).map_err(broker_error)?;
+    let ctime = (original.ctime(), original.ctime_nsec());
+    let cacheable = original.is_file() && original.uid() == 0 && original.mode() & 0o022 == 0;
+    // Keep the inode open to exclude inode reuse. Only root-owned executable
+    // images are eligible; every call revalidates the proc link and the pidfd.
+    let cached = cacheable && MEASURED_EXECUTABLE.with_borrow(|entry| entry.as_ref().is_some_and(|e| {
+        e.digest == wanted && e.ctime == ctime && e.size == original.len()
+           && e.file.metadata().is_ok_and(|m| m.dev() == original.dev() && m.ino() == original.ino())
+    }));
+    if !cached {
+        let mut digest = Sha256::new();
+        io::copy(&mut file, &mut digest).map_err(broker_error)?;
+        if format!("sha256:{:x}", digest.finalize()) != wanted {
+            return Err(Fault::new("E_BUNDLE_UNAVAILABLE", "peer executable does not match registered bundle"));
+        }
+    }
     let current = fs::metadata(path).map_err(broker_error)?;
-    if original.dev() != current.dev()
-        || original.ino() != current.ino()
-        || pid_start(pid).ok() != Some(start)
-        || pid_exited(pidfd).map_err(broker_error)?
-    {
+    if original.dev() != current.dev() || original.ino() != current.ino()
+        || original.len() != current.len() || ctime != (current.ctime(),current.ctime_nsec())
+        || pid_start(pid).ok() != Some(start) || pid_exited(pidfd).map_err(broker_error)? {
         return Err(stale_execution());
     }
-    if format!("sha256:{:x}", digest.finalize()) != wanted {
-        return Err(Fault::new(
-            "E_BUNDLE_UNAVAILABLE",
-            "peer executable does not match registered bundle",
-        ));
+    if cacheable && !cached {
+        MEASURED_EXECUTABLE.with_borrow_mut(|entry| *entry=Some(MeasuredExecutable {
+            file, digest:wanted.to_owned(), ctime, size:original.len()
+        }));
     }
     Ok((original.dev(), original.ino()))
 }
@@ -964,7 +985,7 @@ impl Worker {
                 };
                 Ok(json!({"phase":outcome.phase,"execution":execution}))
             }
-            "SubmitManagedFork" => {
+            "SubmitManagedFork" | "SubmitManagedStatePoint" => {
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct Submit {
@@ -1826,6 +1847,12 @@ impl Worker {
             .complete_exports(&mut self.catalog, &self.objects)?
         {
             self.release_checkpoint_export(&record);
+        }
+        let stops=crate::managed_statepoint::tick(&mut self.catalog,&mut self.statepoints,&self.objects,&self.boot)?;
+        for stop in stops {
+            if let Err(error)=self.stop_statepoint(&stop) {
+                self.catalog.db.execute("UPDATE managed_fork_batches SET error=? WHERE operation_id=? AND error IS NOT ?",rusqlite::params![error.message,stop.operation_id,error.message])?;
+            }
         }
         for record in self.catalog.pending_statepoint_stops()? {
             if let Err(fault) = self.drive_statepoint_stop(record) {

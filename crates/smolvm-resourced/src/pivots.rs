@@ -183,7 +183,7 @@ pub fn prepare(
     let operation = catalog.active_operation(request)?;
     if !matches!(
         operation.kind.as_str(),
-        "writer_pivot" | "independent_fork" | "fork_batch"
+        "writer_pivot" | "independent_fork" | "fork_batch" | "vm_snapshot" | "hibernate" | "vm_rollback"
     ) {
         return Err(Fault::invalid(
             "held pivot requires a writer_pivot operation",

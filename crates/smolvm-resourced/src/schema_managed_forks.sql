@@ -18,7 +18,9 @@ CREATE TABLE managed_fork_batches (
     error TEXT,
     source_released INTEGER NOT NULL DEFAULT 0,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
-    restore_capture_id TEXT
+    restore_capture_id TEXT,
+    volume_restore_policy TEXT,
+    target_operation_id TEXT
 );
 CREATE TABLE managed_fork_children (
     batch_id TEXT NOT NULL REFERENCES managed_fork_batches(operation_id),

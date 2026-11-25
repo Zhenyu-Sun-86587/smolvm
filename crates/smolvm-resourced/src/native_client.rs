@@ -308,7 +308,7 @@ impl Client<'_> {
     pub fn submit_fork(&self, input: &Submission) -> Result<OperationReceipt, QueryError> {
         self.recover_and_retry(|| {
             self.receipt(
-                "SubmitManagedFork",
+                if matches!(input.kind.as_str(),"independent_fork"|"fork_batch") {"SubmitManagedFork"} else {"SubmitManagedStatePoint"},
                 &input.operation_id,
                 &input.request_digest,
                 &input.expected,

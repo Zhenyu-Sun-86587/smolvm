@@ -30,6 +30,8 @@ pub struct Operation {
     pub execution: Option<Expected>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statepoint: Option<Value>,
     pub phase: String,
     pub decision: String,
     pub revision: i64,
@@ -48,6 +50,7 @@ fn operation_row(row: &Row<'_>) -> rusqlite::Result<Operation> {
         native: None,
         execution: None,
         fork: None,
+        statepoint: None,
         phase: row.get(8)?,
         decision: row.get(9)?,
         revision: row.get(10)?,
@@ -422,6 +425,9 @@ impl Catalog {
         if matches!(operation.kind.as_str(), "independent_fork" | "fork_batch") {
             operation.fork = crate::managed_fork::receipt(self, &operation.operation_id)?;
         }
+        if matches!(operation.kind.as_str(), "vm_snapshot" | "hibernate" | "vm_rollback") {
+            operation.statepoint=crate::managed_statepoint::receipt(self,&operation)?;
+        }
         Ok(operation)
     }
 
@@ -531,7 +537,7 @@ impl Catalog {
             ));
         }
         let mut operation = self.matching_operation(r)?;
-        if matches!(operation.kind.as_str(), "independent_fork" | "fork_batch") {
+        if matches!(operation.kind.as_str(), "independent_fork" | "fork_batch" | "vm_snapshot" | "hibernate" | "vm_rollback") {
             return Err(conflict(
                 "E_OPERATION_HAS_EFFECTS",
                 "a managed fork is owned by the capture actor",
