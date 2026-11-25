@@ -42,7 +42,7 @@ fn installed_profile() -> Result<(Handshake, serde_json::Value, String), String>
             .capabilities
             .into_iter()
             .map(|(name, mut value)| {
-                if name == "boot.system" && value.supported && !launch::worker_configured() {
+                if matches!(name.as_str(), "boot.system" | "state.independent_fork" | "state.fork_batch") && value.supported && !launch::worker_configured() {
                     value.supported = false;
                     value.status = "unavailable".into();
                     value.reason_code = "WORKER_NOT_CONFIGURED".into();

@@ -34,7 +34,84 @@ def digest(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def verify(bundle, root, guest, system_image, fork, product_volumes):
+def settled(endpoint, operation_id, timeout=150):
+    latest = {}
+    def terminal():
+        nonlocal latest
+        latest=http(endpoint,f"{EXT}/operations/{operation_id}")
+        return latest if latest["phase"] in ("COMPLETED","ABORTED") else None
+    try: return until(terminal,timeout)
+    except TimeoutError: raise AssertionError(latest)
+
+
+def durable_points(endpoint, source, name, logfile):
+    def invoke(kind, key, params):
+        envelope=dict(kind=kind,operation_id=key,request_digest=digest(key.encode()),expected=source,parameters=params)
+        first=http(endpoint,EXT+"/operations",envelope)
+        assert first["phase"]=="NEW",first
+        result=settled(endpoint,key,180)
+        assert result["phase"]=="COMPLETED",result
+        assert http(endpoint,EXT+"/operations",envelope)==result
+        return result
+    snapshot=invoke("vm_snapshot","managed-checkpoint",{"capture_id":"checkpoint-"+name})["statepoint"]
+    assert snapshot["phase"]=="durable" and snapshot["source_released"] and snapshot["manifest_digest"].startswith("sha256:"),snapshot
+    count=lambda:sum(line.startswith("PARKED_BLOCK_TICK ") for line in logfile.read_text(errors="replace").splitlines())
+    before=count()
+    until(lambda:count()>before+1,10)
+    invoke("standby","standby-before-hibernate",{"mode":"managed"})
+    before=count()
+    hibernated=invoke("hibernate","managed-hibernate",{"capture_id":"hibernate-"+name})["statepoint"]
+    assert hibernated["phase"]=="hibernated" and hibernated["original_source_disposition"]=="STANDBY" and hibernated["source_released"],hibernated
+    assert hibernated["manifest_digest"].startswith("sha256:") and count()==before,hibernated
+    binding=http(endpoint,f"{EXT}/machines/{name}/binding")
+    assert binding["incarnation_id"] is None and binding["execution_epoch"]==source["execution_epoch"]
+    print("Checkpoint publication returned a verified durable manifest while the guest continued. Hibernate stopped the parked execution without advancing its counter.",flush=True)
+
+
+def partial_fork(endpoint, root, ref):
+    import threading
+    names=["partial-keep","partial-retry"]
+    key="partial-batch"
+    req=dict(kind="fork_batch",operation_id=key,request_digest=digest(key.encode()),expected=ref,parameters={"children":names})
+    killed=threading.Event()
+    def interrupt_unpublished():
+        dbfile=root/"catalog/catalog.sqlite"
+        def inject():
+            with sqlite3.connect(f"file:{dbfile}?mode=ro",uri=True) as c:
+                match=c.execute("""SELECT e.pid,e.pid_start_time FROM managed_fork_children ch
+                    JOIN executions e ON e.last_operation_id=ch.operation_id WHERE ch.batch_id=? AND ch.name=?
+                    AND NOT EXISTS(SELECT 1 FROM target_activations a WHERE a.operation_id=ch.operation_id AND a.decision='commit')""",
+                    (key,names[1])).fetchone()
+            if match:
+                pid,start=match
+                fd=os.pidfd_open(pid)
+                try:
+                    if int(Path(f"/proc/{pid}/stat").read_text().rsplit(")",1)[1].split()[19])==start:
+                        signal.pidfd_send_signal(fd,signal.SIGKILL)
+                        killed.set()
+                finally:os.close(fd)
+            return killed.is_set()
+        until(inject,120)
+    thread=threading.Thread(target=interrupt_unpublished,daemon=True)
+    thread.start()
+    original=http(endpoint,EXT+"/operations",req)
+    batch=settled(endpoint,key)
+    thread.join(5)
+    assert killed.is_set() and batch["fork"]["outcome"]=="partial",batch
+    good,failed=batch["fork"]["children"]
+    assert good["phase"]=="COMPLETED" and failed["phase"]=="ABORTED",batch
+    retry=dict(request_digest=req["request_digest"],expected=ref,expected_revision=batch["revision"])
+    http(endpoint,f"{EXT}/operations/{key}/retry",retry)
+    recovered=settled(endpoint,key)
+    assert recovered["fork"]["outcome"]=="applied" and recovered["fork"]["capture_id"]==original["fork"]["capture_id"],recovered
+    old,new=recovered["fork"]["children"]
+    assert good==old and failed["instance_id"]==new["instance_id"] and new["attempt"]==1
+    assert new["execution_epoch"]>failed["execution_epoch"] and new["incarnation_id"]!=failed["incarnation_id"]
+    assert http(endpoint,f"{EXT}/operations/{key}/retry",retry)==recovered
+    print("One of two targets was killed before activation. Retry kept the successful execution and original capture, and advanced only the failed child's epoch.",flush=True)
+
+
+def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
@@ -312,6 +389,13 @@ def verify(bundle, root, guest, system_image, fork, product_volumes):
             assert last[2]==source_ticks[0][2] and last[3]=="grandchild"
             assert (int(last[5]),int(last[6]))==(marker,marker^0xbeef12349876),last
             print("A parked child forked after its parent exited. The grandchild continued its captured process and both disks after fencing both ancestors and the sibling.",flush=True)
+            if fork_faults or statepoint:
+                grand_ref=http(endpoint,f"{EXT}/machines/grandchild/execution")
+                if fork_faults:partial_fork(endpoint,root,grand_ref)
+                if statepoint:durable_points(endpoint,grand_ref,"grandchild",logfile)
+            return
+        if statepoint:
+            durable_points(endpoint,ref,name,logs/(ref["incarnation_id"]+".log"))
             return
         if not system_image:
             old=record["execution"]
@@ -367,15 +451,22 @@ def main():
     parser.add_argument("--system-image",type=Path,help="managed Debian ext4 image containing the systemd Guest Agent service")
     parser.add_argument("--fork",action="store_true",help="fork a batch of two managed guests from one live capture")
     parser.add_argument("--product-volumes", action="store_true", help="open existing registered product disk heads")
+    parser.add_argument("--statepoint",action="store_true",help="checkpoint the guest and hibernate from managed standby")
+    parser.add_argument("--fork-faults",action="store_true",help="kill one unpublished target and retry it from the original capture")
     args=parser.parse_args()
+    if args.fork_faults: args.fork=True
     if os.geteuid()!=0:parser.error("requires root, KVM and systemd")
     if not os.environ.get("SMOLVM_MANAGED_TEST_ISOLATED"):
-        os.execvpe("unshare",["unshare","--mount","--propagation","private","--net","--",sys.executable,__file__,
-                             "--bundle",str(args.bundle.resolve()),*(["--guest",str(args.guest.resolve())] if args.guest else []),*(["--system-image",str(args.system_image.resolve())] if args.system_image else []), *(["--fork"] if args.fork else []), *(["--product-volumes"] if args.product_volumes else [])],{**os.environ,"SMOLVM_MANAGED_TEST_ISOLATED":"1"})
+        args_for_child=["unshare","--mount","--propagation","private","--net","--",sys.executable,__file__,"--bundle",str(args.bundle.resolve())]
+        for flag,path in (("--guest",args.guest),("--system-image",args.system_image)):
+            if path:args_for_child.extend([flag,str(path.resolve())])
+        for flag,enabled in (("--fork",args.fork),("--product-volumes",args.product_volumes),("--statepoint",args.statepoint),("--fork-faults",args.fork_faults)):
+            if enabled:args_for_child.append(flag)
+        os.execvpe("unshare",args_for_child,{**os.environ,"SMOLVM_MANAGED_TEST_ISOLATED":"1"})
     with tempfile.TemporaryDirectory(dir="/var/tmp",prefix="smm-") as tmp:
         root=Path(tmp)
         root.chmod(0o755)
-        try: verify(args.bundle.resolve(),root,args.guest,args.system_image,args.fork,args.product_volumes)
+        try: verify(args.bundle.resolve(),root,args.guest,args.system_image,args.fork,args.product_volumes,args.statepoint,args.fork_faults)
         except BaseException:
             for log in [root/"serve.log",root/"worker.log",*(root/"state/managed").glob("*.log")]:
                 if log.exists():print(f"{log.name}\n{log.read_text(errors='replace')[-7000:]}",file=sys.stderr)

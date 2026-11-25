@@ -128,6 +128,17 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
             },
         );
     }
+    if contracts["managed_parked_fork"].as_u64() == Some(1)
+        && contracts["managed_block_launch"].as_u64() == Some(1)
+        && manifest["guest"]["boot_profiles"].as_array().is_some_and(|profiles| profiles.iter().any(|p|p=="oci-v1"))
+        && artifacts.iter().any(|a|a["path"]=="guest/identity-helper") {
+        for name in ["state.independent_fork","state.fork_batch"] {
+            capabilities.insert(name.into(),Capability {
+                supported:true, status:"supported".into(), reason_code:String::new(),
+                contract_version:Some(1), verified_profile:Some("managed-parked-v1".into()),
+            });
+        }
+    }
     Ok(Handshake {
         schema: "runtime-ext/v1".into(),
         route_id: "deep".into(),
