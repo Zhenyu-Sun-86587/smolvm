@@ -22,6 +22,8 @@ pub struct Capability {
 pub struct Handshake {
     pub schema: String,
     pub route_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_instance_id: Option<String>,
     pub bundle_digest: String,
     pub state_reader_id: String,
     pub protocols: BTreeMap<String, u32>,
@@ -104,6 +106,7 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
     Ok(Handshake {
         schema: "runtime-ext/v1".into(),
         route_id: "deep".into(),
+        runtime_instance_id: None,
         bundle_digest: actual,
         state_reader_id: reader.to_owned(),
         protocols,

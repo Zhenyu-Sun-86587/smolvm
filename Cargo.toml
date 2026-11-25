@@ -35,6 +35,9 @@ repository = "https://github.com/smol-machines/smolvm"
 keywords = ["microvm", "container", "virtualization"]
 categories = ["virtualization", "command-line-utilities"]
 
+[features]
+deep-runtime = []
+
 [lib]
 name = "smolvm"
 path = "src/lib.rs"

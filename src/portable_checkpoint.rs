@@ -101,10 +101,18 @@ const PAUSED_EXPORT_INFIX: &str = ".export-";
 const PAUSED_LAYERS_INDEX: &str = "layers";
 /// Service-owned tmpfs directory where a resume stages its checkpoint, so the
 /// RAM image it hands the VMM is never written to disk.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "deep-runtime")))]
 const RESTORE_TMPFS_ROOT: &str = "/dev/shm/smolvm-restore";
 
-/// [`RESTORE_TMPFS_ROOT`], created if needed, when it is usable: the service
+#[cfg(target_os = "linux")]
+fn restore_tmpfs_path() -> Option<PathBuf> {
+    #[cfg(feature = "deep-runtime")]
+    return crate::deep_state::private_tmpfs("restore");
+    #[cfg(not(feature = "deep-runtime"))]
+    return Some(PathBuf::from(RESTORE_TMPFS_ROOT));
+}
+
+/// The restore tmpfs directory when it is usable: the service
 /// runs as root, `/dev/shm` is tmpfs, and the directory is root-owned mode
 /// 0700. `SMOLVM_RESTORE_TMPFS=0` disables it.
 #[cfg(target_os = "linux")]
@@ -115,11 +123,15 @@ fn restore_tmpfs_root() -> Option<PathBuf> {
     {
         return None;
     }
+    let root = restore_tmpfs_path()?;
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c"/dev/shm".as_ptr(), &mut stat) } != 0 || !is_tmpfs(&stat) {
+    #[cfg(feature = "deep-runtime")]
+    let mount = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).ok()?;
+    #[cfg(not(feature = "deep-runtime"))]
+    let mount = c"/dev/shm";
+    if unsafe { libc::statfs(mount.as_ptr(), &mut stat) } != 0 || !is_tmpfs(&stat) {
         return None;
     }
-    let root = PathBuf::from(RESTORE_TMPFS_ROOT);
     match std::fs::DirBuilder::new().mode(0o700).create(&root) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -152,10 +164,10 @@ fn readonly_input_dirs(vm_dir: &Path) -> Vec<PathBuf> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut dirs = vec![vm_dir.join(READONLY_INPUT_DIR)];
     #[cfg(target_os = "linux")]
-    if let Some(name) = vm_dir.file_name() {
+    if let (Some(name), Some(root)) = (vm_dir.file_name(), restore_tmpfs_path()) {
         let mut tmpfs_name = name.to_os_string();
         tmpfs_name.push(READONLY_INPUT_DIR);
-        dirs.push(Path::new(RESTORE_TMPFS_ROOT).join(tmpfs_name));
+        dirs.push(root.join(tmpfs_name));
     }
     dirs
 }
@@ -179,7 +191,7 @@ fn remove_readonly_input(vm_dir: &Path) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 fn staged_by_root_only(dir: &Path, error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::PermissionDenied
-        && dir.starts_with(RESTORE_TMPFS_ROOT)
+        && restore_tmpfs_path().is_some_and(|root| dir.starts_with(root))
         && unsafe { libc::geteuid() } != 0
 }
 
@@ -430,22 +442,23 @@ pub(crate) fn open_readonly_memory(vm_dir: &Path) -> Result<std::fs::File> {
         fd::{AsRawFd, FromRawFd},
         unix::fs::{MetadataExt, OpenOptionsExt},
     };
-    let [on_disk, on_tmpfs]: [PathBuf; 2] = readonly_input_dirs(vm_dir)
-        .try_into()
-        .expect("disk and tmpfs input directories");
-    let input_dir = if std::fs::symlink_metadata(&on_disk).is_err()
-        && std::fs::symlink_metadata(&on_tmpfs).is_ok()
-    {
-        if !restore_tmpfs_root_is_trusted(Path::new(RESTORE_TMPFS_ROOT)) {
-            return Err(Error::agent(
-                "open restore RAM",
-                "restore tmpfs must be service-owned mode 0700",
-            ));
-        }
-        on_tmpfs
-    } else {
-        on_disk
-    };
+    let mut input_dirs = readonly_input_dirs(vm_dir).into_iter();
+    let on_disk = input_dirs.next().expect("on-disk restore input directory");
+    let on_tmpfs = input_dirs
+        .next()
+        .filter(|candidate| std::fs::symlink_metadata(candidate).is_ok());
+    let input_dir =
+        if let Some(on_tmpfs) = on_tmpfs.filter(|_| std::fs::symlink_metadata(&on_disk).is_err()) {
+            if !on_tmpfs.parent().is_some_and(restore_tmpfs_root_is_trusted) {
+                return Err(Error::agent(
+                    "open restore RAM",
+                    "restore tmpfs must be service-owned mode 0700",
+                ));
+            }
+            on_tmpfs
+        } else {
+            on_disk
+        };
     let directory = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -1500,7 +1513,11 @@ pub fn sweep_abandoned_checkpoint_scratch() -> usize {
             ABANDONED_SCRATCH_AGE,
         );
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+    if let Some(capture) = capture_tmpfs_root() {
+        removed += sweep_abandoned_scratch_in(&capture, &[""], ABANDONED_SCRATCH_AGE);
+    }
+    #[cfg(all(target_os = "linux", not(feature = "deep-runtime")))]
     {
         removed +=
             sweep_abandoned_scratch_in(Path::new(CAPTURE_TMPFS_ROOT), &[""], ABANDONED_SCRATCH_AGE);
@@ -1581,8 +1598,16 @@ fn runtime_capture_dir(name: &str, vm: &VmRecord) -> Result<tempfile::TempDir> {
 /// Service-owned tmpfs directory for transient runtime captures. Searchable
 /// (0711) so a VMM running as its own uid can reach the private directory
 /// made for it inside.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "deep-runtime")))]
 const CAPTURE_TMPFS_ROOT: &str = "/dev/shm/smolvm-capture";
+
+#[cfg(target_os = "linux")]
+fn capture_tmpfs_path() -> Option<PathBuf> {
+    #[cfg(feature = "deep-runtime")]
+    return crate::deep_state::private_tmpfs("capture");
+    #[cfg(not(feature = "deep-runtime"))]
+    return Some(PathBuf::from(CAPTURE_TMPFS_ROOT));
+}
 
 /// Whether `stat` describes a tmpfs. The type of `f_type` differs between
 /// glibc and musl, so both sides are widened to one type.
@@ -1597,10 +1622,14 @@ fn is_tmpfs(stat: &libc::statfs) -> bool {
 #[cfg(target_os = "linux")]
 pub fn capture_tmpfs_root() -> Option<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    let root = PathBuf::from(CAPTURE_TMPFS_ROOT);
+    let root = capture_tmpfs_path()?;
+    #[cfg(feature = "deep-runtime")]
+    let mount = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).ok()?;
+    #[cfg(not(feature = "deep-runtime"))]
+    let mount = c"/dev/shm";
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
     let usable = unsafe { libc::geteuid() } == 0
-        && unsafe { libc::statfs(c"/dev/shm".as_ptr(), &mut stat) } == 0
+        && unsafe { libc::statfs(mount.as_ptr(), &mut stat) } == 0
         && is_tmpfs(&stat)
         && match std::fs::DirBuilder::new().mode(0o711).create(&root) {
             Ok(()) => true,
@@ -1617,7 +1646,10 @@ pub fn capture_tmpfs_root() -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 pub(crate) fn capture_tmpfs_grant() -> Option<PathBuf> {
     capture_tmpfs_root().or_else(|| {
-        let root = PathBuf::from(CAPTURE_TMPFS_ROOT);
+        let root = capture_tmpfs_path()?;
+        if cfg!(feature = "deep-runtime") {
+            return None;
+        }
         std::fs::symlink_metadata(&root)
             .is_ok_and(|metadata| metadata.is_dir())
             .then_some(root)
@@ -1696,7 +1728,7 @@ fn runtime_capture_dir_preferring_tmpfs(name: &str, vm: &VmRecord) -> Result<Run
         let root = capture_tmpfs_root();
         let reservation = root
             .as_ref()
-            .and_then(|_| free_bytes(Path::new("/dev/shm")))
+            .and_then(|root| free_bytes(root))
             .and_then(|free| reserve_tmpfs(needed, free));
         let usable = reservation.is_some()
             // tmpfs pages are RAM: never push the host into swap for this.
@@ -8026,7 +8058,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(feature = "deep-runtime")))]
     #[test]
     fn a_denied_root_only_restore_tmpfs_is_not_a_cleanup_failure() {
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);

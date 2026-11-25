@@ -699,7 +699,7 @@ pub fn vmm_memory_limit_bytes(guest_memory_mib: u32, cuda: bool, memfd_backed: b
 }
 
 #[cfg(target_os = "linux")]
-fn cgroup_v2_process_dir(pid: Pid) -> Option<std::path::PathBuf> {
+pub(crate) fn cgroup_v2_process_dir(pid: Pid) -> Option<std::path::PathBuf> {
     let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     let rel = content
         .lines()
@@ -713,6 +713,26 @@ fn cgroup_v2_process_dir(pid: Pid) -> Option<std::path::PathBuf> {
         return None;
     }
     Some(std::path::Path::new("/sys/fs/cgroup").join(rel))
+}
+
+#[cfg(target_os = "linux")]
+fn owned_scope(dir: &std::path::Path, name: &str) -> bool {
+    #[cfg(feature = "deep-runtime")]
+    return crate::systemd_scope::owns_cgroup(dir, Some(name));
+    #[cfg(not(feature = "deep-runtime"))]
+    return dir
+        .file_name()
+        .and_then(|leaf| leaf.to_str())
+        .is_some_and(|leaf| leaf == crate::systemd_scope::scope_name(name));
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn owned_delegated_cgroup(dir: &std::path::Path, pid: Pid) -> bool {
+    !cfg!(feature = "deep-runtime")
+        && dir
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .is_some_and(|leaf| leaf == format!("vm-{pid}"))
 }
 
 /// Update both memory thresholds only when `pid` is already inside a cgroup owned by
@@ -733,12 +753,8 @@ pub fn set_managed_vmm_memory_limit(
     let Some(dir) = cgroup_v2_process_dir(pid) else {
         return Ok(false);
     };
-    let Some(leaf) = dir.file_name().and_then(|name| name.to_str()) else {
-        return Ok(false);
-    };
-    let scope = crate::systemd_scope::scope_name(machine);
-    let owned = leaf == scope || leaf == format!("vm-{pid}");
-    if !owned {
+    let systemd_owned = owned_scope(&dir, machine);
+    if !systemd_owned && !owned_delegated_cgroup(&dir, pid) {
         return Ok(false);
     }
     // A generation's pages stay charged here until every child mapping them
@@ -768,7 +784,7 @@ pub fn set_managed_vmm_memory_limit(
         );
     }
     let (memory_max_bytes, memory_high_bytes) = (budget.max_bytes, budget.high_bytes);
-    if leaf == scope {
+    if systemd_owned {
         crate::systemd_scope::set_scope_memory_max(machine, memory_max_bytes, memory_high_bytes)?;
         return Ok(true);
     }
@@ -863,9 +879,8 @@ pub fn raise_managed_vmm_memory_budget(
     let Some(dir) = cgroup_v2_process_dir(pid) else {
         return Ok(false);
     };
-    let leaf = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
-    let systemd_owned = leaf == crate::systemd_scope::scope_name(machine);
-    if !systemd_owned && leaf != format!("vm-{pid}") {
+    let systemd_owned = owned_scope(&dir, machine);
+    if !systemd_owned && !owned_delegated_cgroup(&dir, pid) {
         return Ok(false);
     }
     let read_budget = || -> Result<VmmMemoryBudget> {
@@ -1008,10 +1023,9 @@ pub fn set_managed_vmm_cpu_quota(
     let Some(dir) = cgroup_v2_process_dir(pid) else {
         return Ok(false);
     };
-    let leaf = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
-    if leaf == crate::systemd_scope::scope_name(machine) {
+    if owned_scope(&dir, machine) {
         crate::systemd_scope::set_scope_cpu_quota(machine, usec_per_sec)?;
-    } else if leaf == format!("vm-{pid}") {
+    } else if owned_delegated_cgroup(&dir, pid) {
         write_cgroup(&dir, "cpu.max", &cpu_max_line(usec_per_sec)).map_err(|error| {
             Error::agent("CPU resize", format!("cannot update CPU quota: {error}"))
         })?;
@@ -1520,7 +1534,11 @@ pub fn drop_privileges(_uid: u32, _gid: u32) -> std::result::Result<(), String> 
 /// Base of the reserved per-VM uid range. Above normal system (<1000), user
 /// (1000–60000), `nobody` (65534), and systemd DynamicUser (61184–65519) uids.
 #[cfg(target_os = "linux")]
-const VM_UID_BASE: u32 = 2_000_000;
+const VM_UID_BASE: u32 = if cfg!(feature = "deep-runtime") {
+    102_000_000
+} else {
+    2_000_000
+};
 /// Span of the per-VM uid range: the allocator hands out the lowest free uid in
 /// `[BASE, BASE+SPAN)`. 100M is far more than any node hosts at once.
 #[cfg(target_os = "linux")]
@@ -1592,7 +1610,11 @@ pub fn apply_system_data_root(allow_auto: bool) {
     // Relocating HOME also relocates the fallback agent rootfs path. Preserve
     // the installed rootfs for explicit SMOLVM_DATA_DIR and serve's /var/lib
     // default, just as we do for the overlayfs workspace default.
-    let carry_rootfs_from = installed_agent_rootfs();
+    let carry_rootfs_from = if cfg!(feature = "deep-runtime") {
+        None
+    } else {
+        installed_agent_rootfs()
+    };
     match std::fs::create_dir_all(&root) {
         Ok(()) => {
             use std::os::unix::fs::PermissionsExt;
@@ -1819,7 +1841,22 @@ pub fn allocate_vm_uid(
     key_dir: &std::path::Path,
     vm_key: &str,
 ) -> std::io::Result<u32> {
+    #[cfg(feature = "deep-runtime")]
+    if registry_dir == std::path::Path::new(crate::deep_state::UID_REGISTRY) {
+        crate::deep_state::prepare_uid_registry()?;
+        let key = deep_uid_key(key_dir)?;
+        return allocate_vm_uid_unless(registry_dir, key_dir, &key, uid_has_processes);
+    }
     allocate_vm_uid_unless(registry_dir, key_dir, vm_key, uid_has_processes)
+}
+
+#[cfg(feature = "deep-runtime")]
+fn deep_uid_key(key_dir: &std::path::Path) -> std::io::Result<String> {
+    crate::deep_state::require_instance().map_err(std::io::Error::other)?;
+    crate::deep_state::require_private_path(key_dir).map_err(std::io::Error::other)?;
+    Ok(hex::encode(
+        key_dir.canonicalize()?.as_os_str().as_encoded_bytes(),
+    ))
 }
 
 /// Whether any process runs as `uid`. A uid freed with its machine is free
@@ -1880,6 +1917,11 @@ fn allocate_vm_uid_unless(
     for uid in VM_UID_BASE..VM_UID_BASE.saturating_add(VM_UID_SPAN) {
         let marker = registry_dir.join(uid.to_string());
         if let Some(key) = uid_marker_key(registry_dir, uid) {
+            #[cfg(feature = "deep-runtime")]
+            if registry_dir == std::path::Path::new(crate::deep_state::UID_REGISTRY) {
+                // A Serve cannot infer another bundle's ownership or liveness.
+                continue;
+            }
             let live = vms_dir
                 .as_ref()
                 .map(|v| v.join(&key).exists())
@@ -1922,6 +1964,13 @@ pub fn free_vm_uid(registry_dir: &std::path::Path, key_dir: &std::path::Path) {
     if !key_dir.join(".vm-uid").exists() {
         return;
     }
+    #[cfg(feature = "deep-runtime")]
+    if registry_dir == std::path::Path::new(crate::deep_state::UID_REGISTRY)
+        && crate::deep_state::prepare_uid_registry().is_err()
+    {
+        tracing::warn!("cannot verify deep Worker UID registry; retaining assignment");
+        return;
+    }
     let Ok(_registry_lock) = lock_uid_registry(registry_dir) else {
         tracing::warn!("unable to lock UID registry; retaining assignment");
         return;
@@ -1930,9 +1979,16 @@ pub fn free_vm_uid(registry_dir: &std::path::Path, key_dir: &std::path::Path) {
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
     {
-        if uid_marker_key(registry_dir, uid).as_deref()
-            == key_dir.file_name().and_then(|name| name.to_str())
-        {
+        let key = key_dir.file_name().and_then(|name| name.to_str());
+        #[cfg(feature = "deep-runtime")]
+        let owned_key = if registry_dir == std::path::Path::new(crate::deep_state::UID_REGISTRY) {
+            deep_uid_key(key_dir).ok()
+        } else {
+            key.map(str::to_owned)
+        };
+        #[cfg(feature = "deep-runtime")]
+        let key = owned_key.as_deref();
+        if key.is_some() && uid_marker_key(registry_dir, uid).as_deref() == key {
             let _ = std::fs::remove_file(registry_dir.join(uid.to_string()));
         }
     }
@@ -1983,6 +2039,19 @@ fn shared_uid_owner_dir(
             ),
         )
     })?;
+    #[cfg(feature = "deep-runtime")]
+    if registry_dir == std::path::Path::new(crate::deep_state::UID_REGISTRY) {
+        use std::os::unix::ffi::OsStringExt;
+        let bytes = hex::decode(key).map_err(std::io::Error::other)?;
+        let owner = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        crate::deep_state::require_private_path(&owner).map_err(std::io::Error::other)?;
+        if owner.parent() != directory.parent() || !owner.is_dir() {
+            return Err(std::io::Error::other(
+                "shared VM UID owner is outside this runtime's VM directory",
+            ));
+        }
+        return Ok(owner);
+    }
     let mut components = std::path::Path::new(&key).components();
     if !matches!(components.next(), Some(std::path::Component::Normal(_)))
         || components.next().is_some()

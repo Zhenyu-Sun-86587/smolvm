@@ -88,7 +88,11 @@ fn busctl_bounded(mut cmd: Command, timeout: Duration) -> Result<Output> {
 /// own, all VMs together weigh the same as all host services together, so the
 /// node keeps at least half the CPU however many VMs it runs. systemd creates
 /// the slice on demand the first time a scope names it.
-pub const VM_SLICE: &str = "smolvm.slice";
+pub const VM_SLICE: &str = if cfg!(feature = "deep-runtime") {
+    "smolvmdeep.slice"
+} else {
+    "smolvm.slice"
+};
 
 /// Share of the [`VM_SLICE`] memory limit that page cache is kept below by
 /// proactive reclaim. Cache above this line counts as free headroom for
@@ -184,6 +188,12 @@ fn slice_cpus_args(mask: &[u8]) -> Vec<String> {
 /// in the slice move off the reserved CPUs at once. Returns how many CPUs are
 /// reserved.
 pub fn configure_vm_slice() -> Result<usize> {
+    if cfg!(feature = "deep-runtime") {
+        return Err(Error::config(
+            "VM slice",
+            "only the deep Worker may configure the shared VM slice",
+        ));
+    }
     let online = std::fs::read_to_string("/sys/devices/system/cpu/online")
         .ok()
         .and_then(|list| parse_cpu_list(&list))
@@ -346,6 +356,12 @@ pub struct VmSliceMemoryCap {
 /// Called once by `serve` when it runs VMs in scopes; idempotent (a reserve of
 /// 0 clears an earlier cap).
 pub fn configure_vm_slice_memory() -> Result<VmSliceMemoryCap> {
+    if cfg!(feature = "deep-runtime") {
+        return Err(Error::config(
+            "VM slice",
+            "only the deep Worker may configure the shared VM slice",
+        ));
+    }
     const MIB: u64 = 1024 * 1024;
     let host_total_mib = std::fs::read_to_string("/proc/meminfo")
         .ok()
@@ -467,6 +483,12 @@ fn busctl_path() -> Option<PathBuf> {
 /// length so the scope name is always valid. Collisions are avoided by the caller
 /// using unique machine ids; a dead scope self-removes when its VM exits.
 pub fn scope_name(machine_id: &str) -> String {
+    #[cfg(feature = "deep-runtime")]
+    return deep_scope_name(
+        &crate::deep_state::instance_id().unwrap_or_else(|| "unconfigured".to_owned()),
+        machine_id,
+    );
+    #[cfg(not(feature = "deep-runtime"))]
     let safe: String = machine_id
         .chars()
         .map(|c| {
@@ -478,7 +500,70 @@ pub fn scope_name(machine_id: &str) -> String {
         })
         .take(200)
         .collect();
-    format!("smolvm-vm-{safe}.scope")
+    #[cfg(not(feature = "deep-runtime"))]
+    return format!("smolvm-vm-{safe}.scope");
+}
+
+#[cfg(feature = "deep-runtime")]
+fn deep_scope_name(instance: &str, machine_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let machine = hex::encode(&Sha256::digest(machine_id.as_bytes())[..16]);
+    format!("smolvmdeep-vm-{instance}-{machine}.scope")
+}
+
+#[cfg(feature = "deep-runtime")]
+pub(crate) fn owns_cgroup(dir: &Path, machine: Option<&str>) -> bool {
+    crate::deep_state::instance_id()
+        .is_some_and(|instance| deep_scope_dir_owned(dir, &instance, machine))
+}
+
+#[cfg(feature = "deep-runtime")]
+fn deep_scope_name_owned(name: &str, instance: &str) -> bool {
+    name.strip_prefix(&format!("smolvmdeep-vm-{instance}-"))
+        .and_then(|leaf| leaf.strip_suffix(".scope"))
+        .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+#[cfg(feature = "deep-runtime")]
+fn deep_scope_dir_owned(dir: &Path, instance: &str, machine: Option<&str>) -> bool {
+    let slice = Path::new("/sys/fs/cgroup").join(VM_SLICE);
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|leaf| {
+            dir.parent() == Some(slice.as_path())
+                && match machine {
+                    Some(name) => leaf == deep_scope_name(instance, name),
+                    None => deep_scope_name_owned(leaf, instance),
+                }
+        })
+}
+
+#[cfg(feature = "deep-runtime")]
+pub(crate) fn verify_boot_scope(scope: &str) -> Result<()> {
+    let instance = crate::deep_state::require_instance()?;
+    if !deep_scope_name_owned(scope, &instance) {
+        return Err(Error::agent(
+            "VM scope",
+            "boot scope does not belong to this deep runtime",
+        ));
+    }
+    let wanted = format!("0::/{VM_SLICE}/{scope}");
+    let limit = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::fs::read_to_string("/proc/self/cgroup")?
+            .lines()
+            .any(|line| line == wanted)
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= limit {
+            return Err(Error::agent(
+                "VM scope",
+                "the deep VM was not admitted to its systemd scope",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Adopt an already-forked VM `pid` into its own transient scope with `caps`.
@@ -487,6 +572,8 @@ pub fn scope_name(machine_id: &str) -> String {
 /// the bus call failed); the caller should fall back to plain cgroup placement
 /// rather than failing the launch.
 pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<()> {
+    #[cfg(feature = "deep-runtime")]
+    crate::deep_state::require_instance()?;
     let busctl = busctl_path()
         .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot create scope"))?;
     let name = scope_name(machine_id);
@@ -614,6 +701,8 @@ pub fn set_scope_memory_max(
     memory_max_bytes: u64,
     memory_high_bytes: u64,
 ) -> Result<()> {
+    #[cfg(feature = "deep-runtime")]
+    crate::deep_state::require_instance()?;
     let busctl = busctl_path()
         .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot update scope"))?;
     let name = scope_name(machine_id);
@@ -664,6 +753,8 @@ pub fn set_scope_cpu_count(machine_id: &str, cpus: u8) -> Result<()> {
 /// time per wall-clock second across all its threads (1_000_000 = one CPU),
 /// at runtime only, without restarting it.
 pub fn set_scope_cpu_quota(machine_id: &str, usec_per_sec: u64) -> Result<()> {
+    #[cfg(feature = "deep-runtime")]
+    crate::deep_state::require_instance()?;
     if usec_per_sec == 0 {
         return Err(Error::config("CPU quota", "CPU quota must be nonzero"));
     }
@@ -705,6 +796,8 @@ pub fn set_scope_cpu_quota(machine_id: &str, usec_per_sec: u64) -> Result<()> {
 /// that created the scope may call this, after confirming its process is dead.
 /// A scope that is already gone counts as stopped.
 pub fn stop_scope(machine_id: &str) -> Result<()> {
+    #[cfg(feature = "deep-runtime")]
+    crate::deep_state::require_instance()?;
     let busctl = busctl_path()
         .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot stop scope"))?;
     let name = scope_name(machine_id);
@@ -757,6 +850,8 @@ pub fn scope_process_count(machine_id: &str) -> Option<usize> {
     }
     #[cfg(target_os = "linux")]
     {
+        #[cfg(feature = "deep-runtime")]
+        crate::deep_state::instance_id()?;
         let mut cmd = Command::new("systemctl");
         cmd.args(["show", "-P", "ControlGroup", &scope_name(machine_id)]);
         let out = busctl_bounded(cmd, BUSCTL_TIMEOUT).ok()?;
@@ -764,7 +859,12 @@ pub fn scope_process_count(machine_id: &str) -> Option<usize> {
         if !out.status.success() || cgroup.is_empty() {
             return None;
         }
-        let procs = std::fs::read_to_string(format!("/sys/fs/cgroup{cgroup}/cgroup.procs")).ok()?;
+        let cgroup = PathBuf::from(format!("/sys/fs/cgroup{cgroup}"));
+        #[cfg(feature = "deep-runtime")]
+        if !owns_cgroup(&cgroup, Some(machine_id)) {
+            return None;
+        }
+        let procs = std::fs::read_to_string(cgroup.join("cgroup.procs")).ok()?;
         // An exited process its parent has not reaped yet is still listed;
         // it holds nothing and needs no kill.
         let live = |pid: &str| {
@@ -809,6 +909,8 @@ pub fn kill_scope(machine_id: &str) -> Result<bool> {
     }
     #[cfg(target_os = "linux")]
     {
+        #[cfg(feature = "deep-runtime")]
+        crate::deep_state::require_instance()?;
         let Some(busctl) = busctl_path() else {
             return Ok(false);
         };
@@ -1101,7 +1203,7 @@ mod tests {
 
     /// A process that exits before systemd moves it leaves an empty scope
     /// that stays active; stopping it is what removes it.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(feature = "deep-runtime")))]
     #[test]
     #[ignore = "requires root on a systemd host"]
     fn stop_scope_removes_a_scope_whose_process_exited_before_adoption() {
@@ -1124,6 +1226,7 @@ mod tests {
         stop_scope(&id).unwrap();
     }
 
+    #[cfg(not(feature = "deep-runtime"))]
     #[test]
     fn scope_name_sanitizes_and_suffixes() {
         assert_eq!(
@@ -1136,6 +1239,7 @@ mod tests {
         assert_eq!(scope_name("m_1.2:3"), "smolvm-vm-m_1.2:3.scope");
     }
 
+    #[cfg(not(feature = "deep-runtime"))]
     #[test]
     fn scope_name_is_bounded() {
         let long = "x".repeat(500);
@@ -1144,5 +1248,26 @@ mod tests {
         assert!(n.ends_with(".scope"));
         // sanitized body clamped to 200 chars + fixed prefix/suffix.
         assert!(n.len() <= "smolvm-vm-".len() + 200 + ".scope".len());
+    }
+
+    #[cfg(feature = "deep-runtime")]
+    #[test]
+    fn scope_names_isolate_serve_instances_and_machine_names() {
+        assert_eq!(VM_SLICE, "smolvmdeep.slice");
+        let first = deep_scope_name("instance-a", "a/b c");
+        let other_serve = deep_scope_name("instance-b", "a/b c");
+        let other_machine = deep_scope_name("instance-a", "a_b_c");
+        assert_ne!(first, other_serve);
+        assert_ne!(first, other_machine);
+        assert!(first.starts_with("smolvmdeep-vm-instance-a-"));
+        assert!(first.ends_with(".scope"));
+        assert!(deep_scope_name("instance-a", &"x".repeat(1000)).len() < 100);
+        let deep = Path::new("/sys/fs/cgroup/smolvmdeep.slice").join(&first);
+        let legacy = Path::new("/sys/fs/cgroup/smolvm.slice").join(&first);
+        assert!(deep_scope_dir_owned(&deep, "instance-a", Some("a/b c")));
+        assert!(deep_scope_dir_owned(&deep, "instance-a", None));
+        assert!(!deep_scope_dir_owned(&deep, "instance-b", None));
+        assert!(!deep_scope_dir_owned(&deep, "instance-a", Some("a_b_c")));
+        assert!(!deep_scope_dir_owned(&legacy, "instance-a", Some("a/b c")));
     }
 }

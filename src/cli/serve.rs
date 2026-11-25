@@ -57,12 +57,8 @@ impl ServeCmd {
 #[derive(Parser, Debug)]
 pub struct ServeStartCmd {
     /// Address and port or Unix socket path to listen on
-    #[arg(
-        short,
-        long,
-        default_value_t = default_listen_value(),
-        value_name = "ADDR:PORT|PATH"
-    )]
+    #[arg(short, long, value_name = "ADDR:PORT|PATH")]
+    #[cfg_attr(not(feature = "deep-runtime"), arg(default_value_t = default_listen_value()))]
     listen: String,
 
     /// WorkerResource/1 socket for bundle-scoped operation queries on the Unix listener
@@ -254,6 +250,37 @@ impl Drop for DetachMachinesOnExit {
 impl ServeStartCmd {
     /// Run the serve command.
     pub fn run(self) -> Result<()> {
+        let listen_target = ListenTarget::parse(&self.listen)?;
+        #[cfg(target_os = "linux")]
+        if let Some(socket) = &self.worker_resource_socket {
+            if !socket.is_absolute() || !matches!(listen_target, ListenTarget::Unix(_)) {
+                return Err(smolvm::Error::config(
+                    "configure worker operation queries",
+                    "use an absolute --worker-resource-socket and a Unix --listen address",
+                ));
+            }
+        }
+
+        #[cfg(feature = "deep-runtime")]
+        let _deep_state_lease = {
+            let ListenTarget::Unix(socket) = &listen_target else {
+                return Err(smolvm::Error::config(
+                    "deep Serve",
+                    "an explicit private Unix --listen path is required",
+                ));
+            };
+            if self.guest_rollout_port == smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT {
+                return Err(smolvm::Error::config(
+                    "deep Serve",
+                    "select a private --guest-rollout-port distinct from the official default",
+                ));
+            }
+            smolvm::deep_state::initialize(None)?;
+            if let Some(directory) = &self.cache_disk_dir {
+                smolvm::deep_state::require_private_path(directory)?;
+            }
+            smolvm::deep_state::claim_serve(socket)?
+        };
         // Set JSON log format for the logging initializer to pick up
         if self.json_logs {
             std::env::set_var("SMOLVM_LOG_FORMAT", "json");
@@ -304,17 +331,6 @@ impl ServeStartCmd {
             }
         }
 
-        let listen_target = ListenTarget::parse(&self.listen)?;
-        #[cfg(target_os = "linux")]
-        if let Some(socket) = &self.worker_resource_socket {
-            if !socket.is_absolute() || !matches!(listen_target, ListenTarget::Unix(_)) {
-                return Err(smolvm::Error::config(
-                    "configure worker operation queries",
-                    "use an absolute --worker-resource-socket and a Unix --listen address",
-                ));
-            }
-        }
-
         // Set up verbose logging if requested
         if self.verbose {
             // Re-initialize logging at debug level
@@ -355,7 +371,12 @@ impl ServeStartCmd {
         // Done here — single-threaded, before the tokio runtime — so set_var is
         // safe. See docs/runtime-isolation-hardening.md.
         #[cfg(target_os = "linux")]
-        if smolvm::systemd_scope::is_available() {
+        if cfg!(feature = "deep-runtime") {
+            tracing::info!(
+                slice = smolvm::systemd_scope::VM_SLICE,
+                "deep VM slice budgets belong to the Worker"
+            );
+        } else if smolvm::systemd_scope::is_available() {
             std::env::set_var("SMOLVM_VM_USE_SCOPE", "1");
             tracing::info!("per-VM systemd transient scopes enabled (lossless serve restart)");
             // VMs run in their own slice so they can never starve this API; on
@@ -461,7 +482,7 @@ impl ServeStartCmd {
         // boot failed with a message that never named the cause. Refuse to start
         // instead, naming what blocks and how to fix it.
         #[cfg(target_os = "linux")]
-        if smolvm::process::vm_uid_drop_active() {
+        if smolvm::process::vm_uid_drop_active() && !cfg!(feature = "deep-runtime") {
             let mut needed = vec![("data root", smolvm::agent::vm_cache_root())];
             if let Some(lib) = smolvm::agent::find_lib_dir() {
                 needed.push(("libkrun", lib));
@@ -1043,6 +1064,7 @@ impl ListenTarget {
     }
 }
 
+#[cfg(not(feature = "deep-runtime"))]
 fn default_listen_value() -> String {
     #[cfg(unix)]
     {
@@ -1081,8 +1103,13 @@ fn bind_private_unix_socket(
         .tempdir_in(parent)
         .map_err(smolvm::error::Error::Io)?;
     let staged_path = staging.path().join("s");
-    let listener =
-        tokio::net::UnixListener::bind(&staged_path).map_err(smolvm::error::Error::Io)?;
+    #[cfg(feature = "deep-runtime")]
+    let address = krun_socket::SocketPath::new(&staged_path)?;
+    #[cfg(feature = "deep-runtime")]
+    let bind_path = address.path();
+    #[cfg(not(feature = "deep-runtime"))]
+    let bind_path = &staged_path;
+    let listener = tokio::net::UnixListener::bind(bind_path).map_err(smolvm::error::Error::Io)?;
     std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o600))
         .map_err(smolvm::error::Error::Io)?;
     std::fs::rename(&staged_path, path).map_err(smolvm::error::Error::Io)?;
@@ -1323,11 +1350,27 @@ mod tests {
     use super::ListenTarget;
     use std::time::{Duration, Instant};
 
+    fn parse_start(args: &[&str]) -> std::result::Result<super::ServeStartCmd, clap::Error> {
+        use clap::Parser;
+        super::ServeStartCmd::try_parse_from(
+            ["serve", "--listen", "/run/private/serve.sock"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+    }
+
+    #[cfg(feature = "deep-runtime")]
+    #[test]
+    fn deep_serve_requires_an_explicit_listener() {
+        use clap::Parser;
+        assert!(super::ServeStartCmd::try_parse_from(["serve"]).is_err());
+        assert!(parse_start(&[]).is_ok());
+    }
+
     #[test]
     fn a_server_keeps_larger_checkpoint_caches_than_the_cli() {
-        use clap::Parser;
         let gib = 1024 * 1024 * 1024;
-        let defaults = super::ServeStartCmd::try_parse_from(["serve"]).unwrap();
+        let defaults = parse_start(&[]).unwrap();
         let cache =
             super::server_restore_cache(defaults.restore_cache_entries, defaults.restore_cache_gib);
         assert_eq!(cache.entries, 32);
@@ -1336,8 +1379,7 @@ mod tests {
         let cli = smolvm::portable_checkpoint::RestoreCache::default();
         assert!(cache.entries > cli.entries && cache.max_bytes > cli.max_bytes);
 
-        let sized = super::ServeStartCmd::try_parse_from([
-            "serve",
+        let sized = parse_start(&[
             "--restore-cache-entries",
             "0",
             "--restore-cache-gib",
@@ -1351,33 +1393,24 @@ mod tests {
         assert_eq!(cache.entries, 0);
         assert_eq!(cache.max_bytes, 512 * gib);
         assert_eq!(sized.prepared_checkpoint_cache_gib, 1);
-        assert!(
-            super::ServeStartCmd::try_parse_from(["serve", "--restore-cache-entries", "2000"])
-                .is_err()
-        );
+        assert!(parse_start(&["--restore-cache-entries", "2000"]).is_err());
     }
 
     #[test]
     fn the_guest_rollout_port_defaults_to_the_guest_port_and_can_move() {
-        use clap::Parser;
-        let parse = |args: &[&str]| {
-            super::ServeStartCmd::try_parse_from(
-                std::iter::once("serve").chain(args.iter().copied()),
-            )
-        };
         if std::env::var_os("SMOLVM_GUEST_ROLLOUT_HOST_PORT").is_none() {
             assert_eq!(
-                parse(&[]).unwrap().guest_rollout_port,
+                parse_start(&[]).unwrap().guest_rollout_port,
                 smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT
             );
         }
         assert_eq!(
-            parse(&["--guest-rollout-port", "10091"])
+            parse_start(&["--guest-rollout-port", "10091"])
                 .unwrap()
                 .guest_rollout_port,
             10091
         );
-        assert!(parse(&["--guest-rollout-port", "0"]).is_err());
+        assert!(parse_start(&["--guest-rollout-port", "0"]).is_err());
     }
 
     #[test]

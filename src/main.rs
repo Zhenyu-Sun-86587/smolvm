@@ -237,10 +237,12 @@ fn run_cli() {
     // agree on where smolvm state lives) before anything computes a path. The
     // auto /var/lib/smolvm default is serve-only (applied in its run()). Done
     // first, single-threaded, so the set_var is safe.
-    if let Some(dir) = state_dir_from_args(std::env::args_os().skip(1)) {
-        std::env::set_var("SMOLVM_DATA_DIR", dir);
+    if !cfg!(feature = "deep-runtime") {
+        if let Some(dir) = state_dir_from_args(std::env::args_os().skip(1)) {
+            std::env::set_var("SMOLVM_DATA_DIR", dir);
+        }
+        smolvm::process::apply_system_data_root(/* allow_auto */ false);
     }
-    smolvm::process::apply_system_data_root(/* allow_auto */ false);
 
     // Auto-detect packed binary mode BEFORE parsing the normal CLI.
     // If this executable has a `.smolmachine` sidecar, appended assets,
@@ -268,6 +270,15 @@ fn run_cli() {
     );
     if !internal {
         if let Some(mode) = smolvm_pack::detect_packed_mode() {
+            #[cfg(feature = "deep-runtime")]
+            {
+                let root = state_dir_from_args(std::env::args_os().skip(1));
+                if let Err(error) = smolvm::deep_state::initialize(root.as_deref()) {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+                smolvm::process::apply_system_data_root(false);
+            }
             cli::pack_run::run_as_packed_binary(mode);
         }
         // A packed stub separated from its `.smolmachine` sidecar is
@@ -294,7 +305,40 @@ fn run_cli() {
 
     // Execute command
     // Note: orphan cleanup is handled per-command (skipped for ephemeral `machnie run`).
-    let result = match cli.command {
+    let result = run_command(cli);
+
+    // Handle errors
+    if let Err(e) = result {
+        tracing::debug!(error = %e, "command failed");
+        match error_format {
+            ErrorFormat::Text => eprintln!("Error: {}", e),
+            ErrorFormat::Json => eprintln!(
+                "{}",
+                serde_json::json!({ "error": { "code": e.code(), "message": e.to_string() } })
+            ),
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run_command(cli: Cli) -> smolvm::Result<()> {
+    #[cfg(feature = "deep-runtime")]
+    match &cli.command {
+        Commands::Completion { .. }
+        | Commands::Runtime(_)
+        | Commands::Serve(cli::serve::ServeCmd::Openapi(_)) => {}
+        Commands::Engine(_) => {
+            return Err(smolvm::Error::config(
+                "deep runtime",
+                "Docker Engine activation is unavailable in the deep route",
+            ))
+        }
+        _ => {
+            smolvm::deep_state::initialize(cli.state_dir.as_deref())?;
+            smolvm::process::apply_system_data_root(false);
+        }
+    }
+    match cli.command {
         Commands::Machine(cmd) => (*cmd).run(),
         Commands::Serve(cmd) => cmd.run(),
         #[cfg(target_os = "linux")]
@@ -366,19 +410,6 @@ fn run_cli() {
             cli::cleanup_ephemeral::run(&vm_name, pid, start_time);
             Ok(())
         }
-    };
-
-    // Handle errors
-    if let Err(e) = result {
-        tracing::debug!(error = %e, "command failed");
-        match error_format {
-            ErrorFormat::Text => eprintln!("Error: {}", e),
-            ErrorFormat::Json => eprintln!(
-                "{}",
-                serde_json::json!({ "error": { "code": e.code(), "message": e.to_string() } })
-            ),
-        }
-        std::process::exit(1);
     }
 }
 

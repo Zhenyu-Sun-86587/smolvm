@@ -1733,6 +1733,9 @@ pub fn network_registry_dir(network: &str) -> PathBuf {
 /// (`<cache_dir>/smolvm/uids/`), a sibling of the VM data dirs. Root-managed; the
 /// dropped VMMs never touch it. See `process::allocate_vm_uid`.
 pub fn vm_uid_registry_dir() -> PathBuf {
+    #[cfg(feature = "deep-runtime")]
+    return PathBuf::from(crate::deep_state::UID_REGISTRY);
+    #[cfg(not(feature = "deep-runtime"))]
     vm_cache_root()
         .parent()
         .map(|p| p.join("uids"))
@@ -3774,6 +3777,37 @@ impl AgentManager {
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
+        #[cfg(feature = "deep-runtime")]
+        let deep_machine = {
+            crate::deep_state::require_instance()?;
+            let name = self.name().ok_or_else(|| {
+                Error::config("start deep VM", "the VM needs a named private scope")
+            })?;
+            if !crate::systemd_scope::is_available() || !crate::process::vm_uid_drop_active() {
+                return Err(Error::config(
+                    "start deep VM",
+                    "verified per-VM systemd scope and UID isolation are required for launch",
+                ));
+            }
+            for path in [
+                Some(vm_cache_root()),
+                Some(self.rootfs_path()),
+                super::find_lib_dir(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(blocked) = crate::process::first_nontraversable_ancestor(&path) {
+                    return Err(Error::config(
+                        "start deep VM",
+                        format!("the VMM UID cannot traverse {}", blocked.display()),
+                    ));
+                }
+            }
+            crate::deep_state::prepare_uid_registry()?;
+            name
+        };
+
         for mount in &mounts {
             mount.ensure_source_still_allowed()?;
         }
@@ -4428,9 +4462,17 @@ impl AgentManager {
         // `features.watch_parent = Some(false)` — otherwise its persistent
         // machines die the moment the CLI process exits.
         let watch_parent = features.watch_parent.unwrap_or(boot_binary.is_some());
-        let boot_exe =
-            vm_boot_executable().map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
+        let boot_exe = if cfg!(feature = "deep-runtime") {
+            std::env::current_exe()?
+        } else {
+            vm_boot_executable().map_err(|e| Error::agent("find smolvm binary", e.to_string()))?
+        };
         let mut cmd = std::process::Command::new(&boot_exe);
+        #[cfg(feature = "deep-runtime")]
+        cmd.env(
+            "SMOLVM_DEEP_VM_SCOPE",
+            crate::systemd_scope::scope_name(deep_machine),
+        );
         if let Some(service) = crate::network::launch::guest_host_service()
             .map_err(|reason| Error::config("configure guest rollout ingress", reason))?
         {
@@ -4631,7 +4673,7 @@ impl AgentManager {
         #[cfg(target_os = "linux")]
         let mut adopted_scope = None;
         #[cfg(target_os = "linux")]
-        if std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some() {
+        if cfg!(feature = "deep-runtime") || std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some() {
             if let Some(name) = self.name() {
                 let budget = crate::process::vmm_memory_budget(
                     resources_for_config.memory_mib,
