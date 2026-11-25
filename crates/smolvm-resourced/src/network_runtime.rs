@@ -37,6 +37,23 @@ struct Acknowledge {
     expected_revision: i64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Dial {
+    attachment_id: String,
+    lease_id: String,
+    expected_revision: i64,
+    guest_port: u16,
+    transport: Transport,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Transport {
+    Tcp,
+    Udp,
+}
+
 impl NetworkRuntime {
     pub(crate) fn query(catalog: &Catalog, request: &Request) -> Result<TapLease> {
         let data: PortId = request.payload()?;
@@ -285,6 +302,52 @@ impl NetworkRuntime {
         self.target_port(binding)?
             .close_identity()
             .map_err(host_error)
+    }
+
+    pub(crate) fn dial(
+        &self,
+        catalog: &Catalog,
+        request: &Request,
+        execution: &Execution,
+    ) -> Result<(TapLease, &'static str, OwnedFd)> {
+        catalog.ready()?;
+        let data: Dial = request.payload()?;
+        if !valid_id(&data.attachment_id) || data.guest_port == 0 {
+            return Err(Fault::invalid(
+                "network attachment and nonzero service port are required",
+            ));
+        }
+        let operation = catalog.matching_operation(request)?;
+        let lease = catalog.tap_lease(&data.attachment_id)?;
+        if operation.operation_id != execution.last_operation_id
+            || !lease.matches(execution)
+            || lease.lease_id != data.lease_id
+        {
+            return Err(Fault::new(
+                "E_STALE_EXECUTION",
+                "attachment differs from the service execution",
+            ));
+        }
+        if lease.revision != data.expected_revision {
+            return Err(Fault::new(
+                "E_STALE_REVISION",
+                "service attachment revision changed",
+            ));
+        }
+        if lease.state != "attached" || lease.gate != "open" {
+            return Err(unknown_attachment());
+        }
+        let port = self
+            .ports
+            .get(&data.attachment_id)
+            .ok_or_else(unknown_attachment)?;
+        let address = std::net::SocketAddrV4::new(lease.attachment.private_ipv4, data.guest_port);
+        let (kind, role) = match data.transport {
+            Transport::Tcp => (socket2::Type::STREAM, "network_tcp"),
+            Transport::Udp => (socket2::Type::DGRAM, "network_udp"),
+        };
+        let socket = port.dial(address, kind).map_err(host_error)?;
+        Ok((lease, role, socket))
     }
 
     pub(crate) fn fence(&mut self, catalog: &Catalog, request: &Request) -> Result<()> {

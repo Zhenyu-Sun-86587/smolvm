@@ -3,8 +3,8 @@
 use super::{enter_private_namespace, prepare_tap_port, PreparedTapPort, TAP_PORT_NAME};
 use std::fs::File;
 use std::io::{self, Write};
-use std::net::Ipv4Addr;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::process::{self, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -241,6 +241,31 @@ impl PrivateRouter {
 }
 
 impl QuarantinedPort {
+    /// Start a nonblocking connection in the private router namespace, using
+    /// the attachment's routed address. The receiver owns connection polling.
+    pub(crate) fn dial(&self, address: SocketAddrV4, kind: socket2::Type) -> io::Result<OwnedFd> {
+        let router = self.router_link.router.clone();
+        thread::Builder::new()
+            .name("dial-network-attachment".to_owned())
+            .spawn(move || {
+                // Only this short-lived thread enters the Worker network domain.
+                if unsafe { libc::setns(router.namespace().as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let socket = socket2::Socket::new(socket2::Domain::IPV4, kind, None)?;
+                socket.set_nonblocking(true)?;
+                match socket.connect(&address.into()) {
+                    Ok(()) => Ok(socket.into()),
+                    Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => {
+                        Ok(socket.into())
+                    }
+                    Err(error) => Err(error),
+                }
+            })?
+            .join()
+            .map_err(|_| io::Error::other("attachment dialer panicked"))?
+    }
+
     /// Install the exact prepared identity policy while the TAP is still down.
     pub(crate) fn arm_identity(&self) -> io::Result<()> {
         self.close_identity()?;

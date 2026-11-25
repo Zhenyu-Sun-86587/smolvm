@@ -454,6 +454,28 @@ impl Worker {
                     .acknowledge(&self.catalog, request, &execution)
                     .map(|lease| json!(lease))
             }
+            "DialNetworkAttachment" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new(
+                        "E_PERMISSION_DENIED",
+                        "Worker control peer required for a service dial",
+                    ));
+                }
+                let execution = self.scoped_execution(request)?;
+                self.verify_live_execution(&execution)?;
+                let (lease, role, fd) = self.network.dial(&self.catalog, request, &execution)?;
+                self.verify_live_execution(&execution)?;
+                return Ok(Reply {
+                    table: vec![ipc::FdEntry {
+                        index: 0,
+                        resource_id: lease.attachment.attachment_id.clone(),
+                        role: role.to_owned(),
+                    }],
+                    result: json!(lease),
+                    descriptors: vec![fd],
+                    delivered: None,
+                });
+            }
             "PublishInitialNetworkAttachment" => {
                 let execution =
                     if peer.uid == self.admin_uid || peer.uid == unsafe { libc::geteuid() } {
