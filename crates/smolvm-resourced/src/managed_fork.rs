@@ -151,6 +151,9 @@ pub(crate) fn submit(
             "source inventory is ineligible for parked capture",
         ));
     }
+    if inv.devices.iter().any(|dev|dev["virtio_type"]==19 && dev["parked_vsock_rebind"]!=true) {
+        return Err(Fault::new("E_CAPABILITY_UNSUPPORTED","this source vsock has no verified parked rebind contract"));
+    }
     let (session, token, anchor) = if inv.source_disposition == "STANDBY" {
         c.db.query_row("SELECT n.session,n.token,n.anchor FROM native_standby s JOIN native_transitions n USING(operation_id) WHERE s.incarnation_id=? AND n.mode='managed'",[incarnation],
             |r|Ok((r.get::<_,u32>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?.ok_or_else(||conflict("source requires managed standby"))?
@@ -432,7 +435,7 @@ impl Actor {
         }
         let jobs = {
             let mut q=c.db.prepare("SELECT operation_id,source_incarnation,capture_id,session,token,anchor,stage,original,network_gate,pivot_json,(SELECT kind FROM operations o WHERE o.operation_id=b.operation_id)
-                FROM managed_fork_batches b WHERE stage IN ('cancel_preflight','children','cancel_gate','arming','parking','standby','holding','pivoting','source_return','waking')
+                FROM managed_fork_batches b WHERE stage IN ('failure_return','cancel_preflight','children','cancel_gate','arming','parking','standby','holding','pivoting','source_return','waking')
                 OR (stage='exporting' AND EXISTS (SELECT 1 FROM operations o WHERE o.operation_id=b.operation_id AND o.kind IN ('independent_fork','fork_batch'))) ORDER BY rowid")?;
             let result = q
                 .query_map([], |r| {
@@ -519,8 +522,29 @@ impl Actor {
                     j.advance(c, "holding")?
                 }
             }
+            "failure_return" => {
+                let inv=ep.inventory()?;
+                if inv.source_disposition=="HELD" {
+                    ep.command(&format!("CAPTURE_FINISH {scope} RETURN_STANDBY"))?;
+                    return Ok(());
+                }
+                if inv.source_disposition=="STANDBY" && j.original=="RUNNING" {
+                    ep.command(&format!("STANDBY_WAKE {scope}"))?;
+                    return Ok(());
+                }
+                if inv.source_disposition==j.original {
+                    let reason:String=c.db.query_row("SELECT coalesce(error,'native capture refused') FROM managed_fork_batches WHERE operation_id=?",[&j.id],|r|r.get(0))?;
+                    finish_abort(c,&j.id,Some(&reason))?;
+                }
+            }
             "holding" => {
-                let status = ep.command(&format!("CAPTURE_PREPARE {scope} parked"))?;
+                let status = match ep.command(&format!("CAPTURE_PREPARE {scope} parked")) {
+                    Err(fault) if fault.code=="E_NATIVE_REFUSED" && fault.message.starts_with("ENOTSUP") => {
+                        c.db.execute("UPDATE managed_fork_batches SET stage='failure_return',error=? WHERE operation_id=? AND stage='holding'",params![fault.message,j.id])?;
+                        return Ok(())
+                    }
+                    result=>result?
+                };
                 if serde_json::from_str::<Value>(&status).map_err(invalid)?["source_disposition"]
                     == "HELD"
                 {
