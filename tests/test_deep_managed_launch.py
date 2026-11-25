@@ -151,7 +151,7 @@ def partial_fork(endpoint, root, ref):
     print("One of two targets was killed before activation. Retry kept the successful execution and original capture, and advanced only the failed child's epoch.",flush=True)
 
 
-def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults):
+def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults, observer=None):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
@@ -284,6 +284,7 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
                 assert "E_VOLUME_BUSY" in str(error), error
             else:
                 raise AssertionError("another machine consumed a volume reservation")
+        launch_started = time.monotonic_ns()
         original = http(endpoint, EXT+"/operations",submit)
         assert original["phase"] == "NEW"
         def final():
@@ -349,6 +350,9 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
             print("The managed Debian Guest Agent reported systemd as PID 1 over its incarnation-scoped socket.",flush=True)
         else:
             until(lambda:"PARKED_BLOCK_TICK " in guest_log(),20)
+        if observer is not None:
+            observer(endpoint, root, ref, record, launch_started)
+            return
         serve.kill()
         serve.wait()
         serve=spawn(serve_command,"serve.log")

@@ -30,3 +30,42 @@ The runtime stage verifies the seed and matches its crun provenance to the pinne
 The manual **Build deep runtime from source** workflow runs both stages inside the digest-pinned builder image. Dispatch it from the smolvm commit in the build lock and supply the pinned platform checkout and lock directory, plus HTTPS locations for the kernel and OCI seed. The workflow stores the runtime stage as a tar archive to preserve file modes.
 
 The stage output is intended for subsequent Bundle packaging. Packaging requires production identity, profile and license inputs. An isolated KVM boot and exec gate is still required for release.
+
+## Managed runtime benchmark
+
+Run the benchmark on a development Worker with KVM, an installed managed
+RuntimeBundle, Python 3.11 or newer and a C compiler capable of static linking.
+
+```bash
+sudo python3 scripts/deep/bench-managed-runtime.py \
+  --bundle "$BUNDLE" --output /var/tmp/managed-bench.json \
+  --samples 2 --modes clean dirty --read-lanes 16 4 0 --durable
+```
+
+Each sample runs inside private mount and network namespaces. It exercises
+cold start, repeated capture, concurrent fanout, three recursive generations,
+checkpoint publication and two reads of a durable StatePoint. Use
+`--fanout` to fit the Worker's admitted vCPU budget. A focused lane count
+comparison can use `--depth 0` and omit `--durable`.
+
+The Guest writes and verifies separate markers on two real writable block
+devices. In each restored Guest a new workload forks four readers, performs
+1,024 direct random 4 KiB reads and verifies every returned block. The
+`dirty` workload also overwrites 16 MiB of Guest memory per heartbeat.
+
+The JSON report contains every successful sample, observed Worker operation
+phases and per-scenario p50 and p95 values. Source heartbeat gaps measure the
+change in the Guest's ordinary execution loop. Host detection of the first
+workload result uses the polling resolution of the harness. The report includes
+per-target PSS, Linux RSS high-water values, thread counts, host I/O counters
+and observed read rates. Global host page caches remain in place. The first
+and repeated durable reads use the same StatePoint and separate target
+incarnations. The fixture uses local disks and a Guest without a TAP device.
+
+The lane sweep requires a libkrun build that supports `KRUN_BLOCK_READ_LANES`.
+The expected host VMM thread difference for the three synchronous block
+devices is 36 threads between 16 and 4 lanes or 48 between 16 and 0.
+
+The optional `--guest-dir` accepts static `bench-guest-clean` and
+`bench-guest-dirty` artifacts built from the fixture with `DIRTY_MIB=0`
+and `DIRTY_MIB=16`. Their SHA-256 values are recorded in each sample.
