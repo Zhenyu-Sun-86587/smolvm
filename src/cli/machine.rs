@@ -467,6 +467,12 @@ pub enum MachineCmd {
 
     /// Save RAM and disk durably, then stop at the saved execution boundary
     Pause(PauseCmd),
+    /// Hold this live execution in memory
+    #[cfg(feature = "deep-runtime")]
+    Standby(super::runtime::StandbyCmd),
+    /// Wake the registered execution from native standby
+    #[cfg(feature = "deep-runtime")]
+    Wake(super::runtime::NativeMachineCmd),
 
     /// Resume saved execution in the same machine
     Resume(ResumeCmd),
@@ -547,16 +553,22 @@ impl MachineCmd {
         // helper didn't finish (Ctrl-C / SIGKILL / host sleep mid-run). The cap
         // keeps the boot hot path from stalling on a large backlog — it drains
         // over successive runs. Other commands sweep everything.
+        #[cfg(feature = "deep-runtime")]
+        let remote_operation = matches!(&self, MachineCmd::Standby(_) | MachineCmd::Wake(_));
+        #[cfg(not(feature = "deep-runtime"))]
+        let remote_operation = false;
         if matches!(self, MachineCmd::Run(_)) {
             super::vm_common::cleanup_orphaned_ephemeral_vms_bounded(EPHEMERAL_RUN_SWEEP_CAP);
-        } else if !matches!(
-            self,
-            MachineCmd::ImageFeed(_)
-                | MachineCmd::CheckpointRequirements(_)
-                | MachineCmd::SshConfig(_)
-                | MachineCmd::SshProxy(_)
-                | MachineCmd::SshStart(_)
-        ) {
+        } else if !remote_operation
+            && !matches!(
+                self,
+                MachineCmd::ImageFeed(_)
+                    | MachineCmd::CheckpointRequirements(_)
+                    | MachineCmd::SshConfig(_)
+                    | MachineCmd::SshProxy(_)
+                    | MachineCmd::SshStart(_)
+            )
+        {
             super::vm_common::cleanup_orphaned_ephemeral_vms();
         }
 
@@ -578,6 +590,10 @@ impl MachineCmd {
             MachineCmd::BranchRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Pause(cmd) => cmd.run(),
+            #[cfg(feature = "deep-runtime")]
+            MachineCmd::Standby(cmd) => cmd.run(),
+            #[cfg(feature = "deep-runtime")]
+            MachineCmd::Wake(cmd) => cmd.wake(),
             MachineCmd::Resume(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),

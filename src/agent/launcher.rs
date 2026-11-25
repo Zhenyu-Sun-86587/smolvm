@@ -2133,6 +2133,22 @@ fn launch_agent_vm_inner(
             Ok(p) if !p.is_empty() => Some(PathBuf::from(p)),
             _ => vsock_socket.parent().map(|d| d.join("control.sock")),
         };
+        #[cfg(feature = "deep-runtime")]
+        if let Some(helper) = crate::runtime_ext::launch::guest_gate() {
+            let native_rc = match helper {
+                Some(digest) => krun
+                    .set_guest_identity_helper
+                    .map(|f| f(ctx, digest.as_ptr(), digest.len())),
+                None => krun.enable_guest_gate.map(|f| f(ctx)),
+            };
+            if native_rc != Some(0) || krun.set_control_socket.is_none() || ctl_path.is_none() {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure native Guest gate",
+                    format!("incompatible bundle control ABI ({native_rc:?})"),
+                ));
+            }
+        }
         if let Some(ref ctl) = ctl_path {
             let ctl_str = ctl.to_string_lossy().into_owned();
             match krun.set_control_socket {
@@ -2140,6 +2156,14 @@ fn launch_agent_vm_inner(
                     Ok(ctl_c) => {
                         let ret = set_control_socket(ctx, ctl_c.as_ptr());
                         if ret < 0 {
+                            #[cfg(feature = "deep-runtime")]
+                            if crate::runtime_ext::launch::guest_gate().is_some() {
+                                krun_free_ctx(ctx);
+                                return Err(Error::agent(
+                                    "attach native control socket",
+                                    format!("libkrun returned {ret}"),
+                                ));
+                            }
                             tracing::warn!("krun_set_control_socket failed: {ret}");
                         } else {
                             tracing::info!(socket = %ctl_str, "control socket enabled");

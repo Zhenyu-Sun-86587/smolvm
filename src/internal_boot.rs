@@ -282,6 +282,8 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
         crate::process::exit_child(1);
     }
 
+    #[cfg(feature = "deep-runtime")]
+    let native_ticket = crate::runtime_ext::launch::read_ticket()?;
     // Close inherited file descriptors from the parent (server).
     // Without this, the subprocess holds database locks, network sockets, etc.
     // that can interfere with libkrun's operation. Keep stdin/stdout/stderr (0-2)
@@ -547,9 +549,17 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
         // dumpable here (after the drop) for a forkable VM, or fork breaks under
         // per-VM uid isolation. See process::set_dumpable.
         #[cfg(target_os = "linux")]
-        if std::env::var_os("SMOLVM_FORKABLE").is_some() {
+        let legacy_forkable = std::env::var_os("SMOLVM_FORKABLE").is_some();
+        #[cfg(feature = "deep-runtime")]
+        let legacy_forkable = legacy_forkable && native_ticket.is_none();
+        #[cfg(target_os = "linux")]
+        if legacy_forkable {
             crate::process::set_dumpable(true);
         }
+    }
+    #[cfg(feature = "deep-runtime")]
+    if let Some(ticket) = native_ticket {
+        ticket.register()?;
     }
 
     // A fork clone restores by mapping the golden's guest-RAM memfd, opened via

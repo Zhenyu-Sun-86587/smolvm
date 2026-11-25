@@ -159,6 +159,9 @@ pub fn submit(catalog: &mut Catalog, boot: &str, r: &Request, input: Input) -> R
         }
         s
     } else {
+        if let Some(reason) = observed.standby_blocker.as_deref() {
+            return Err(unsupported(reason));
+        }
         if observed.source_disposition != "RUNNING" {
             return Err(Fault::new("E_STATE_CONFLICT", "source is not running"));
         }
@@ -417,7 +420,24 @@ impl Transition {
             "waking" => format!("STANDBY_WAKE {}", s.scope()),
             _ => return Err(unsupported("unknown native operation stage")),
         };
-        let receipt: Value = serde_json::from_str(&ep.command(&command)?)
+        let reply = match ep.command(&command) {
+            Err(fault)
+                if self.stage == "entering"
+                    && fault.code == "E_NATIVE_REFUSED"
+                    && fault.message.starts_with("ENOTSUP ") =>
+            {
+                let inventory = ep.inventory()?;
+                if inventory.source_disposition == "RUNNING" {
+                    return Ok(Next::Finish(false, "RUNNING", Some(fault.message)));
+                }
+                if s.mode == "managed" && self.gate(ep, "QUERY", "")?.0 == "parked" {
+                    return Ok(Next::Advance("aborting", "GUEST_HELD"));
+                }
+                return Err(fault);
+            }
+            result => result?,
+        };
+        let receipt: Value = serde_json::from_str(&reply)
             .map_err(|_| Fault::invalid("invalid VMM standby receipt"))?;
         if receipt["protocol"] != "CaptureControl/1"
             || receipt["session"] != s.number

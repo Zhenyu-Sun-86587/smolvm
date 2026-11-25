@@ -57,6 +57,8 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use self::error::ApiError;
+#[cfg(feature = "deep-runtime")]
+pub use crate::runtime_ext::launch::configure_native_launch_worker;
 #[cfg(target_os = "linux")]
 pub use crate::runtime_ext::worker_operations_router;
 use state::ApiState;
