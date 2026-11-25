@@ -213,6 +213,7 @@ impl Catalog {
             "manifest_digest":digest,"commit_id":manifest.commit_id,
         }).to_string())?;
         add_disks(&tx, id, &record.point.disk_generations)?;
+        crate::activation_catalog::publish_statepoint_tap(&tx, record, digest)?;
         tx.execute(
             "INSERT INTO root_refs VALUES(?,?,?,'active',1,?)",
             params![

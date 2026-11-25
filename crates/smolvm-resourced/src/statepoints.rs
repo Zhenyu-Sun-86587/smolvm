@@ -164,6 +164,8 @@ impl StatePoints {
             Some(_) => return Err(conflict("held capture bytes changed on export replay")),
             None => catalog.start_statepoint(&operation, &export, &point)?,
         };
+        crate::activation_catalog::pin_statepoint_tap(catalog, &record, source,
+            record.point.devices.iter().any(|device|device.is_network()))?;
         let directory = self.directory.clone();
         let bundle = operation.bundle_digest;
         let commit_id = operation.operation_id;

@@ -100,6 +100,8 @@ struct Attachment {
 }
 
 impl Device {
+    pub(crate) fn is_network(&self) -> bool { self.virtio_type == 1 }
+
     pub(crate) fn managed_source(&self)->Option<(&str,(&str,&str))> {
         let a=&self.block.as_ref()?.managed_attachment;
         Some((&a.device_id,(a.writable_head_id.as_deref().unwrap_or(&a.generation_id),&a.volume_id)))

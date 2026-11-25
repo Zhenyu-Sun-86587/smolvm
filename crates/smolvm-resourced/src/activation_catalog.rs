@@ -1,7 +1,7 @@
 use crate::catalog::{Catalog, Execution, Operation};
 use crate::ipc::{valid_digest, valid_id, Fault, Result};
 use crate::network_lease_catalog::{AttachmentDescriptor, TapLease};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -98,8 +98,8 @@ struct CaptureOrigin {
     digest: String,
 }
 
-fn capture_origin(catalog: &Catalog, resource_id: &str) -> Result<CaptureOrigin> {
-    catalog.db.query_row(
+fn capture_origin(db: &Connection, resource_id: &str) -> Result<CaptureOrigin> {
+    db.query_row(
         "SELECT e.incarnation_id,e.execution_epoch,t.descriptor_digest
         FROM fd_transfers t JOIN executions e USING(incarnation_id) JOIN resources r USING(resource_id)
         WHERE t.resource_id=?1 AND t.state='committed' AND r.kind='descriptor' AND r.state='available' AND r.immutable=1
@@ -119,9 +119,8 @@ struct CapturedTap {
     bound: Option<BoundTap>,
 }
 
-fn captured_tap(catalog: &Catalog, resource_id: &str) -> Result<Option<CapturedTap>> {
-    let row: Option<(String, i64, String, Option<String>)> = catalog
-        .db
+fn captured_tap(db: &Connection, resource_id: &str) -> Result<Option<CapturedTap>> {
+    let row: Option<(String, i64, String, Option<String>)> = db
         .query_row(
             "SELECT source_incarnation_id,source_execution_epoch,capture_digest,bound_tap_json
         FROM capture_network_attestations WHERE resource_id=?",
@@ -159,13 +158,23 @@ pub(crate) fn pin_source_tap(
     execution: &Execution,
     expects_network: bool,
 ) -> Result<()> {
-    let origin = capture_origin(catalog, resource_id)?;
+    let origin = capture_origin(&catalog.db, resource_id)?;
+    pin_capture_tap(catalog, resource_id, origin, execution, expects_network)
+}
+
+fn pin_capture_tap(
+    catalog: &Catalog,
+    resource_id: &str,
+    origin: CaptureOrigin,
+    execution: &Execution,
+    expects_network: bool,
+) -> Result<()> {
     if origin.incarnation != execution.incarnation_id || origin.epoch != execution.execution_epoch {
         return Err(tap_fence(
             "capture does not belong to this source execution",
         ));
     }
-    if let Some(existing) = captured_tap(catalog, resource_id)? {
+    if let Some(existing) = captured_tap(&catalog.db, resource_id)? {
         return if existing.origin == origin && existing.bound.is_some() == expects_network {
             Ok(())
         } else {
@@ -190,12 +199,20 @@ pub(crate) fn pin_source_tap(
             ))
         }
     };
+    store_captured_tap(&catalog.db, resource_id, &origin, bound.as_ref())
+}
+
+fn store_captured_tap(
+    db: &Connection,
+    resource_id: &str,
+    origin: &CaptureOrigin,
+    bound: Option<&BoundTap>,
+) -> Result<()> {
     let json = bound
-        .as_ref()
         .map(serde_json::to_string)
         .transpose()
         .map_err(|_| Fault::new("E_CATALOG", "cannot encode captured TAP attestation"))?;
-    catalog.db.execute(
+    db.execute(
         "INSERT INTO capture_network_attestations VALUES(?,?,?,?,?)",
         params![
             resource_id,
@@ -208,6 +225,82 @@ pub(crate) fn pin_source_tap(
     Ok(())
 }
 
+fn statepoint_export_origin(
+    db: &Connection,
+    record: &crate::statepoint_catalog::Record,
+) -> Result<(String, CaptureOrigin)> {
+    db.query_row(
+        "SELECT p.volatile_id,e.incarnation_id,e.execution_epoch,r.descriptor_digest
+        FROM statepoints p JOIN resources r ON r.resource_id=p.volatile_id
+        JOIN executions e ON e.incarnation_id=p.source_incarnation_id
+        WHERE p.capture_id=?1 AND p.operation_id=?2 AND p.representation_id=?3
+          AND p.phase IN ('exporting','durable') AND r.state='available' AND r.immutable=1
+          AND r.durability='volatile' AND r.created_by_operation=?2
+          AND json_extract(r.descriptor_json,'$.source_ram_digest')=?4
+          AND json_extract(r.descriptor_json,'$.checkpoint_digest')=?5",
+        params![
+            record.export.capture_id,
+            record.operation_id,
+            record.point.representation_id,
+            record.point.source_ram_digest,
+            record.point.checkpoint_digest
+        ],
+        |r| {
+            Ok((
+                r.get(0)?,
+                CaptureOrigin {
+                    incarnation: r.get(1)?,
+                    epoch: r.get(2)?,
+                    digest: r.get(3)?,
+                },
+            ))
+        },
+    )
+    .optional()?
+    .ok_or_else(|| tap_fence("StatePoint volatile capture descriptor changed"))
+}
+
+/// Pin the captured network while a StatePoint's source is still held.
+pub(crate) fn pin_statepoint_tap(
+    catalog: &Catalog,
+    record: &crate::statepoint_catalog::Record,
+    execution: &Execution,
+    expects_network: bool,
+) -> Result<()> {
+    if record.phase != "exporting" {
+        return Err(tap_fence("StatePoint has passed the network capture phase"));
+    }
+    let (volatile, origin) = statepoint_export_origin(&catalog.db, record)?;
+    pin_capture_tap(catalog, &volatile, origin, execution, expects_network)
+}
+
+/// Transfer the pinned source evidence inside the StatePoint publish transaction
+/// after the immutable representation has been created and before volatile GC.
+pub(crate) fn publish_statepoint_tap(
+    tx: &Transaction<'_>,
+    record: &crate::statepoint_catalog::Record,
+    manifest_digest: &str,
+) -> Result<()> {
+    let (volatile, origin) = statepoint_export_origin(tx, record)?;
+    let Some(captured) = captured_tap(tx, &volatile)? else {
+        // StatePoints created before this attestation keep the legacy path.
+        return Ok(());
+    };
+    let representation = &record.point.representation_id;
+    let durable = capture_origin(tx, representation)?;
+    if captured.origin != origin
+        || durable.incarnation != origin.incarnation
+        || durable.epoch != origin.epoch
+        || durable.digest != manifest_digest
+        || !valid_digest(manifest_digest)
+    {
+        return Err(tap_fence(
+            "StatePoint capture and durable representation differ",
+        ));
+    }
+    store_captured_tap(tx, representation, &durable, captured.bound.as_ref())
+}
+
 /// Construct the SGI2 intent from sealed source provenance and the target's
 /// exact attached TAP. A no-network capture requires no target TAP.
 pub(crate) fn captured_network_input(
@@ -215,11 +308,9 @@ pub(crate) fn captured_network_input(
     resource_id: &str,
     target: &Operation,
 ) -> Result<Option<Value>> {
-    let captured = captured_tap(catalog, resource_id)?
-        .ok_or_else(|| tap_fence("capture has no durable network attestation"))?;
-    let source = catalog.execution(&captured.origin.incarnation)?;
-    if captured.origin != capture_origin(catalog, resource_id)?
-        || target.kind != "restore_target"
+    let origin = capture_origin(&catalog.db, resource_id)?;
+    let source = catalog.execution(&origin.incarnation)?;
+    if target.kind != "restore_target"
         || source.route_id != target.route_id
         || source.bundle_digest != target.bundle_digest
     {
@@ -227,13 +318,22 @@ pub(crate) fn captured_network_input(
             "captured network is outside the target route or bundle",
         ));
     }
+    let bound = match captured_tap(&catalog.db, resource_id)? {
+        Some(captured) if captured.origin == origin => captured.bound,
+        Some(_) => {
+            return Err(tap_fence(
+                "captured network is outside the immutable source",
+            ))
+        }
+        None => legacy_source_tap(catalog, &source)?,
+    };
     let mut query = catalog.db.prepare(
         "SELECT attachment_id FROM network_tap_leases WHERE operation_id=? AND state<>'retired'",
     )?;
     let targets = query
         .query_map([&target.operation_id], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    match (captured.bound, targets.as_slice()) {
+    match (bound, targets.as_slice()) {
         (None, []) => Ok(None),
         (Some(source), [id]) => {
             let tap = catalog.tap_lease(id)?;
@@ -259,6 +359,26 @@ pub(crate) fn captured_network_input(
         _ => Err(tap_fence(
             "target TAP inventory differs from the captured network",
         )),
+    }
+}
+
+fn legacy_source_tap(catalog: &Catalog, source: &Execution) -> Result<Option<BoundTap>> {
+    match catalog.tap_leases_for_execution(source)?.as_slice() {
+        [lease] if lease.state == "attached" => Ok(Some(BoundTap::try_from(lease.clone())?)),
+        [] => {
+            let had_port = catalog.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM network_tap_leases WHERE incarnation_id=? AND execution_epoch=?)",
+                params![source.incarnation_id, source.execution_epoch],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if had_port {
+                return Err(tap_fence(
+                    "earlier networked capture lacks its source TAP attestation",
+                ));
+            }
+            Ok(None)
+        }
+        _ => Err(tap_fence("capture needs its exact source TAP")),
     }
 }
 
@@ -445,7 +565,7 @@ fn network_binding(
     source: &SourceCapture,
     execution: &Execution,
 ) -> Result<Option<NetworkBinding>> {
-    let pinned = captured_tap(catalog, resource)?;
+    let pinned = captured_tap(&catalog.db, resource)?;
     let has_attestation = pinned.is_some();
     let old = if let Some(pinned) = pinned {
         if pinned.origin.incarnation != source.incarnation_id
@@ -463,11 +583,7 @@ fn network_binding(
         if original.execution_epoch != source.execution_epoch {
             return Err(tap_fence("source lease is outside the capture epoch"));
         }
-        match catalog.tap_leases_for_execution(&original)?.as_slice() {
-            [] => None,
-            [lease] if lease.state == "attached" => Some(BoundTap::try_from(lease.clone())?),
-            _ => return Err(tap_fence("capture needs its exact source TAP")),
-        }
+        legacy_source_tap(catalog, &original)?
     };
     let targets = catalog.tap_leases_for_execution(execution)?;
     match (old, targets.as_slice(), input) {
