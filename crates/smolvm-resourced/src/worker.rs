@@ -1095,7 +1095,7 @@ impl Worker {
             "RetryManagedFork" => Ok(json!(crate::managed_fork::retry(&mut self.catalog,request,request.payload()?)?)),
             "CancelNativeOperation" => {
                 let op=self.catalog.matching_operation(request)?;
-                if matches!(op.kind.as_str(),"independent_fork"|"fork_batch") {
+                if matches!(op.kind.as_str(),"independent_fork"|"fork_batch"|"hibernate"|"vm_rollback"|"vm_snapshot") {
                     return Ok(json!(crate::managed_fork::cancel(&mut self.catalog, request, request.payload()?)?));
                 }
                 let op = crate::native_operations::cancel(

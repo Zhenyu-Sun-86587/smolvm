@@ -100,7 +100,10 @@ def durable_points(endpoint, source, name, logfile):
     clone_op=invoke("vm_restore","clone-checkpoint",{"name":clone,"capture_id":snapshot["capture_id"],"mode":"clone_conflicts"},slot(clone))["statepoint"]
     assert clone_op["manifest_digest"]==snapshot["manifest_digest"] and any(a!=b for a,b in clone_op["volume_map"].items()),clone_op
     copy,clone_ticks=watch(clone)
-    assert copy["instance_id"]!=current["instance_id"] and clone_ticks[0][1:3]==ticks[0][1:3] and clone_ticks[0][3]==clone,clone_ticks[:2]
+    assert copy["instance_id"]!=current["instance_id"] and clone_ticks[0][1:3]==ticks[0][1:3] ,clone_ticks[:2]
+    # If the cut landed after gethostname(), the suspended loop can print its cached
+    # value once. The next iteration reads each target's installed identity.
+    assert clone_ticks[1][3]==clone and ticks[1][3]==name and clone_ticks[1][4]!=ticks[1][4],(clone_ticks[1],ticks[1])
     assert clone_ticks[0][5:7]==ticks[0][5:7],(clone_ticks[0],ticks[0])
     print("A separate restore from the original checkpoint reproduced the RAM and two-disk boundary in another logical instance.",flush=True)
 
