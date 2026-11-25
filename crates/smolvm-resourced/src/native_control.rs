@@ -142,7 +142,7 @@ impl Endpoint {
         let (socket, _pidfd) = endpoint.connect()?;
         ipc::peer(&socket).map_err(unavailable)
     }
-    fn connect(&self) -> Result<(Socket, OwnedFd)> {
+    pub(crate) fn connect(&self) -> Result<(Socket, OwnedFd)> {
         let (start, pidfd) = observe_pid(self.pid)?;
         if start != self.start {
             return Err(stale());

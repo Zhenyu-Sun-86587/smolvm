@@ -207,13 +207,28 @@ fn source_capture(
            AND resource.kind='descriptor' AND resource.state='available' AND resource.immutable=1
            AND lease.incarnation_id=?2 AND lease.operation_id=?3 AND lease.state='attached'
            AND source.bundle_digest=?4 AND source.incarnation_id<>?2 AND source.route_id=?5
-         ORDER BY lease.lease_id LIMIT 1",
+         UNION ALL
+         SELECT p.manifest_digest,source.incarnation_id,source.execution_epoch,lease.lease_id,lease.revision
+         FROM statepoints p
+         JOIN resources resource ON resource.resource_id=p.representation_id
+         JOIN executions source ON source.incarnation_id=p.source_incarnation_id
+         JOIN fd_leases lease ON lease.resource_id=p.representation_id
+         WHERE p.representation_id=?1 AND (
+             p.phase='hibernated' OR (p.phase='durable' AND json_extract(p.export_json,'$.purpose')='checkpoint')
+         ) AND resource.state='available' AND resource.immutable=1 AND resource.durability='durable'
+           AND lease.incarnation_id=?2 AND lease.operation_id=?3 AND lease.state='attached'
+           AND source.bundle_digest=?4 AND source.incarnation_id<>?2 AND source.route_id=?5
+           AND json_extract(p.point_json,'$.capture_anchor')=?6
+           AND json_extract(p.point_json,'$.helper_digest')=?7
+         ORDER BY 4 LIMIT 1",
             params![
                 input.capture_resource_id,
                 execution.incarnation_id,
                 execution.last_operation_id,
                 execution.bundle_digest,
-                execution.route_id
+                execution.route_id,
+                input.capture_anchor,
+                input.helper_digest,
             ],
             |row| {
                 Ok(SourceCapture {

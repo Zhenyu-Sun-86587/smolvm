@@ -233,7 +233,11 @@ pub fn receive(socket: &Socket) -> Result<Vec<u8>> {
 }
 
 pub fn receive_packet(socket: &Socket) -> Result<Packet> {
-    let mut packet = vec![0; MAX_PACKET];
+    receive_packet_with_limit(socket, MAX_PACKET)
+}
+
+pub(crate) fn receive_packet_with_limit(socket: &Socket, limit: usize) -> Result<Packet> {
+    let mut packet = vec![0; limit];
     let mut body = libc::iovec {
         iov_base: packet.as_mut_ptr().cast(),
         iov_len: packet.len(),

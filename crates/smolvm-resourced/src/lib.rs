@@ -39,6 +39,14 @@ mod network_runtime;
 #[cfg(target_os = "linux")]
 mod pivots;
 #[cfg(target_os = "linux")]
+mod statepoint_capture;
+#[cfg(target_os = "linux")]
+mod statepoint_catalog;
+#[cfg(target_os = "linux")]
+mod statepoint_store;
+#[cfg(target_os = "linux")]
+mod statepoints;
+#[cfg(target_os = "linux")]
 mod worker;
 
 #[cfg(target_os = "linux")]

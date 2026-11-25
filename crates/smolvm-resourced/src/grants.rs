@@ -6,7 +6,7 @@ use crate::pivots::ForkOrigin;
 use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -44,6 +44,8 @@ struct RestoreProof {
     origin: ForkOrigin,
     grant_id: String,
     expected_revision: i64,
+    #[serde(default)]
+    statepoint_lease_id: Option<String>,
     heads: Vec<RestoreHead>,
 }
 
@@ -77,6 +79,30 @@ pub fn verify_restore_writer(
             "restore has no current attached writer grant",
         ));
     }
+    let exact = if let Some(lease) = &wanted.statepoint_lease_id {
+        let policy: String = catalog
+            .db
+            .query_row(
+                "SELECT l.volume_policy FROM statepoint_restore_leases l
+            JOIN fd_leases f USING(lease_id) JOIN statepoints p USING(capture_id)
+            WHERE l.lease_id=? AND f.operation_id=? AND f.incarnation_id=? AND f.state='attached'
+                AND p.operation_id=? AND p.representation_id=f.resource_id",
+                params![
+                    lease,
+                    operation.operation_id,
+                    execution.incarnation_id,
+                    wanted.origin.pivot_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                fence_unproven("StatePoint writer policy is outside this restore lease")
+            })?;
+        policy == "exact"
+    } else {
+        false
+    };
     let set = catalog
         .writer_set(&grant.operation_id)?
         .ok_or_else(|| fence_unproven("restore writer reservation is missing"))?;
@@ -86,7 +112,7 @@ pub fn verify_restore_writer(
         ));
     }
     let mut sources = HashMap::new();
-    let mut volumes = HashSet::new();
+    let mut volumes = HashMap::new();
     for (((head, record), entry), descriptor) in wanted
         .heads
         .iter()
@@ -111,7 +137,9 @@ pub fn verify_restore_writer(
             || sources
                 .insert(head.source_volume_id.clone(), head.generation_id.clone())
                 .is_some()
-            || !volumes.insert(head.volume_id.clone())
+            || volumes
+                .insert(head.volume_id.clone(), head.head_resource_id.clone())
+                .is_some()
         {
             return Err(fence_unproven(
                 "restore head does not start at its exact immutable source generation",
@@ -130,7 +158,14 @@ pub fn verify_restore_writer(
             ));
         }
     }
-    crate::pivots::validate_fork_origin(catalog, &wanted.origin, execution, &sources, &volumes)?;
+    crate::pivots::validate_fork_origin(
+        catalog,
+        &wanted.origin,
+        execution,
+        &sources,
+        &volumes,
+        exact.then_some(operation.operation_id.as_str()),
+    )?;
     Ok(json!({"origin":wanted.origin,"grant":grant,"heads":wanted.heads}))
 }
 

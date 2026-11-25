@@ -520,7 +520,8 @@ pub fn validate_fork_origin(
     origin: &ForkOrigin,
     target: &Execution,
     source_heads: &HashMap<String, String>,
-    target_volumes: &HashSet<String>,
+    target_volumes: &HashMap<String, String>,
+    exact_operation: Option<&str>,
 ) -> Result<()> {
     let point = catalog
         .writer_pivot(&origin.pivot_id)?
@@ -534,13 +535,104 @@ pub fn validate_fork_origin(
         || source.route_id != target.route_id
         || point.incarnation_id == target.incarnation_id
         || point.plan.heads.len() != source_heads.len()
-        || point.plan.heads.iter().any(|head| {
-            source_heads.get(&head.volume_id) != Some(&head.head_resource_id)
-                || target_volumes.contains(&head.volume_id)
+        || point
+            .plan
+            .heads
+            .iter()
+            .any(|head| source_heads.get(&head.volume_id) != Some(&head.head_resource_id))
+    {
+        return Err(fence_unproven(
+            "restore does not name the complete sealed source pivot",
+        ));
+    }
+    if let Some(operation) = exact_operation {
+        let heads = exact_successors(catalog, &origin.pivot_id, Some(operation))?;
+        if source.instance_id != target.instance_id
+            || heads
+                .iter()
+                .any(|head| target_volumes.get(&head.volume_id) != Some(&head.head_resource_id))
+        {
+            return Err(generation_mismatch());
+        }
+    } else if point
+        .plan
+        .heads
+        .iter()
+        .any(|head| target_volumes.contains_key(&head.volume_id))
+    {
+        return Err(fence_unproven(
+            "clone restore requires new writable volumes",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn generation_mismatch() -> Fault {
+    Fault::new(
+        "E_VOLUME_GENERATION_MISMATCH",
+        "captured volume cannot use the current writer generation",
+    )
+}
+
+pub(crate) fn exact_successors(
+    catalog: &Catalog,
+    id: &str,
+    new_operation: Option<&str>,
+) -> Result<Vec<VolumeHead>> {
+    if catalog.operation(id)?.kind == "statepoint" {
+        return Ok(Vec::new());
+    }
+    let pivot = catalog.writer_pivot(id)?.ok_or_else(missing)?;
+    if pivot.state != "complete" || catalog.execution(&pivot.incarnation_id)?.phase != "exited" {
+        return Err(generation_mismatch());
+    }
+    let mut heads = Vec::new();
+    for captured in pivot.plan.heads {
+        let next = VolumeHead {
+            volume_id: captured.volume_id,
+            head_resource_id: captured.next_resource_id,
+        };
+        catalog
+            .volume_identity(&next)
+            .map_err(|_| generation_mismatch())?;
+        let advanced: bool = catalog.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM writer_sets s
+            JOIN writer_grants g USING(operation_id) JOIN json_each(s.heads_json) h
+            WHERE s.operation_id<>?1 AND (?2 IS NULL OR s.operation_id<>?2)
+                AND json_extract(h.value, '$.head_resource_id')=?3)",
+            params![id, new_operation, next.head_resource_id],
+            |row| row.get(0),
+        )?;
+        if advanced {
+            return Err(generation_mismatch());
+        }
+        heads.push(next);
+    }
+    Ok(heads)
+}
+
+pub(crate) fn require_capture_pivot(
+    catalog: &Catalog,
+    operation_id: &str,
+    execution: &Execution,
+    hold_token: &str,
+    writers: &HashMap<String, (String, String)>,
+) -> Result<()> {
+    let pivot = catalog.writer_pivot(operation_id)?.ok_or_else(missing)?;
+    pivot.check_scope(execution)?;
+    if pivot.state != "complete"
+        || pivot.plan.hold_token != hold_token
+        || pivot.plan.heads.len() != writers.len()
+        || pivot.plan.heads.iter().any(|head| {
+            writers
+                .get(&head.volume_id)
+                .is_none_or(|(resource, grant)| {
+                    *resource != head.head_resource_id || *grant != pivot.plan.previous_grant_id
+                })
         })
     {
         return Err(fence_unproven(
-            "restore does not name the complete sealed source pivot and independent volumes",
+            "capture lacks its complete sealed WriterPivot",
         ));
     }
     Ok(())
