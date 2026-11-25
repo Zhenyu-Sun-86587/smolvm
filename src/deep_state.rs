@@ -6,7 +6,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::{
     ffi::OsStrExt,
-    fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 use std::path::{Component, Path, PathBuf};
 
@@ -281,11 +281,18 @@ pub(crate) fn prepare_uid_registry() -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
-    let dir = private_dir(path)?;
-    if dir.metadata()?.mode() & 0o777 != 0o700 {
-        return Err(invalid("deep Worker UID registry must use mode 0700"));
+    ensure_uid_registry_mode(&private_dir(path)?)
+}
+
+fn ensure_uid_registry_mode(dir: &File) -> io::Result<()> {
+    match dir.metadata()?.mode() & 0o777 {
+        0o700 => Ok(()),
+        // Earlier deep launchers widened this directory for their first VM.
+        // The checked directory descriptor lets us restore the private mode
+        // without replacing or reassigning any existing UID claim.
+        0o701 => dir.set_permissions(fs::Permissions::from_mode(0o700)),
+        _ => Err(invalid("deep Worker UID registry must use mode 0700")),
     }
-    Ok(())
 }
 
 /// Claim this Serve's socket directory and retain the exclusive state lease.
@@ -329,6 +336,25 @@ pub(crate) fn claim_serve(socket: &Path) -> crate::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uid_registry_recovers_earlier_traverse_mode_without_discarding_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path();
+        fs::write(path.join("claim"), "preserved UID claim").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o701)).unwrap();
+        let registry = private_dir(path).unwrap();
+        ensure_uid_registry_mode(&registry).unwrap();
+        ensure_uid_registry_mode(&registry).unwrap();
+        assert_eq!(registry.metadata().unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::read_to_string(path.join("claim")).unwrap(),
+            "preserved UID claim"
+        );
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_uid_registry_mode(&registry).is_err());
+    }
 
     #[test]
     fn state_and_socket_ownership_are_explicit_and_distinct() {

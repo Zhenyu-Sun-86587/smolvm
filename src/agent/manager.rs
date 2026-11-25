@@ -4298,6 +4298,9 @@ impl AgentManager {
                 // rootfs, and the disk templates. The data dir itself stays 0700;
                 // widen only the ancestor chains (execute-only). Resilient to a
                 // restrictive umask on the runtime-created intermediates.
+                // Deep's UID allocator is a Worker control directory. The
+                // dropped VMM does not access it.
+                #[cfg(not(feature = "deep-runtime"))]
                 crate::process::ensure_traversable(&registry);
                 if let Some(parent) = d.parent() {
                     crate::process::ensure_traversable(parent);
