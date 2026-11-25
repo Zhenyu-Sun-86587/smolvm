@@ -3,6 +3,7 @@ use crate::ipc::{Fault, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 pub struct TransferRecord {
     pub resource_id: String,
@@ -22,6 +23,8 @@ pub struct LeaseRecord {
     pub delivered: usize,
     pub revision: i64,
 }
+
+pub type BackingIdentities = BTreeMap<String, (u64, u64, u64)>;
 
 fn absent(what: &str) -> Fault {
     Fault::new("E_NOT_FOUND", format!("{what} does not exist"))
@@ -233,6 +236,69 @@ impl Catalog {
             params![count as i64, id],
         )?;
         Ok(())
+    }
+
+    pub fn backing_identities(&self, resource: &str) -> Result<BackingIdentities> {
+        let mut statement = self.db.prepare(
+            "SELECT b.identities_json FROM fd_transfer_batches b
+            JOIN fd_transfers t USING (transfer_id)
+            WHERE t.resource_id=? AND t.state IN ('missing','committed')",
+        )?;
+        let rows = statement.query_map([resource], |row| row.get::<_, String>(0))?;
+        let mut identities = BTreeMap::new();
+        for row in rows {
+            let batch: Vec<(String, u64, u64, u64)> = serde_json::from_str(&row?)
+                .map_err(|_| Fault::new("E_CATALOG", "invalid stored RAM backing identities"))?;
+            for (id, device, inode, length) in batch {
+                if identities.insert(id, (device, inode, length)).is_some() {
+                    return Err(Fault::new(
+                        "E_CATALOG",
+                        "duplicate stored RAM backing identity",
+                    ));
+                }
+            }
+        }
+        Ok(identities)
+    }
+
+    pub fn commit_reexport(
+        &mut self,
+        lease: &LeaseRecord,
+        delivered: usize,
+    ) -> Result<LeaseRecord> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let restored = tx.execute(
+            "UPDATE fd_transfers SET state='committed' WHERE resource_id=? AND state='missing'",
+            [&lease.resource_id],
+        )?;
+        if restored != 0 {
+            let changed = tx.execute(
+                "UPDATE resources SET state='available',revision=revision+1
+                WHERE resource_id=? AND state='lost'",
+                [&lease.resource_id],
+            )?;
+            if changed != 1 {
+                return Err(Fault::new(
+                    "E_CATALOG",
+                    "generation resource changed during recovery",
+                ));
+            }
+        }
+        let attached = tx.execute(
+            "UPDATE fd_leases SET state='attached',revision=revision+1,delivered=?
+            WHERE lease_id=? AND state='unknown' AND revision=?",
+            params![delivered as i64, lease.lease_id, lease.revision],
+        )?;
+        if attached != 1 {
+            return Err(Fault::new(
+                "E_STALE_REVISION",
+                "descriptor lease changed during recovery",
+            ));
+        }
+        tx.commit()?;
+        self.lease(&lease.lease_id)
     }
 
     pub fn update_lease(

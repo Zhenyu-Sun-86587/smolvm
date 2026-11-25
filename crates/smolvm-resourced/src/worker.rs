@@ -320,8 +320,10 @@ impl Worker {
         descriptors: Vec<OwnedFd>,
     ) -> Result<Reply> {
         request.check()?;
-        if request.method != "RegisterGenerationBatch"
-            && (!descriptors.is_empty() || !request.fd_table.is_empty())
+        if !matches!(
+            request.method.as_str(),
+            "RegisterGenerationBatch" | "ReconcileExecutionExports"
+        ) && (!descriptors.is_empty() || !request.fd_table.is_empty())
         {
             return Err(Fault::new(
                 "E_CAPABILITY_UNSUPPORTED",
@@ -335,6 +337,7 @@ impl Worker {
             | "AbortGenerationTransfer"
             | "AcquireResourceLease"
             | "AckAttached"
+            | "ReconcileExecutionExports"
             | "ReleaseResourceLease" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 match request.method.as_str() {
@@ -347,6 +350,10 @@ impl Worker {
                     }
                     "RegisterGenerationCommit" => {
                         self.escrow.commit(&mut self.catalog, request, &execution)
+                    }
+                    "ReconcileExecutionExports" => {
+                        self.escrow
+                            .reexport(&mut self.catalog, request, &execution, descriptors)
                     }
                     "AbortGenerationTransfer" => {
                         self.escrow.abort(&self.catalog, request, &execution)
