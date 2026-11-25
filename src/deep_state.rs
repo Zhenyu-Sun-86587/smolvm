@@ -110,11 +110,16 @@ fn read_marker(dir: &Path, marker: &str) -> io::Result<String> {
     Ok(contents)
 }
 
-fn claim_dir(dir: &Path, marker: &str, expected: &str) -> io::Result<()> {
+fn claim_dir(
+    dir: &Path,
+    marker: &str,
+    matches: impl Fn(&str) -> bool,
+    contents: impl FnOnce() -> io::Result<String>,
+) -> io::Result<()> {
     let directory = private_dir(dir)?;
     lock(&directory, true)?;
     match read_marker(dir, marker) {
-        Ok(contents) if contents == expected => Ok(()),
+        Ok(contents) if matches(&contents) => Ok(()),
         Ok(_) => Err(invalid(
             "deep runtime directory belongs to another installation",
         )),
@@ -125,17 +130,49 @@ fn claim_dir(dir: &Path, marker: &str, expected: &str) -> io::Result<()> {
                 ));
             }
             use std::io::Write;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(dir.join(marker))?;
-            file.write_all(expected.as_bytes())?;
-            file.sync_all()?;
+            let mut file = tempfile::NamedTempFile::new_in(dir)?;
+            file.write_all(contents()?.as_bytes())?;
+            file.as_file().sync_all()?;
+            file.persist_noclobber(dir.join(marker))?;
             directory.sync_all()
         }
         Err(error) => Err(error),
     }
+}
+
+fn state_prefix(root: &Path) -> String {
+    let path_hash = hex::encode(&Sha256::digest(root.as_os_str().as_bytes())[..16]);
+    format!("{STATE_MAGIC}{path_hash}\n")
+}
+
+fn marker_instance<'a>(root: &Path, contents: &'a str) -> Option<&'a str> {
+    let instance = contents
+        .strip_prefix(&state_prefix(root))?
+        .strip_suffix('\n')?;
+    (instance.len() == 32 && instance.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(instance)
+}
+
+fn claim_state(root: &Path) -> io::Result<()> {
+    claim_dir(
+        root,
+        STATE_MARKER,
+        |contents| marker_instance(root, contents).is_some(),
+        || {
+            let mut random = [0u8; 16];
+            getrandom::fill(&mut random).map_err(io::Error::other)?;
+            Ok(format!("{}{}\n", state_prefix(root), hex::encode(random)))
+        },
+    )
+}
+
+fn claim_socket(dir: &Path, instance: &str) -> io::Result<()> {
+    claim_dir(
+        dir,
+        SOCKET_MARKER,
+        |value| value == instance,
+        || Ok(instance.to_owned()),
+    )
 }
 
 /// Establish the selected private state before resolving any writable paths.
@@ -147,7 +184,7 @@ pub fn initialize(state: Option<&Path>) -> crate::Result<()> {
             "an explicit --state-dir or SMOLVM_DATA_DIR is required",
         )
     })?;
-    claim_dir(root, STATE_MARKER, STATE_MAGIC)?;
+    claim_state(root)?;
     for subdir in [
         ".cache",
         ".cache/smolvm",
@@ -183,10 +220,6 @@ pub fn initialize(state: Option<&Path>) -> crate::Result<()> {
     Ok(())
 }
 
-fn scope_id(root: &Path) -> String {
-    hex::encode(&Sha256::digest(root.as_os_str().as_bytes())[..16])
-}
-
 /// Verify the bound state directory and get its stable systemd and tmpfs identity.
 pub(crate) fn instance_id() -> Option<String> {
     let configured = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from)?;
@@ -194,7 +227,7 @@ pub(crate) fn instance_id() -> Option<String> {
     if configured != root {
         return None;
     }
-    (read_marker(&root, STATE_MARKER).ok()?.as_str() == STATE_MAGIC).then(|| scope_id(&root))
+    marker_instance(&root, &read_marker(&root, STATE_MARKER).ok()?).map(str::to_owned)
 }
 
 pub(crate) fn require_instance() -> crate::Result<String> {
@@ -271,7 +304,7 @@ pub(crate) fn claim_serve(socket: &Path) -> crate::Result<File> {
         .parent()
         .ok_or_else(|| invalid("deep Serve needs a socket directory"))?;
     if socket_dir != root {
-        claim_dir(socket_dir, SOCKET_MARKER, &identity)?;
+        claim_socket(socket_dir, &identity)?;
     }
     let file = OpenOptions::new()
         .read(true)
@@ -303,7 +336,7 @@ mod tests {
         let old = temp.path().join("official");
         fs::create_dir(&old).unwrap();
         fs::write(old.join("machines.db"), "official contents").unwrap();
-        assert!(claim_dir(&old, STATE_MARKER, STATE_MAGIC).is_err());
+        assert!(claim_state(&old).is_err());
         assert_eq!(
             fs::read_to_string(old.join("machines.db")).unwrap(),
             "official contents"
@@ -312,15 +345,29 @@ mod tests {
 
         let first = temp.path().join("first");
         let second = temp.path().join("second");
-        claim_dir(&first, STATE_MARKER, STATE_MAGIC).unwrap();
-        claim_dir(&second, STATE_MARKER, STATE_MAGIC).unwrap();
-        assert_ne!(scope_id(&first), scope_id(&second));
+        claim_state(&first).unwrap();
+        claim_state(&second).unwrap();
+        let first_marker = read_marker(&first, STATE_MARKER).unwrap();
+        let second_marker = read_marker(&second, STATE_MARKER).unwrap();
+        let first_id = marker_instance(&first, &first_marker).unwrap();
+        let second_id = marker_instance(&second, &second_marker).unwrap();
+        assert_ne!(first_id, second_id);
+        assert!(marker_instance(&second, &first_marker).is_none());
 
         let socket = temp.path().join("socket");
-        claim_dir(&socket, SOCKET_MARKER, &scope_id(&first)).unwrap();
-        assert!(claim_dir(&socket, SOCKET_MARKER, &scope_id(&second)).is_err());
+        claim_socket(&socket, first_id).unwrap();
+        assert!(claim_socket(&socket, second_id).is_err());
         let alias = temp.path().join("alias");
         std::os::unix::fs::symlink(&old, &alias).unwrap();
-        assert!(claim_dir(&alias, STATE_MARKER, STATE_MAGIC).is_err());
+        assert!(claim_state(&alias).is_err());
+
+        claim_state(&first).unwrap();
+        assert_eq!(read_marker(&first, STATE_MARKER).unwrap(), first_marker);
+        fs::remove_dir_all(&first).unwrap();
+        claim_state(&first).unwrap();
+        let replacement_marker = read_marker(&first, STATE_MARKER).unwrap();
+        let replacement_id = marker_instance(&first, &replacement_marker).unwrap();
+        assert_ne!(replacement_id, first_id);
+        assert!(claim_socket(&socket, replacement_id).is_err());
     }
 }

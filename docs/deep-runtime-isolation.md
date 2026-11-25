@@ -6,7 +6,10 @@ regular build keeps the existing defaults.
 Give each deep Serve a dedicated absolute state directory and an explicit
 Unix socket. An empty directory is claimed on first use. Keep the resulting
 ownership markers on restart. A state directory can have one active Serve.
-An external socket directory is claimed for one state directory. Configure
+An external socket directory is claimed for one installed state identity. The
+state marker holds a random instance ID, which Serve returns as
+`runtime_instance_id` in the bundle handshake. Restart preserves the ID. A new
+state directory at the same path receives a new ID. Configure
 a different guest rollout port for each Serve and reserve the official
 default for the official runtime.
 
@@ -23,7 +26,7 @@ Engine activation is disabled for this distribution because its global
 socket and activation services are outside the Serve's namespace.
 
 Each VMM scope is placed under `smolvmdeep.slice`. Scope names include
-hashes of the canonical state directory and machine name, so two Serves
+the installed runtime instance ID and a hash of the machine name, so two Serves
 can use the same machine name. Boot checks actual cgroup membership before
 loading the VM. Read-only Serve operations can be tested without systemd.
 VMM launch requires the systemd placement and per-VM UID isolation. A
@@ -39,8 +42,7 @@ deep slice budget independently of the official lane before deployment.
 By default, checkpoint scratch uses each Serve's own state directory. To
 supply tmpfs scratch, mount separate, root-owned tmpfs filesystems at
 `/dev/shm/smolvmdeep-capture-ID` (mode `0711`) and
-`/dev/shm/smolvmdeep-restore-ID` (mode `0700`). `ID` is the first 32
-hexadecimal characters of SHA-256 over the canonical state path's bytes.
+`/dev/shm/smolvmdeep-restore-ID` (mode `0700`). `ID` is the 32-character runtime instance ID.
 Size those filesystems from the Worker budget. A directory or bind mount
 backed by the shared `/dev/shm` filesystem leaves the state-directory
 scratch path in use.

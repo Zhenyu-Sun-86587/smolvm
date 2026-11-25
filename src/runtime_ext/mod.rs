@@ -27,8 +27,16 @@ fn installed() -> Result<Handshake, String> {
     let mut hash = Sha256::new();
     let mut running = BufReader::new(File::open("/proc/self/exe").map_err(|e| e.to_string())?);
     std::io::copy(&mut running, &mut hash).map_err(|e| e.to_string())?;
-    smolvm_runtime_protocol::handshake(manifest, &format!("{:x}", hash.finalize()))
-        .map_err(str::to_owned)
+    let handshake = smolvm_runtime_protocol::handshake(manifest, &format!("{:x}", hash.finalize()))
+        .map_err(str::to_owned)?;
+    #[cfg(feature = "deep-runtime")]
+    let handshake = Handshake {
+        runtime_instance_id: Some(
+            crate::deep_state::instance_id().ok_or("missing deep Serve state identity")?,
+        ),
+        ..handshake
+    };
+    Ok(handshake)
 }
 
 pub(crate) async fn capabilities() -> Result<Json<&'static Handshake>, ApiError> {
