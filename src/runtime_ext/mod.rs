@@ -87,6 +87,7 @@ pub fn worker_operations_router(socket: std::path::PathBuf) -> axum::Router {
             "/api/v1/runtime-ext/v1/operations",
             axum::routing::post(submit),
         )
+        .route("/api/v1/runtime-ext/v1/operations/{id}/retry", axum::routing::post(retry_fork))
         .route(
             "/api/v1/runtime-ext/v1/operations/{id}/cancel",
             axum::routing::post(cancel),
@@ -282,6 +283,17 @@ async fn submit(
         client.submit(&input)
     })
     .await
+}
+#[cfg(feature = "deep-runtime")]
+async fn retry_fork(
+    axum::extract::State(socket): axum::extract::State<std::path::PathBuf>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(input): Json<smolvm_resourced::native_client::Cancellation>,
+) -> axum::response::Response {
+    native(socket, move |client| {
+        launch::require_own(&input.expected.instance_id)?;
+        client.retry_fork(&id, &input)
+    }).await
 }
 #[cfg(feature = "deep-runtime")]
 async fn cancel(

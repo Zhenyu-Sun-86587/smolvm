@@ -920,6 +920,9 @@ impl Worker {
                 if crate::managed_fork::restore(&self.catalog, &op.operation_id)?.is_none() {
                     return Err(Fault::invalid("missing managed target"));
                 }
+                if crate::managed_fork::target_cancelled(&self.catalog, &op.operation_id)? {
+                    return Err(Fault::new("E_CANCELLED","the batch cancelled this unpublished target"));
+                }
                 let record = activation_runtime::receipt(&self.catalog, &execution, request)?;
                 let outcome = match record.phase.as_str() {
                     "offered" => {
@@ -1036,7 +1039,12 @@ impl Worker {
                 let _ = self.native_signal.try_send(());
                 Ok(json!(op))
             }
+            "RetryManagedFork" => Ok(json!(crate::managed_fork::retry(&mut self.catalog,request,request.payload()?)?)),
             "CancelNativeOperation" => {
+                let op=self.catalog.matching_operation(request)?;
+                if matches!(op.kind.as_str(),"independent_fork"|"fork_batch") {
+                    return Ok(json!(crate::managed_fork::cancel(&mut self.catalog, request, request.payload()?)?));
+                }
                 let op = crate::native_operations::cancel(
                     &mut self.catalog,
                     request,
@@ -1742,6 +1750,48 @@ impl Worker {
         }
     }
 
+    fn reconcile_fork_cancellations(&mut self) -> Result<()> {
+        let ids = {
+            let mut q=self.catalog.db.prepare("SELECT o.operation_id FROM managed_fork_children ch
+                JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.cancelled=1 AND o.phase='NEW'
+                AND NOT EXISTS (SELECT 1 FROM target_activations a WHERE a.operation_id=o.operation_id AND a.decision='commit')")?;
+            let rows=q.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for id in ids {
+            let op=self.catalog.operation(&id)?;
+            let plan=crate::managed::plan(&self.catalog,&op)?.ok_or_else(||Fault::invalid("cancelled target has no launch plan"))?;
+            let inc=plan.launch.execution.incarnation_id.as_deref().ok_or_else(stale_execution)?;
+            let mut epoch=op.expected_execution_epoch;
+            match self.catalog.execution(inc) {
+                Ok(execution) => {
+                    epoch=execution.execution_epoch;
+                    if execution.phase!="exited" {
+                        if execution.host_boot_id==self.boot && pid_start(execution.pid).ok()==Some(execution.pid_start_time) {
+                            let (start,pidfd)=observe_pid(execution.pid)?;
+                            if start != execution.pid_start_time {return Err(stale_execution())}
+                            verify_executable(execution.pid,start,&pidfd,&self.catalog.bundle(&op.bundle_digest)?)?;
+                            let rc=unsafe{libc::syscall(libc::SYS_pidfd_send_signal,pidfd.as_raw_fd(),libc::SIGTERM,std::ptr::null::<libc::siginfo_t>(),0u32)};
+                            if rc<0 && io::Error::last_os_error().raw_os_error()!=Some(libc::ESRCH) {return Err(broker_error(io::Error::last_os_error()))}
+                            continue;
+                        }
+                        self.finalize_scoped_execution(execution)?;
+                    }
+                }
+                Err(e) if e.code=="E_NOT_FOUND" => (),
+                Err(e) => return Err(e),
+            }
+            let expected=crate::ipc::Expected { instance_id:op.instance_id.clone(), incarnation_id:None, execution_epoch:epoch };
+            let request=crate::ipc::Request {
+                protocol:crate::ipc::PROTOCOL.into(),method:"FinishOperation".into(),request_id:"cancel-parked-target".into(),
+                route_id:Some(op.route_id.clone()),bundle_digest:Some(op.bundle_digest.clone()),
+                operation_id:Some(id),request_digest:Some(op.request_digest.clone()),expected:Some(expected),
+                fd_table:Vec::new(),payload:Value::Null
+            };
+            self.catalog.finish(&request,true,op.revision)?;
+        }
+        Ok(())
+    }
     fn reconcile_statepoints(&mut self) -> Result<()> {
         for record in self
             .statepoints
@@ -2157,6 +2207,9 @@ fn serve(
                 .forks
                 .tick(&mut worker.catalog, &mut worker.escrow, &worker.boot)
                 .map_err(|e| io::Error::other(e.message))?;
+            if let Err(error)=worker.reconcile_fork_cancellations() {
+                eprintln!("resourced fork cancellation: {error}");
+            }
             worker
                 .reconcile_statepoints()
                 .map_err(|fault| io::Error::other(fault.message))?;

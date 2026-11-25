@@ -318,6 +318,10 @@ pub fn boot() -> Result<()> {
     }
     systemd_scope::verify_boot_scope(&boot.scope)?;
     process::close_inherited_fds_from(3);
+    // Guest RAM overlays need this VMM's own page map to capture private pages
+    // on a recursive fork. Open it before dropping the execution identity.
+    let pagemap = File::open("/proc/self/pagemap")?;
+    std::env::set_var("KRUN_PAGEMAP_FD", pagemap.as_raw_fd().to_string());
     let null = File::open("/dev/null")?;
     if unsafe { libc::dup2(null.as_raw_fd(), 0) } < 0 {
         return Err(std::io::Error::last_os_error().into());

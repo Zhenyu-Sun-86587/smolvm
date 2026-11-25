@@ -39,11 +39,30 @@ pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
     let Some((stage,capture,original,released,error))=c.db.query_row(
         "SELECT stage,capture_id,original,source_released,error FROM managed_fork_batches WHERE operation_id=?",[id],
         |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?))).optional()? else {return Ok(None)};
-    let mut stmt=c.db.prepare("SELECT ch.name,ch.instance_id,ch.operation_id,COALESCE(o.phase,'RESERVED'),m.incarnation_id,ch.prior_epoch FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id LEFT JOIN managed_launches m ON m.operation_id=ch.operation_id WHERE ch.batch_id=? ORDER BY ch.ordinal")?;
-    let rows=stmt.query_map([id],|r|Ok(json!({"name":r.get::<_,String>(0)?,"instance_id":r.get::<_,String>(1)?,"operation_id":r.get::<_,String>(2)?,"phase":r.get::<_,String>(3)?,"incarnation_id":r.get::<_,Option<String>>(4)?,"execution_epoch":r.get::<_,i64>(5)?+1})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(Some(
-        json!({"stage":stage,"capture_id":capture,"original_source_disposition":original,"source_released":released,"children":rows,"error":error}),
-    ))
+    let mut stmt = c.db.prepare(
+        "SELECT ch.name,ch.instance_id,ch.operation_id,
+             CASE WHEN ch.cancelled=1 AND o.operation_id IS NULL THEN 'ABORTED' ELSE COALESCE(o.phase,'RESERVED') END,
+             m.incarnation_id,ch.prior_epoch,ch.attempt,ch.cancelled
+         FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id
+         LEFT JOIN managed_launches m ON m.operation_id=ch.operation_id
+         WHERE ch.batch_id=? ORDER BY ch.ordinal")?;
+    let rows = stmt.query_map([id], |r| Ok(json!({
+        "name":r.get::<_,String>(0)?, "instance_id":r.get::<_,String>(1)?, "operation_id":r.get::<_,String>(2)?,
+        "phase":r.get::<_,String>(3)?, "incarnation_id":r.get::<_,Option<String>>(4)?,
+        "execution_epoch":r.get::<_,i64>(5)?+1, "attempt":r.get::<_,i64>(6)?, "cancelled":r.get::<_,bool>(7)?
+    })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let successful = rows.iter().filter(|r|r["phase"] == "COMPLETED").count();
+    let failed = rows.iter().filter(|r|r["phase"] == "ABORTED").count();
+    let outcome = match (stage.as_str(), successful, failed) {
+        ("aborted", _, _) => "cancelled",
+        ("complete", _, 0) => "applied",
+        ("complete", 0, _) => "failed",
+        ("complete", _, _) => "partial",
+        _ => "pending",
+    };
+    Ok(Some(json!({"stage":stage, "capture_id":capture, "original_source_disposition":original,
+        "source_released":released, "children":rows, "completed_count":successful,
+        "failed_count":failed, "outcome":outcome, "error":error})))
 }
 pub(crate) fn submit(
     c: &mut Catalog,
@@ -174,8 +193,8 @@ pub(crate) fn submit(
         storage_bytes: storage,
     };
     c.begin_with(r,kind,|tx|{
-        tx.execute("INSERT INTO managed_fork_batches(operation_id,source_incarnation,capture_id,template,children,session,token,anchor,network_gate,original,stage,pivot_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![id,incarnation,key(id,"ram",0),template_bytes,names,session,token,anchor,network,inv.source_disposition,initial,pivot])?;
+        tx.execute("INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,session,token,anchor,network_gate,original,stage,pivot_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![id,incarnation,namespace,key(id,"ram",0),template_bytes,names,session,token,anchor,network,inv.source_disposition,initial,pivot])?;
         for (i,name) in input.children.iter().enumerate(){
             let instance=machine_id(&namespace,name);
             let present:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM instance_bindings WHERE route_id=? AND instance_id=?)",params![route,instance],|r|r.get(0))?;
@@ -185,6 +204,92 @@ pub(crate) fn submit(
         }
         Ok(())
     })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Control {
+    expected_revision: i64,
+}
+
+fn control_scope(c: &Catalog, r: &Request) -> Result<Operation> {
+    let op = c.matching_operation(r)?;
+    let expected = r.scope()?.2;
+    if !matches!(op.kind.as_str(), "fork_batch" | "independent_fork")
+        || op.expected_execution_epoch != expected.execution_epoch
+        || op.expected_incarnation_id != expected.incarnation_id {
+        return Err(Fault::new("E_STALE_EXECUTION","request differs from the admitted fork source"));
+    }
+    Ok(op)
+}
+
+pub(crate) fn retry(c: &mut Catalog, r: &Request, control: Control) -> Result<Operation> {
+    let op = control_scope(c,r)?;
+    let id = &op.operation_id;
+    let tx = c.db.transaction()?;
+    let replay: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_fork_retries WHERE batch_id=? AND prior_revision=?)",
+        params![id,control.expected_revision], |r|r.get(0))?;
+    if replay {
+        drop(tx);
+        return Ok(op);
+    }
+    if op.revision != control.expected_revision {
+        return Err(Fault::new("E_STALE_REVISION","batch retry revision changed"));
+    }
+    if op.phase != "COMPLETED" {
+        return Err(conflict("wait for the existing target attempts to settle"));
+    }
+    let failed = {
+        let mut stmt = tx.prepare("SELECT ch.ordinal,ch.attempt,ch.instance_id,b.execution_epoch,
+            h.vcpus,h.memory_mib,h.storage_bytes
+            FROM managed_fork_children ch JOIN operations o ON ch.operation_id=o.operation_id
+            JOIN managed_budget_holds h ON h.operation_id=o.operation_id AND h.instance_id=ch.instance_id
+            JOIN instance_bindings b ON b.route_id=o.route_id AND b.instance_id=ch.instance_id
+            WHERE ch.batch_id=? AND ch.cancelled=0 AND o.phase='ABORTED' AND h.state='released'
+              AND b.incarnation_id IS NULL AND b.active_operation_id IS NULL")?;
+        let rows=stmt.query_map([id],|row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,
+            row.get::<_,String>(2)?,row.get::<_,i64>(3)?,Capacity { vcpus:row.get(4)?,memory_mib:row.get(5)?,storage_bytes:row.get(6)? })))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    if failed.is_empty() {
+        return Err(conflict("batch has no fenced failed targets to retry"));
+    }
+    for (ordinal, prior_attempt, instance, epoch, capacity) in failed {
+        admission::reserve(&tx,id,&instance,capacity)?;
+        let attempt=prior_attempt+1;
+        let child=key(&format!("{id}/{ordinal}"),"attempt",attempt as usize);
+        tx.execute("UPDATE managed_fork_children SET operation_id=?,prior_epoch=?,attempt=?,frame_hex=NULL
+            WHERE batch_id=? AND ordinal=? AND attempt=?",params![child,epoch,attempt,id,ordinal,prior_attempt])?;
+    }
+    tx.execute("INSERT INTO managed_fork_retries VALUES(?,?)",params![id,op.revision])?;
+    tx.execute("UPDATE managed_fork_batches SET stage='children',error=NULL WHERE operation_id=? AND source_released=1",[id])?;
+    tx.execute("UPDATE operations SET phase='NEW',revision=revision+1 WHERE operation_id=?",[id])?;
+    tx.commit()?;
+    c.operation(id)
+}
+
+pub(crate) fn cancel(c: &mut Catalog, r: &Request, control: Control) -> Result<Operation> {
+    let op=control_scope(c,r)?;
+    let id=&op.operation_id;
+    let prior:bool=c.db.query_row("SELECT cancel_requested FROM managed_fork_batches WHERE operation_id=?",[id],|r|r.get(0))?;
+    if prior {return Ok(op)}
+    if control.expected_revision!=op.revision {return Err(Fault::new("E_STALE_REVISION","batch cancellation revision changed"))}
+    if op.phase!="NEW" {return Err(Fault::new("E_ALREADY_COMMITTED","batch already has a terminal result"))}
+    let tx=c.db.transaction()?;
+    tx.execute("UPDATE managed_fork_batches SET cancel_requested=1,
+        stage=CASE WHEN stage IN ('arming','parking') THEN 'cancel_gate' ELSE stage END WHERE operation_id=?",[id])?;
+    tx.execute("UPDATE managed_fork_children AS ch SET cancelled=1 WHERE batch_id=?
+         AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.operation_id=ch.operation_id AND o.phase='COMPLETED')
+         AND NOT EXISTS(SELECT 1 FROM target_activations a WHERE a.operation_id=ch.operation_id AND a.decision='commit')", [id])?;
+    tx.execute("UPDATE operations SET revision=revision+1 WHERE operation_id=?",[id])?;
+    tx.commit()?;
+    c.operation(id)
+}
+
+pub(crate) fn target_cancelled(c: &Catalog, id: &str) -> Result<bool> {
+    Ok(c.db.query_row("SELECT EXISTS(SELECT 1 FROM managed_fork_children WHERE operation_id=? AND cancelled=1)",[id],|r|r.get(0))?)
 }
 
 struct Job {
@@ -330,6 +435,30 @@ impl Actor {
         let ep = Endpoint::load(&c.db, &j.inc, boot)?;
         let scope = j.scope();
         match j.stage.as_str() {
+            "cancel_gate" => {
+                let inv=ep.inventory()?;
+                let done = if inv.source_disposition=="RUNNING" && inv.last_session<j.session {
+                    true
+                } else {
+                    let phase=j.gate(&ep,"QUERY","")?;
+                    match phase.as_str() {
+                        "preparing" | "armed" | "parked" => {
+                            j.gate(&ep,"ABORT","")?;
+                            false
+                        }
+                        "aborted" | "expired_thawed" | "failed_thawed" => true,
+                        _ => false,
+                    }
+                };
+                if done {
+                    let tx=c.db.transaction()?;
+                    tx.execute("UPDATE managed_fork_batches SET source_released=1,stage='aborted',error=NULL WHERE operation_id=?",[&j.id])?;
+                    tx.execute("UPDATE operations SET phase='ABORTED',decision='ABORT',revision=revision+1 WHERE operation_id=?",[&j.id])?;
+                    tx.execute("UPDATE managed_budget_holds SET state='released' WHERE operation_id=? AND state='reserved'",[&j.id])?;
+                    tx.execute("UPDATE instance_bindings SET active_operation_id=NULL WHERE active_operation_id=?",[&j.id])?;
+                    tx.commit()?;
+                }
+            }
             "arming" => {
                 let state = j.gate(&ep, "PREPARE", "2500 15000")?;
                 if state == "armed" {
@@ -426,35 +555,35 @@ fn release(c: &mut Catalog, j: &Job) -> Result<()> {
 }
 fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
     let parent = c.operation(&j.id)?;
-    let (template, disks): (String, String) = c.db.query_row(
-        "SELECT template,disk_json FROM managed_fork_batches WHERE operation_id=?",
+    let (template, disks, namespace): (String, String, String) = c.db.query_row(
+        "SELECT template,disk_json,serve_instance FROM managed_fork_batches WHERE operation_id=?",
         [&j.id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let base: Machine = serde_json::from_str(&template).map_err(invalid)?;
     let disks: BTreeMap<String, (String,String)> = serde_json::from_str(&disks).map_err(invalid)?;
     let pending = {
-        let mut q=c.db.prepare("SELECT ch.operation_id,ch.name,ch.instance_id FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.batch_id=? AND o.operation_id IS NULL ORDER BY ch.ordinal")?;
+        let mut q=c.db.prepare("SELECT ch.operation_id,ch.name,ch.instance_id,ch.prior_epoch FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.batch_id=? AND o.operation_id IS NULL AND ch.cancelled=0 ORDER BY ch.ordinal")?;
         let rows = q
             .query_map([&j.id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
-    let namespace=c.db.query_row("SELECT serve_instance FROM managed_launches m JOIN executions e ON e.last_operation_id=m.operation_id WHERE e.incarnation_id=?",[&j.inc],|r|r.get::<_,String>(0))?;
-    for (op, name, instance) in pending {
+    for (op, name, instance, epoch) in pending {
         let mut machine = base.clone();
         machine.name = name.clone();
         for d in &mut machine.disks {
             d.volume_id = None;
             d.generation_id = disks.get(&d.device_id).ok_or_else(||conflict("capture omits declared disk"))?.0.clone();
         }
-        let expected = crate::ipc::Expected { instance_id: instance.clone(), incarnation_id: None, execution_epoch: 0 };
+        let expected = crate::ipc::Expected { instance_id: instance.clone(), incarnation_id: None, execution_epoch: epoch };
         let mut devices = machine.devices(c, &op, &parent.route_id, &parent.bundle_digest, &expected)?;
         for device in &mut devices {
             if device.disk.read_only {
@@ -471,24 +600,37 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
         );
         let tx = c.db.transaction()?;
         tx.execute(
-            "INSERT INTO operations VALUES(?,'restore_target',?,'deep',?,?,0,NULL,'NEW','NONE',1)",
-            params![op, digest, instance, parent.bundle_digest],
+            "INSERT INTO operations VALUES(?,'restore_target',?,?,?,?,?,NULL,'NEW','NONE',1)",
+            params![op, digest, parent.route_id, instance, parent.bundle_digest, epoch],
         )?;
-        tx.execute("INSERT INTO instance_bindings(route_id,instance_id,execution_epoch,active_operation_id)VALUES('deep',?,0,?)",params![instance,op])?;
+        if tx.execute("INSERT INTO instance_bindings(route_id,instance_id,execution_epoch,active_operation_id)
+             VALUES(?,?,?,?) ON CONFLICT(route_id,instance_id) DO UPDATE SET active_operation_id=excluded.active_operation_id
+             WHERE incarnation_id IS NULL AND active_operation_id IS NULL AND execution_epoch=excluded.execution_epoch",
+             params![parent.route_id,instance,epoch,op])? != 1 {
+            return Err(conflict("child binding changed before dispatch"));
+        }
         tx.execute("INSERT INTO managed_launches(operation_id,incarnation_id,serve_instance,machine_name,spec_json,devices_json,vcpus,memory_mib) VALUES(?,?,?,?,?,?,?,?)",
             params![op,inc,namespace,name,serde_json::to_string(&machine).map_err(invalid)?,serde_json::to_string(&devices).map_err(invalid)?,machine.cpus,machine.memory_mib])?;
         tx.execute("UPDATE managed_budget_holds SET operation_id=? WHERE operation_id=? AND instance_id=? AND state='reserved'",params![op,j.id,instance])?;
         tx.execute("INSERT OR IGNORE INTO root_refs SELECT 'operation',?,resource_id,'active',1,? FROM root_refs WHERE owner_kind='fork_capture' AND owner_id=? AND state='active'",params![op,op,j.id])?;
         tx.commit()?;
     }
-    let (total,done):(i64,i64)=c.db.query_row("SELECT count(*),COALESCE(SUM(CASE WHEN o.phase IN ('COMPLETED','ABORTED') THEN 1 ELSE 0 END),0) FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.batch_id=?",[&j.id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let (total, done, failed, retryable): (i64,i64,i64,i64) = c.db.query_row(
+        "SELECT COUNT(*),COUNT(CASE WHEN o.phase IN ('COMPLETED','ABORTED') OR (o.phase IS NULL AND ch.cancelled=1) THEN 1 END),
+             COUNT(CASE WHEN o.phase='ABORTED' OR ch.cancelled=1 THEN 1 END),
+             COUNT(CASE WHEN o.phase='ABORTED' AND ch.cancelled=0 THEN 1 END)
+         FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.batch_id=?",
+         [&j.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     if total == done && total > 0 {
         let tx = c.db.transaction()?;
-        tx.execute(
-            "UPDATE managed_fork_batches SET stage='complete' WHERE operation_id=?",
-            [&j.id],
-        )?;
+        tx.execute("UPDATE managed_fork_batches SET stage='complete' WHERE operation_id=?", [&j.id])?;
         tx.execute("UPDATE operations SET phase='COMPLETED',revision=revision+1 WHERE operation_id=? AND phase='NEW'",[&j.id])?;
+        if retryable == 0 {
+            tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='fork_capture' AND owner_id=? AND state='active'",[&j.id])?;
+        }
+        if failed > 0 {
+            tx.execute("UPDATE managed_budget_holds SET state='released' WHERE operation_id=? AND state='reserved'",[&j.id])?;
+        }
         tx.commit()?;
     }
     Ok(())

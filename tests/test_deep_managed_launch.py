@@ -183,7 +183,8 @@ def verify(bundle, root, guest, system_image, fork, product_volumes):
                 if dbfile.suffix not in (".sqlite",".sqlite3"):continue
                 with suppress(Exception),sqlite3.connect(dbfile) as db:
                     for pid, start in db.execute("select pid,pid_start_time from executions"):
-                        pidfd = os.pidfd_open(pid)
+                        try: pidfd = os.pidfd_open(pid)
+                        except ProcessLookupError: continue
                         try:
                             actual=int(Path(f"/proc/{pid}/stat").read_text().rsplit(")",1)[1].split()[19])
                             if actual==start: signal.pidfd_send_signal(pidfd,signal.SIGKILL)
@@ -266,7 +267,48 @@ def verify(bundle, root, guest, system_image, fork, product_volumes):
                 boundary=boundary or first[1]
                 assert first[1]==boundary,first
                 assert first[2]==source_ticks[0][2] and first[3]==child["name"] and first[4]!=source_ticks[0][4],first
-            print("One native parked capture restored two independently identified KVM children with live RAM and both writable disks.",flush=True)
+            def fence_machine(vm_name):
+                active=http(endpoint,f"{EXT}/machines/{vm_name}/execution")
+                identity=http(endpoint,f"{EXT}/instances/{active['instance_id']}/inventory")["execution"]
+                handle=os.pidfd_open(identity["pid"])
+                try:
+                    signal.pidfd_send_signal(handle,signal.SIGKILL)
+                finally:
+                    os.close(handle)
+                until(lambda:http(endpoint,f"{EXT}/machines/{vm_name}/binding")["incarnation_id"] is None,20)
+            def native(kind, source, key, parameters):
+                request=dict(operation_id=key,request_digest=digest(key.encode()),expected=source,kind=kind,parameters=parameters)
+                http(endpoint,EXT+"/operations",request)
+                def observed():
+                    result=http(endpoint,EXT+"/operations/"+key)
+                    if result["phase"]=="ABORTED": raise AssertionError(result)
+                    return result if result["phase"]=="COMPLETED" else None
+                return until(observed,150)
+            print("One held cut restored two distinct KVM children at the same RAM and two-writer boundary.",flush=True)
+            fence_machine(name)
+            assert http(endpoint,EXT+"/operations",call)==finished
+            first_name,second_name=names
+            first_ref=http(endpoint,f"{EXT}/machines/{first_name}/execution")
+            native("standby",first_ref,"standby-branch-a",{"mode":"managed"})
+            child_inv=f"{EXT}/instances/{first_ref['instance_id']}/inventory"
+            assert http(endpoint,child_inv)["inventory"]["source_disposition"]=="STANDBY"
+            descendant=native("independent_fork",first_ref,"fork-after-parent-exit",{"children":["grandchild"]})["fork"]
+            assert descendant["original_source_disposition"]=="STANDBY" and descendant["source_released"]
+            assert http(endpoint,child_inv)["inventory"]["source_disposition"]=="STANDBY"
+            grandchild,=descendant["children"]
+            assert grandchild["phase"]=="COMPLETED",grandchild
+            logfile=logs/(grandchild["incarnation_id"]+".log")
+            count=lambda:sum(line.startswith("PARKED_BLOCK_TICK ") for line in logfile.read_text(errors="replace").splitlines())
+            until(lambda:logfile.exists() and count()>=1,20)
+            fence_machine(first_name)
+            fence_machine(second_name)
+            prior=count()
+            until(lambda:count()>prior+2,10)
+            last=next(line for line in reversed(logfile.read_text(errors="replace").splitlines()) if line.startswith("PARKED_BLOCK_TICK ")).split()
+            marker=int(last[1])-1
+            assert last[2]==source_ticks[0][2] and last[3]=="grandchild"
+            assert (int(last[5]),int(last[6]))==(marker,marker^0xbeef12349876),last
+            print("A parked child forked after its parent exited. The grandchild continued its captured process and both disks after fencing both ancestors and the sibling.",flush=True)
             return
         if not system_image:
             old=record["execution"]

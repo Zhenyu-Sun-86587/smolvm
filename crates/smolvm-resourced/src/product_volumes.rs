@@ -835,13 +835,13 @@ pub(crate) fn require_launch_set(
     instance: &str,
     count: usize,
 ) -> Result<()> {
-    let reserved: usize = catalog.db.query_row(
+    let reserved: i64 = catalog.db.query_row(
         "SELECT count(*) FROM product_volume_attachments a JOIN product_volumes v USING(volume_id)
         WHERE a.instance_id=? AND v.route_id=? AND a.state='reserved'",
         params![instance, route],
         |row| row.get(0),
     )?;
-    if count != reserved {
+    if usize::try_from(reserved).ok() != Some(count) {
         return Err(busy(
             "managed launch must include every reserved attachment",
         ));

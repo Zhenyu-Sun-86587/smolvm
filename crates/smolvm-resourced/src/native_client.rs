@@ -703,6 +703,10 @@ impl Client<'_> {
         }
         Ok(())
     }
+    pub fn retry_fork(&self, id: &str, input: &Cancellation) -> Result<OperationReceipt, QueryError> {
+        self.receipt("RetryManagedFork", id, &input.request_digest, &input.expected,
+                     json!({"expected_revision":input.expected_revision}))
+    }
     pub fn cancel(&self, id: &str, input: &Cancellation) -> Result<OperationReceipt, QueryError> {
         self.receipt(
             "CancelNativeOperation",
