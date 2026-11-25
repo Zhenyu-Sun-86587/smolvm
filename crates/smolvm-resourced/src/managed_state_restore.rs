@@ -43,6 +43,8 @@ pub(crate) struct Input {
     pub capture_id: String,
     #[serde(default)]
     pub mode: RestoreMode,
+    #[serde(default)]
+    pub network_id: Option<String>,
 }
 
 fn invalid(error: impl ToString) -> Fault {
@@ -169,6 +171,7 @@ pub(crate) fn queue_rollback(
             name: name.into(),
             capture_id: restore_capture_id.into(),
             mode,
+            network_id: None,
         },
         Some(rescue_capture_id),
         Some(&parent.operation_id),
@@ -195,6 +198,12 @@ fn queue(
         ));
     }
     let namespace = managed::serve_id(&expected.instance_id, &input.name)?;
+    let imported = crate::backup_import::imported(catalog, &input.capture_id)?;
+    if !imported && input.network_id.is_some() {
+        return Err(Fault::invalid(
+            "target network selection requires an imported backup",
+        ));
+    }
     if let Some((capture, mode, rescue)) = catalog.db.query_row(
         "SELECT capture_id,mode,rescue_capture_id FROM managed_state_restores WHERE operation_id=?",
         [id],
@@ -203,10 +212,16 @@ fn queue(
         if capture != input.capture_id || mode != input.mode.as_str() || rescue.as_deref() != rescue_capture_id {
             return Err(Fault::new("E_IDEMPOTENCY_CONFLICT", "durable restore parameters changed"));
         }
+        if imported {
+            let recorded: Option<String>=catalog.db.query_row("SELECT json_extract(spec_json,'$.network.network_id') FROM managed_launches WHERE operation_id=?",
+                [id],|row|row.get(0))?;
+            if recorded != input.network_id {
+                return Err(Fault::new("E_IDEMPOTENCY_CONFLICT", "backup target network selection changed"));
+            }
+        }
         return catalog.begin(request, "restore_target");
     }
     let (point, original) = source(catalog, route, bundle, &input.capture_id)?;
-    let imported = crate::backup_import::imported(catalog,&input.capture_id)?;
     if !imported && !original.instance_id.starts_with(&format!("i-{namespace}-")) {
         return Err(Fault::new(
             "E_PERMISSION_DENIED",
@@ -214,10 +229,17 @@ fn queue(
         ));
     }
     let same_machine = original.instance_id == expected.instance_id;
-    let archived_target = imported && !same_machine && expected.execution_epoch==0 && rescue_capture_id.is_none() && input.mode==RestoreMode::CloneConflicts;
-    if (imported && !archived_target) || (!imported && ((point.export.purpose == Purpose::Checkpoint && same_machine) != rescue_capture_id.is_some()
-        || (point.export.purpose != Purpose::Checkpoint && !same_machine)
-        || (!same_machine && expected.execution_epoch != 0)))
+    let archived_target = imported
+        && !same_machine
+        && expected.execution_epoch == 0
+        && rescue_capture_id.is_none()
+        && input.mode == RestoreMode::CloneConflicts;
+    if (imported && !archived_target)
+        || (!imported
+            && ((point.export.purpose == Purpose::Checkpoint && same_machine)
+                != rescue_capture_id.is_some()
+                || (point.export.purpose != Purpose::Checkpoint && !same_machine)
+                || (!same_machine && expected.execution_epoch != 0)))
     {
         return Err(Fault::new(
             "E_FENCE_UNPROVEN",
@@ -240,6 +262,24 @@ fn queue(
         BTreeMap::new()
     };
     let mut machine = source_plan.machine;
+    if imported {
+        machine.network = match (machine.network.as_ref(), input.network_id.as_deref()) {
+            (Some(archived), Some(target)) => {
+                Some(catalog.archived_network_target(target, archived)?)
+            }
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(crate::network_catalog::network_recovery_fault(
+                    "cannot attach a NIC to an archived no-network topology",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(crate::network_catalog::network_recovery_fault(
+                    "backup restore requires a registered isolated target network",
+                ));
+            }
+        }
+    }
     machine.name = input.name;
     let mut devices = Vec::with_capacity(machine.disks.len());
     let mut volume_map = BTreeMap::new();
@@ -418,11 +458,15 @@ pub(crate) fn receipt(catalog: &Catalog, op: &Operation) -> Result<Option<Value>
             .as_ref()
             .map_or("preparing", |(phase, _)| phase),
     };
-    Ok(Some(
-        json!({"stage":stage,"capture_id":capture,"rescue_capture_id":rescue,"representation_id":representation,
+    let mut value = json!({"stage":stage,"capture_id":capture,"rescue_capture_id":rescue,"representation_id":representation,
         "manifest_digest":manifest,"target_operation_id":op.operation_id,"volume_map":volume_map,"error_code":code,"error":error,
-        "activation_decision":authorization.as_ref().map(|(_, decision)| decision)}),
-    ))
+        "activation_decision":authorization.as_ref().map(|(_, decision)| decision)});
+    if op.phase == "COMPLETED" && crate::backup_import::imported(catalog, &capture)? {
+        if let Some(network) = crate::activation_catalog::archived_network_receipt(catalog, op)? {
+            value["network_recovery"] = network;
+        }
+    }
+    Ok(Some(value))
 }
 
 pub(crate) fn activation_input(
