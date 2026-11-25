@@ -237,7 +237,6 @@ impl KrunFunctions {
         use std::io::Write;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         type Ram = unsafe extern "C" fn(u32, *const u8, usize, *const i32, usize) -> i32;
-        type Authority = unsafe extern "C" fn(u32, i32, *const u8, *const u8, u64) -> i32;
         let snapshot = directory.join("capture");
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -270,10 +269,6 @@ impl KrunFunctions {
                 ._handle
                 .get::<Ram>(b"krun_set_diskless_snapshot_ram_v1\0")
                 .map_err(|e| e.to_string())?;
-            let configure = self
-                ._handle
-                .get::<Authority>(b"krun_set_guest_target_authority_v1\0")
-                .map_err(|e| e.to_string())?;
             check(
                 "parked checkpoint",
                 self.set_snapshot.ok_or("missing snapshot loader")?(ctx, path.as_ptr()),
@@ -288,13 +283,53 @@ impl KrunFunctions {
                     fds.len(),
                 ),
             )?;
-            check(
+        }
+        self.managed_target_authority(ctx, plan, restore, &memory.authority)
+    }
+
+    pub(crate) fn managed_statepoint(
+        &self,
+        ctx: u32,
+        plan: &Plan,
+        restore: &smolvm_resourced::managed::Restore,
+        durable: &smolvm_resourced::managed_state_restore::Durable,
+    ) -> Result<(), String> {
+        let config = serde_json::to_vec(&serde_json::json!({
+            "operation_id":plan.launch.operation_id,"request_digest":plan.launch.request_digest,
+            "capture_id":restore.capture_id,"lease_id":durable.lease_id,"volume_restore_policy":durable.mode
+        })).map_err(|e| e.to_string())?;
+        unsafe {
+            let attach = self
+                ._handle
+                .get::<Config>(b"krun_configure_worker_statepoint_restore_v1\0")
+                .map_err(|e| e.to_string())?;
+            self.check_managed_restore(
+                "durable StatePoint",
+                attach(ctx, config.as_ptr(), config.len()),
+            )
+        }
+    }
+
+    pub(crate) fn managed_target_authority(
+        &self,
+        ctx: u32,
+        plan: &Plan,
+        restore: &smolvm_resourced::managed::Restore,
+        authority: &smolvm_resourced::native_client::TargetAuthority,
+    ) -> Result<(), String> {
+        type Authority = unsafe extern "C" fn(u32, i32, *const u8, *const u8, u64) -> i32;
+        unsafe {
+            let configure = self
+                ._handle
+                .get::<Authority>(b"krun_set_guest_target_authority_v1\0")
+                .map_err(|e| e.to_string())?;
+            self.check_managed_restore(
                 "target identity authority",
                 configure(
                     ctx,
-                    memory.authority.as_raw_fd(),
-                    memory.anchor.as_ptr(),
-                    memory.context.as_ptr(),
+                    authority.authority.as_raw_fd(),
+                    authority.anchor.as_ptr(),
+                    authority.context.as_ptr(),
                     plan.launch.execution.execution_epoch as u64,
                 ),
             )?;
@@ -304,13 +339,22 @@ impl KrunFunctions {
                     .get::<Config>(b"krun_configure_worker_block_restore_v1\0")
                     .map_err(|e| e.to_string())?;
                 let proof=serde_json::to_vec(&serde_json::json!({"operation_id":plan.launch.operation_id,"request_digest":plan.launch.request_digest,
-                    "source_pivot_id":restore.batch_id,"grant_id":plan.grant_id,"expected_revision":2})).map_err(|e|e.to_string())?;
-                check(
+                    "source_pivot_id":restore.batch_id,"grant_id":plan.grant_id,"expected_revision":2})).map_err(|e| e.to_string())?;
+                self.check_managed_restore(
                     "restored writer set",
                     configure(ctx, proof.as_ptr(), proof.len()),
                 )?;
             }
         }
         Ok(())
+    }
+
+    fn check_managed_restore(&self, step: &str, status: i32) -> Result<(), String> {
+        if status == 0 {
+            Ok(())
+        } else {
+            let detail = self.last_error_message().unwrap_or_default();
+            Err(format!("{step} returned {status}: {detail}"))
+        }
     }
 }

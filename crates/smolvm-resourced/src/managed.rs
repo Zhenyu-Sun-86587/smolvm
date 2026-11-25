@@ -90,6 +90,8 @@ pub struct Restore {
     pub anchor: String,
     pub helper_digest: String,
     pub source_pivot: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable: Option<crate::managed_state_restore::Durable>,
 }
 pub(crate) fn key(op: &str, label: &str, slot: usize) -> String {
     let digest = Sha256::digest(format!("{op}\0{label}\0{slot}").as_bytes());
@@ -98,7 +100,7 @@ pub(crate) fn key(op: &str, label: &str, slot: usize) -> String {
 pub fn machine_id(serve: &str, name: &str) -> String {
     format!("i-{serve}-{:x}", Sha256::digest(name.as_bytes()))
 }
-fn serve_id(instance: &str, name: &str) -> Result<String> {
+pub(crate) fn serve_id(instance: &str, name: &str) -> Result<String> {
     let id = instance
         .strip_prefix("i-")
         .and_then(|s| s.split_once('-'))
@@ -343,7 +345,10 @@ pub(crate) fn plan(c: &Catalog, op: &Operation) -> Result<Option<Plan>> {
             devices: serde_json::from_str(&devices)
                 .map_err(|e| Fault::new("E_CATALOG", e.to_string()))?,
             grant_id: key(&op.operation_id, "grant", 0),
-            restore: crate::managed_fork::restore(c, &op.operation_id)?,
+            restore: match crate::managed_state_restore::plan(c, op)? {
+                Some(restore) => Some(restore),
+                None => crate::managed_fork::restore(c, &op.operation_id)?,
+            },
         })
     })
     .transpose()

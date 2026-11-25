@@ -45,8 +45,8 @@ def settled(endpoint, operation_id, timeout=150):
 
 
 def durable_points(endpoint, source, name, logfile):
-    def invoke(kind, key, params):
-        envelope=dict(kind=kind,operation_id=key,request_digest=digest(key.encode()),expected=source,parameters=params)
+    def invoke(kind, key, params, expected=source):
+        envelope=dict(kind=kind,operation_id=key,request_digest=digest(key.encode()),expected=expected,parameters=params)
         first=http(endpoint,EXT+"/operations",envelope)
         assert first["phase"]=="NEW",first
         result=settled(endpoint,key,180)
@@ -66,6 +66,43 @@ def durable_points(endpoint, source, name, logfile):
     binding=http(endpoint,f"{EXT}/machines/{name}/binding")
     assert binding["incarnation_id"] is None and binding["execution_epoch"]==source["execution_epoch"]
     print("Checkpoint publication returned a verified durable manifest while the guest continued. Hibernate stopped the parked execution without advancing its counter.",flush=True)
+
+    def slot(machine):
+        result=http(endpoint,f"{EXT}/machines/{machine}/binding")
+        return {field:result[field] for field in ("instance_id","incarnation_id","execution_epoch")}
+
+    def watch(machine):
+        current=http(endpoint,f"{EXT}/machines/{machine}/execution")
+        log=logfile.parent/(current["incarnation_id"]+".log")
+        def ticks():
+            if log.exists():
+                lines=[line.split() for line in log.read_text(errors="replace").splitlines() if line.startswith("PARKED_BLOCK_TICK ")]
+                if len(lines)>=2:return lines
+        return current,until(ticks,20)
+
+    resumed=invoke("vm_restore","resume-hibernated",{"name":name,"capture_id":hibernated["capture_id"],"mode":"exact"},slot(name))
+    assert resumed["statepoint"]["stage"]=="released" and resumed["statepoint"]["manifest_digest"]==hibernated["manifest_digest"],resumed
+    volumes=resumed["statepoint"]["volume_map"]
+    assert volumes and all(old==new for old,new in volumes.items()),volumes
+    again,active_ticks=watch(name)
+    old_ticks=[l.split() for l in logfile.read_text(errors="replace").splitlines() if l.startswith("PARKED_BLOCK_TICK ")]
+    assert again["execution_epoch"]==source["execution_epoch"]+1 and again["incarnation_id"]!=source["incarnation_id"],again
+    assert active_ticks[0][2]==old_ticks[-1][2] and int(active_ticks[0][1])==int(old_ticks[-1][1])+1,(active_ticks[0],old_ticks[-1])
+    print("Exact hibernate restore continued the original guest PID and next counter tick with the same writable volume IDs.",flush=True)
+
+    rolled=invoke("vm_rollback","rollback-before-hibernate",{"capture_id":snapshot["capture_id"],"mode":"clone_conflicts"},again)["statepoint"]
+    assert rolled["manifest_digest"]==snapshot["manifest_digest"] and rolled["rescue_manifest_digest"].startswith("sha256:") and rolled["rescue_capture_id"]!=snapshot["capture_id"],rolled
+    current,ticks=watch(name)
+    assert current["execution_epoch"]==again["execution_epoch"]+1 and int(ticks[0][1])<int(active_ticks[0][1]) and ticks[0][2]==old_ticks[0][2],ticks[:2]
+    print("Rollback fenced the previous execution, retained its durable rescue and resumed the earlier counter in a new epoch.",flush=True)
+
+    clone="checkpoint-copy"
+    clone_op=invoke("vm_restore","clone-checkpoint",{"name":clone,"capture_id":snapshot["capture_id"],"mode":"clone_conflicts"},slot(clone))["statepoint"]
+    assert clone_op["manifest_digest"]==snapshot["manifest_digest"] and any(a!=b for a,b in clone_op["volume_map"].items()),clone_op
+    copy,clone_ticks=watch(clone)
+    assert copy["instance_id"]!=current["instance_id"] and clone_ticks[0][1:3]==ticks[0][1:3] and clone_ticks[0][3]==clone,clone_ticks[:2]
+    assert clone_ticks[0][5:7]==ticks[0][5:7],(clone_ticks[0],ticks[0])
+    print("A separate restore from the original checkpoint reproduced the RAM and two-disk boundary in another logical instance.",flush=True)
 
 
 def partial_fork(endpoint, root, ref):
@@ -391,7 +428,9 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
             print("A parked child forked after its parent exited. The grandchild continued its captured process and both disks after fencing both ancestors and the sibling.",flush=True)
             if fork_faults or statepoint:
                 grand_ref=http(endpoint,f"{EXT}/machines/grandchild/execution")
-                if fork_faults:partial_fork(endpoint,root,grand_ref)
+                if fork_faults:
+                    partial_fork(endpoint,root,grand_ref)
+                    if statepoint:fence_machine("partial-keep")
                 if statepoint:durable_points(endpoint,grand_ref,"grandchild",logfile)
             return
         if statepoint:

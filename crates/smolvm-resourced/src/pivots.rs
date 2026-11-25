@@ -462,16 +462,13 @@ pub fn reconcile_dead(
     parked: &mut HashMap<String, Vec<File>>,
     execution: &Execution,
 ) -> Result<()> {
-    let id: Option<String> = catalog
-        .db
-        .query_row(
-            "SELECT p.operation_id FROM writer_pivots p JOIN operations o USING(operation_id)
-        WHERE p.incarnation_id=? AND o.phase='NEW'",
-            [&execution.incarnation_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(id) = id else { return Ok(()) };
+    let ids={
+        let mut query=catalog.db.prepare("SELECT p.operation_id FROM writer_pivots p JOIN operations o USING(operation_id)
+            WHERE p.incarnation_id=? AND o.phase='NEW' ORDER BY p.rowid")?;
+        let found=query.query_map([&execution.incarnation_id],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        found
+    };
+    for id in ids {
     let pivot = catalog.writer_pivot(&id)?.ok_or_else(missing)?;
     pivot.check_scope(execution)?;
     match pivot.state.as_str() {
@@ -485,7 +482,12 @@ pub fn reconcile_dead(
         "complete" | "aborted" => {}
         _ => abort(catalog, root, parked, &pivot)?,
     }
-    catalog.finish_dead_pivot(&id, matches!(pivot.state.as_str(), "commit" | "complete"))
+    let higher_level:bool=catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM managed_fork_batches WHERE operation_id=?)",[&id],|r|r.get(0))?;
+    if !higher_level {
+        catalog.finish_dead_pivot(&id, matches!(pivot.state.as_str(), "commit" | "complete"))?;
+    }
+    }
+    Ok(())
 }
 
 pub fn query(catalog: &Catalog, request: &Request) -> Result<Value> {

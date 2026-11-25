@@ -335,6 +335,30 @@ impl Client<'_> {
             json!({"serve_instance":serve}),
         )
     }
+    pub fn submit_state_restore(&self, input: &Submission) -> Result<OperationReceipt, QueryError> {
+        self.recover_and_retry(|| {
+            self.receipt(
+                "SubmitManagedStateRestore",
+                &input.operation_id,
+                &input.request_digest,
+                &input.expected,
+                input.parameters.clone(),
+            )
+        })
+    }
+    pub fn prepare_state_restore(
+        &self,
+        launch: &Launch,
+        scope: &ExecutionRef,
+    ) -> Result<bool, QueryError> {
+        let value: Value = self.call(
+            "PrepareManagedStateRestore",
+            Some(scope),
+            Some((&launch.operation_id, &launch.request_digest)),
+            empty(),
+        )?;
+        Ok(value["phase"] == "prepared")
+    }
     pub fn fork_memory(
         &self,
         plan: &crate::managed::Plan,
@@ -434,8 +458,30 @@ impl Client<'_> {
         if ack["state"] != "attached" || ack["lease_id"] != lease_id {
             return Err(protocol());
         }
+        Ok(ForkMemory {
+            descriptor,
+            checkpoint,
+            ram,
+            authority: self.restore_authority(launch, restore)?,
+        })
+    }
+
+    pub fn restore_authority(
+        &self,
+        launch: &Launch,
+        restore: &crate::managed::Restore,
+    ) -> Result<TargetAuthority, QueryError> {
+        let protocol = || fault("E_PROTOCOL_UNSUPPORTED", "invalid Worker restore authority");
+        let expected = Some(&launch.execution);
+        let intent = Some((launch.operation_id.as_str(), launch.request_digest.as_str()));
+        let resource = restore
+            .durable
+            .as_ref()
+            .map_or(restore.capture_id.as_str(), |point| {
+                &point.representation_id
+            });
         let ready: Value = self.call("PrepareManagedForkAuthority", expected, intent, empty())?;
-        if ready["binding"]["input"]["capture_resource_id"] != restore.capture_id
+        if ready["binding"]["input"]["capture_resource_id"] != resource
             || ready["binding"]["input"]["capture_anchor"] != restore.anchor
             || ready["binding"]["input"]["helper_digest"] != restore.helper_digest
         {
@@ -462,10 +508,7 @@ impl Client<'_> {
         .map_err(|_| protocol())?;
         let mut anchor = [0; 16];
         hex::decode_to_slice(&restore.anchor, &mut anchor).map_err(|_| protocol())?;
-        Ok(ForkMemory {
-            descriptor,
-            checkpoint,
-            ram,
+        Ok(TargetAuthority {
             context,
             anchor,
             authority: fds.pop().ok_or_else(protocol)?,
@@ -779,9 +822,18 @@ impl Client<'_> {
         }
         Ok(())
     }
-    pub fn retry_fork(&self, id: &str, input: &Cancellation) -> Result<OperationReceipt, QueryError> {
-        self.receipt("RetryManagedFork", id, &input.request_digest, &input.expected,
-                     json!({"expected_revision":input.expected_revision}))
+    pub fn retry_fork(
+        &self,
+        id: &str,
+        input: &Cancellation,
+    ) -> Result<OperationReceipt, QueryError> {
+        self.receipt(
+            "RetryManagedFork",
+            id,
+            &input.request_digest,
+            &input.expected,
+            json!({"expected_revision":input.expected_revision}),
+        )
     }
     pub fn cancel(&self, id: &str, input: &Cancellation) -> Result<OperationReceipt, QueryError> {
         self.receipt(
@@ -822,6 +874,10 @@ pub struct ForkMemory {
     pub descriptor: Vec<u8>,
     pub checkpoint: Vec<u8>,
     pub ram: Vec<OwnedFd>,
+    pub authority: TargetAuthority,
+}
+
+pub struct TargetAuthority {
     pub context: [u8; 32],
     pub anchor: [u8; 16],
     pub authority: OwnedFd,

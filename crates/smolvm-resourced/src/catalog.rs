@@ -29,9 +29,9 @@ pub struct Operation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<Expected>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fork: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statepoint: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<Value>,
     pub phase: String,
     pub decision: String,
     pub revision: i64,
@@ -49,8 +49,8 @@ fn operation_row(row: &Row<'_>) -> rusqlite::Result<Operation> {
         expected_incarnation_id: row.get(7)?,
         native: None,
         execution: None,
-        fork: None,
         statepoint: None,
+        fork: None,
         phase: row.get(8)?,
         decision: row.get(9)?,
         revision: row.get(10)?,
@@ -242,10 +242,11 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_network_dns.sql"))?;
                 tx.execute_batch(include_str!("schema_managed_forks.sql"))?;
                 tx.execute_batch(include_str!("schema_capture_network.sql"))?;
+                tx.execute_batch(include_str!("schema_managed_state_restores.sql"))?;
                 tx.execute_batch(include_str!("schema_lifecycle.sql"))?;
                 tx.execute_batch("PRAGMA user_version=17")?;
             }
-            1..=15 | 17 => {
+            1..=17 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -288,6 +289,10 @@ impl Catalog {
                 }
                 if version < 15 {
                     tx.execute_batch(include_str!("schema_capture_network.sql"))?;
+                }
+                if version < 16 {
+                    tx.execute_batch(include_str!("schema_managed_state_restores.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=16")?;
                 }
                 if version < 17 {
                     tx.execute_batch(include_str!("schema_lifecycle.sql"))?;
@@ -432,6 +437,14 @@ impl Catalog {
         }
         if matches!(operation.kind.as_str(), "vm_snapshot" | "hibernate" | "vm_rollback") {
             operation.statepoint=crate::managed_statepoint::receipt(self,&operation)?;
+            if operation.kind=="vm_rollback" && operation.phase=="COMPLETED" {
+                operation.execution=self.db.query_row("SELECT e.instance_id,e.incarnation_id,e.execution_epoch FROM managed_fork_batches b
+                    JOIN managed_launches m ON m.operation_id=b.target_operation_id JOIN executions e USING(incarnation_id)
+                    WHERE b.operation_id=?", [&operation.operation_id],|r|Ok(Expected {instance_id:r.get(0)?,incarnation_id:r.get(1)?,execution_epoch:r.get(2)?})).optional()?;
+            }
+        }
+        if operation.kind == "restore_target" {
+            operation.statepoint = crate::managed_state_restore::receipt(self, &operation)?;
         }
         Ok(operation)
     }
@@ -444,6 +457,16 @@ impl Catalog {
         &mut self,
         r: &Request,
         kind: &str,
+        record: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    ) -> Result<Operation> {
+        self.begin_with_handoff(r, kind, None, record)
+    }
+
+    pub(crate) fn begin_with_handoff(
+        &mut self,
+        r: &Request,
+        kind: &str,
+        predecessor: Option<&str>,
         record: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
     ) -> Result<Operation> {
         let (id, digest) = r.operation()?;
@@ -474,7 +497,7 @@ impl Catalog {
         if epoch != expected.execution_epoch || incarnation != expected.incarnation_id {
             return Err(stale());
         }
-        if active.is_some() {
+        if active.as_deref() != predecessor {
             return Err(conflict(
                 "E_OPERATION_IN_PROGRESS",
                 "this instance already has an active operation",
@@ -821,6 +844,7 @@ impl Catalog {
             "UPDATE instance_bindings SET incarnation_id=NULL WHERE incarnation_id=?",
             [id],
         )?;
+        crate::managed_fork::source_exited(&tx,id)?;
         tx.execute("UPDATE managed_budget_holds SET state='released' WHERE incarnation_id=? AND state='running'",[id])?;
         crate::escrow_catalog::release_execution(&tx, id)?;
         tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='managed_execution' AND owner_id=? AND state='active'",[id])?;

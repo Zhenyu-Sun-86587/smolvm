@@ -234,15 +234,19 @@ impl PrivateRouter {
                         policy.private_ipv4, self.gateway, self.gateway
                     ),
                 )?;
-                nft(port, &format!(
-                    "add table ip fixed\n\
-                     add chain ip fixed prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}\n\
-                     add chain ip fixed postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}\n\
-                     add rule ip fixed prerouting ip daddr {} dnat to {guest}\n\
-                     add rule ip fixed postrouting oifname \"up0\" ip saddr {guest} snat to {}\n\
-                     add rule ip fixed postrouting iifname \"{TAP_PORT_NAME}\" oifname \"{TAP_PORT_NAME}\" ip daddr {guest} snat to {gateway}\n",
-                    policy.private_ipv4, policy.private_ipv4
-                ))?;
+                nft(
+                    port,
+                    &format!(
+                        "add table ip fixed\n\
+                         add chain ip fixed prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}\n\
+                         add chain ip fixed postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}\n\
+                         add rule ip fixed prerouting iifname \"{TAP_PORT_NAME}\" ip daddr {gateway} udp dport 53 dnat to {}\n\
+                         add rule ip fixed prerouting ip daddr {} dnat to {guest}\n\
+                         add rule ip fixed postrouting oifname \"up0\" ip saddr {guest} snat to {}\n\
+                         add rule ip fixed postrouting iifname \"{TAP_PORT_NAME}\" oifname \"{TAP_PORT_NAME}\" ip daddr {guest} snat to {gateway}\n",
+                        self.gateway, policy.private_ipv4, policy.private_ipv4
+                    ),
+                )?;
             }
         }
         Ok(QuarantinedPort {
