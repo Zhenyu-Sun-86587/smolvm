@@ -42,7 +42,8 @@ fn installed_profile() -> Result<(Handshake, serde_json::Value, String), String>
             .capabilities
             .into_iter()
             .map(|(name, mut value)| {
-                if name == "boot.system" && value.supported && !launch::worker_configured() {
+                if matches!(name.as_str(), "boot.system" | "state.independent_fork" | "state.fork_batch" | "state.checkpoint" | "state.hibernate" |
+                    "state.restore" | "state.rollback") && value.supported && !launch::worker_configured() {
                     value.supported = false;
                     value.status = "unavailable".into();
                     value.reason_code = "WORKER_NOT_CONFIGURED".into();
@@ -87,6 +88,7 @@ pub fn worker_operations_router(socket: std::path::PathBuf) -> axum::Router {
             "/api/v1/runtime-ext/v1/operations",
             axum::routing::post(submit),
         )
+        .route("/api/v1/runtime-ext/v1/operations/{id}/retry", axum::routing::post(retry_fork))
         .route(
             "/api/v1/runtime-ext/v1/operations/{id}/cancel",
             axum::routing::post(cancel),
@@ -272,13 +274,31 @@ async fn submit(
 ) -> axum::response::Response {
     native(socket, move |client| {
         launch::require_own(&input.expected.instance_id)?;
+        if matches!(input.kind.as_str(), "independent_fork" | "fork_batch" | "hibernate" | "vm_snapshot" | "vm_rollback") {
+            return client.submit_fork(&input);
+        }
         if input.kind == "launch" {
             launch::ensure_binding(client, &input.expected.instance_id)?;
             return client.managed_submit(&input);
         }
+        if input.kind == "vm_restore" {
+            launch::ensure_binding(client, &input.expected.instance_id)?;
+            return client.submit_state_restore(&input);
+        }
         client.submit(&input)
     })
     .await
+}
+#[cfg(feature = "deep-runtime")]
+async fn retry_fork(
+    axum::extract::State(socket): axum::extract::State<std::path::PathBuf>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(input): Json<smolvm_resourced::native_client::Cancellation>,
+) -> axum::response::Response {
+    native(socket, move |client| {
+        launch::require_own(&input.expected.instance_id)?;
+        client.retry_fork(&id, &input)
+    }).await
 }
 #[cfg(feature = "deep-runtime")]
 async fn cancel(

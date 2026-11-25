@@ -78,6 +78,21 @@ fn session(row: &rusqlite::Row, offset: usize) -> rusqlite::Result<Session> {
     })
 }
 
+/// Older parked snapshots contain the kernel freezer's session counter in RAM
+/// even when the target transport started its private authority at session one.
+pub(crate) fn next_session(catalog: &Catalog, incarnation: &str, observed: u32) -> Result<u32> {
+    let saved: u32 = catalog.db.query_row(
+        "SELECT COALESCE(MAX(s),0) FROM (
+            SELECT session s FROM native_transitions WHERE incarnation_id=?1 UNION ALL
+            SELECT session FROM managed_fork_batches WHERE source_incarnation=?1 UNION ALL
+            SELECT b.session FROM executions e JOIN managed_fork_children ch ON ch.operation_id=e.last_operation_id
+              JOIN managed_fork_batches b ON b.operation_id=ch.batch_id WHERE e.incarnation_id=?1 UNION ALL
+            SELECT json_extract(p.export_json,'$.session') FROM executions e JOIN managed_state_restores r ON r.operation_id=e.last_operation_id
+              JOIN statepoints p USING(capture_id) WHERE e.incarnation_id=?1)",
+        [incarnation], |r|r.get(0))?;
+    saved.max(observed).checked_add(1).ok_or_else(||Fault::invalid("Guest gate session exhausted"))
+}
+
 pub fn submit(catalog: &mut Catalog, boot: &str, r: &Request, input: Input) -> Result<Operation> {
     let (id, _) = r.operation()?;
     let (route, _, expected) = r.scope()?;
@@ -170,11 +185,6 @@ pub fn submit(catalog: &mut Catalog, boot: &str, r: &Request, input: Input) -> R
                 "managed standby requires an installed measured helper",
             ));
         }
-        let latest: u32 = catalog.db.query_row(
-            "SELECT coalesce(max(session),0) FROM native_transitions WHERE incarnation_id=?",
-            [incarnation],
-            |r| r.get(0),
-        )?;
         let network = observed.devices.iter().any(|d| d["virtio_type"] == 1);
         if mode == "managed"
             && observed
@@ -185,10 +195,7 @@ pub fn submit(catalog: &mut Catalog, boot: &str, r: &Request, input: Input) -> R
             return Err(unsupported("managed network standby requires a Worker TAP"));
         }
         Session {
-            number: latest
-                .max(observed.last_session)
-                .checked_add(1)
-                .ok_or_else(|| Fault::invalid("native session exhausted"))?,
+            number: next_session(catalog, incarnation, observed.last_session)?,
             token: nonce()?,
             anchor: nonce()?,
             mode: mode.into(),

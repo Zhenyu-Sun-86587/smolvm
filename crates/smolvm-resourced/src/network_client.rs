@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -150,6 +151,11 @@ impl WorkerNetworkScope {
             "payload": payload,
         });
         let socket = ipc::connect(&self.socket).map_err(transport)?;
+        // The Worker verifies the measured execution before the offer and
+        // around publication. Use the same response budget as native control.
+        socket
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .map_err(transport)?;
         if ipc::peer(&socket).map_err(transport)?.uid != 0 {
             return Err(protocol(
                 "network attachment requires the privileged Worker peer",
@@ -158,7 +164,7 @@ impl WorkerNetworkScope {
         ipc::send(&socket, request.to_string().as_bytes()).map_err(transport)?;
         let packet = ipc::receive_packet(&socket).map_err(|error| QueryError {
             code: error.code.to_owned(),
-            message: error.message,
+            message: format!("{method}: {}", error.message),
         })?;
         let mut response: Response = serde_json::from_slice(&packet.body)
             .map_err(|_| protocol("invalid network response"))?;

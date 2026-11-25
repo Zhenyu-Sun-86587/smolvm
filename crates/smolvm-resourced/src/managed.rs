@@ -7,6 +7,33 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::net::Ipv4Addr;
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Network {
+    pub network_id: String,
+    pub route_domain_id: String,
+    pub cidr: String,
+    pub mode: NetworkMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    Native,
+    FixedInternal,
+}
+
+impl Network {
+    pub(crate) fn fixed_route(&self) -> Option<(Ipv4Addr, Ipv4Addr, u8)> {
+        (self.mode == NetworkMode::FixedInternal).then_some((
+            Ipv4Addr::new(10, 0, 2, 15),
+            Ipv4Addr::new(10, 0, 2, 2),
+            24,
+        ))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +59,8 @@ pub struct Machine {
     pub init: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<Network>,
 }
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -50,8 +79,20 @@ pub struct Plan {
     pub machine: Machine,
     pub devices: Vec<Device>,
     pub grant_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<Restore>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Restore {
+    pub batch_id: String,
+    pub capture_id: String,
+    pub anchor: String,
+    pub helper_digest: String,
+    pub source_pivot: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable: Option<crate::managed_state_restore::Durable>,
+}
 pub(crate) fn key(op: &str, label: &str, slot: usize) -> String {
     let digest = Sha256::digest(format!("{op}\0{label}\0{slot}").as_bytes());
     format!("{label}-{}", &hex::encode(digest)[..32])
@@ -59,7 +100,7 @@ pub(crate) fn key(op: &str, label: &str, slot: usize) -> String {
 pub fn machine_id(serve: &str, name: &str) -> String {
     format!("i-{serve}-{:x}", Sha256::digest(name.as_bytes()))
 }
-fn serve_id(instance: &str, name: &str) -> Result<String> {
+pub(crate) fn serve_id(instance: &str, name: &str) -> Result<String> {
     let id = instance
         .strip_prefix("i-")
         .and_then(|s| s.split_once('-'))
@@ -74,7 +115,7 @@ fn serve_id(instance: &str, name: &str) -> Result<String> {
     Ok(id.to_string())
 }
 impl Machine {
-    fn devices(
+    pub(crate) fn devices(
         &self,
         c: &Catalog,
         op: &str,
@@ -113,6 +154,15 @@ impl Machine {
             .map(|id| plan(c, &c.operation(&id)?))
             .transpose()?
             .flatten();
+        if previous
+            .as_ref()
+            .is_some_and(|p| p.machine.network != self.network)
+        {
+            return Err(Fault::new(
+                "E_NETWORK_ATTACHMENT_CONFLICT",
+                "managed network changes require a separate attachment operation",
+            ));
+        }
         if previous.as_ref().is_some_and(|p| {
             p.machine.boot_profile != self.boot_profile
                 || p.machine
@@ -244,6 +294,13 @@ impl Machine {
     }
 }
 impl Plan {
+    pub fn network_attachment_id(&self) -> Option<String> {
+        self.machine
+            .network
+            .as_ref()
+            .map(|_| key(&self.launch.execution.instance_id, "net", 0))
+    }
+
     pub(crate) fn heads(&self) -> Vec<VolumeHead> {
         self.devices
             .iter()
@@ -288,6 +345,10 @@ pub(crate) fn plan(c: &Catalog, op: &Operation) -> Result<Option<Plan>> {
             devices: serde_json::from_str(&devices)
                 .map_err(|e| Fault::new("E_CATALOG", e.to_string()))?,
             grant_id: key(&op.operation_id, "grant", 0),
+            restore: match crate::managed_state_restore::plan(c, op)? {
+                Some(restore) => Some(restore),
+                None => crate::managed_fork::restore(c, &op.operation_id)?,
+            },
         })
     })
     .transpose()
@@ -324,6 +385,13 @@ pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<O
         return c.begin(r, "launch");
     }
     let devices = machine.devices(c, id, route, bundle, expected)?;
+    if let Some(network) = &machine.network {
+        c.register_private_network(&crate::network_catalog::RegisterNetwork {
+            network_id: network.network_id.clone(),
+            route_domain_id: network.route_domain_id.clone(),
+            cidr: network.cidr.clone(),
+        })?;
+    }
     let storage = devices
         .iter()
         .filter(|d| !d.disk.read_only)

@@ -3,6 +3,7 @@
 use crate::catalog::{Catalog, Execution, Operation};
 use crate::escrow_catalog::LeaseRecord;
 use crate::ipc::{valid_id, Fault, FdEntry, Request, Result};
+use crate::managed_state_restore::{self, RestoreMode as VolumePolicy};
 use crate::native_control::Endpoint;
 use crate::statepoint_capture::{self, host_io, Export, Purpose};
 use crate::statepoint_catalog::Record;
@@ -38,23 +39,6 @@ struct Prepare {
     capture_id: String,
     #[serde(default)]
     volume_restore_policy: VolumePolicy,
-}
-
-#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum VolumePolicy {
-    Exact,
-    #[default]
-    CloneConflicts,
-}
-
-impl VolumePolicy {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Exact => "exact",
-            Self::CloneConflicts => "clone_conflicts",
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -128,11 +112,13 @@ impl StatePoints {
             }
         }
         catalog.ready()?;
-        catalog.active_operation(request)?;
+        if prior.is_none() || operation.kind!="vm_snapshot" {
+            catalog.active_operation(request)?;
+        }
         if !self.exports.is_empty() {
             return Err(limits());
         }
-        if !matches!(operation.kind.as_str(), "statepoint" | "writer_pivot") {
+        if !matches!(operation.kind.as_str(), "statepoint" | "writer_pivot" | "vm_snapshot" | "hibernate" | "vm_rollback") {
             return Err(Fault::invalid(
                 "StatePoint requires its own capture operation",
             ));
@@ -162,6 +148,8 @@ impl StatePoints {
             Some(_) => return Err(conflict("held capture bytes changed on export replay")),
             None => catalog.start_statepoint(&operation, &export, &point)?,
         };
+        crate::activation_catalog::pin_statepoint_tap(catalog, &record, source,
+            record.point.devices.iter().any(|device|device.is_network()))?;
         let directory = self.directory.clone();
         let bundle = operation.bundle_digest;
         let commit_id = operation.operation_id;
@@ -276,35 +264,7 @@ impl StatePoints {
         capture_id: &str,
     ) -> Result<(Record, Operation)> {
         let (route, bundle, _) = request.scope()?;
-        let record = catalog.require_statepoint(capture_id)?;
-        let source = catalog.operation(&record.operation_id)?;
-        if source.route_id != route || source.bundle_digest != bundle {
-            return Err(Fault::new(
-                "E_BUNDLE_UNAVAILABLE",
-                "restore requires the original StatePoint reader",
-            ));
-        }
-        if !matches!(
-            (record.export.purpose, record.phase.as_str()),
-            (Purpose::Checkpoint, "durable")
-                | (Purpose::Hibernate | Purpose::RollbackRescue, "hibernated")
-        ) {
-            return Err(Fault::new(
-                "E_RESOURCE_UNAVAILABLE",
-                "StatePoint has no available durable restore root",
-            ));
-        }
-        let resource = catalog.resource(&record.point.representation_id)?;
-        if resource["state"] != "available"
-            || resource["durability"] != "durable"
-            || resource["immutable"] != true
-        {
-            return Err(Fault::new(
-                "E_RESOURCE_UNAVAILABLE",
-                "StatePoint durable representation is unavailable",
-            ));
-        }
-        Ok((record, source))
+        managed_state_restore::source(catalog, route, bundle, capture_id)
     }
 
     pub fn prepare_restore(
@@ -316,12 +276,13 @@ impl StatePoints {
         let input: Prepare = request.payload()?;
         let (record, source) = self.valid_restore(catalog, request, &input.capture_id)?;
         let exact_heads = if input.volume_restore_policy == VolumePolicy::Exact {
-            if record.export.purpose != Purpose::Hibernate
-                || source.instance_id != request.scope()?.2.instance_id
-            {
-                return Err(crate::pivots::generation_mismatch());
-            }
-            crate::pivots::exact_successors(catalog, &source.operation_id, None)?
+            managed_state_restore::exact_heads(
+                catalog,
+                &record,
+                &source,
+                &request.scope()?.2.instance_id,
+                request.operation_id.as_deref(),
+            )?
         } else {
             Vec::new()
         };
@@ -389,7 +350,7 @@ impl StatePoints {
         if !valid_id(&input.lease_id)
             || operation.kind != "restore_target"
             || target.incarnation_id == point.point.incarnation_id
-            || (point.export.purpose == Purpose::Hibernate
+            || (point.export.purpose != Purpose::Checkpoint
                 && source.instance_id != target.instance_id)
         {
             return Err(Fault::new(
@@ -397,15 +358,25 @@ impl StatePoints {
                 "StatePoint restore requires an authorized replacement execution",
             ));
         }
-        if input.volume_restore_policy == VolumePolicy::Exact {
-            if point.export.purpose != Purpose::Hibernate
-                || source.instance_id != target.instance_id
+        if let Some(restore) = managed_state_restore::plan(catalog, &operation)? {
+            if restore.capture_id != input.capture_id
+                || restore
+                    .durable
+                    .is_none_or(|durable| durable.mode != input.volume_restore_policy)
+                || input.lease_id
+                    != crate::managed::key(&operation.operation_id, "statepoint-lease", 0)
             {
-                return Err(crate::pivots::generation_mismatch());
+                return Err(conflict(
+                    "managed restore capture, volume policy or lease changed",
+                ));
             }
-            crate::pivots::exact_successors(
+        }
+        if input.volume_restore_policy == VolumePolicy::Exact {
+            managed_state_restore::exact_heads(
                 catalog,
-                &source.operation_id,
+                &point,
+                &source,
+                &target.instance_id,
                 Some(&operation.operation_id),
             )?;
         }

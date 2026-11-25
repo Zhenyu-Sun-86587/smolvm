@@ -163,6 +163,7 @@ struct Worker {
     network: crate::network_runtime::NetworkRuntime,
     activation: ActivationRuntime,
     statepoints: StatePoints,
+    forks: crate::managed_fork::Actor,
 }
 
 struct Reply {
@@ -262,6 +263,17 @@ fn process_fd(pid: i32) -> io::Result<OwnedFd> {
     }
 }
 
+struct MeasuredExecutable {
+    file: File,
+    digest: String,
+    ctime: (i64,i64),
+    size: u64,
+}
+
+thread_local! {
+    static MEASURED_EXECUTABLE: std::cell::RefCell<Option<MeasuredExecutable>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn verify_executable(
     pid: i32,
     start: i64,
@@ -271,21 +283,31 @@ pub(crate) fn verify_executable(
     let path = format!("/proc/{pid}/exe");
     let mut file = File::open(&path).map_err(broker_error)?;
     let original = file.metadata().map_err(broker_error)?;
-    let mut digest = Sha256::new();
-    io::copy(&mut file, &mut digest).map_err(broker_error)?;
+    let ctime = (original.ctime(), original.ctime_nsec());
+    let cacheable = original.is_file() && original.uid() == 0 && original.mode() & 0o022 == 0;
+    // Keep the inode open to exclude inode reuse. Only root-owned executable
+    // images are eligible; every call revalidates the proc link and the pidfd.
+    let cached = cacheable && MEASURED_EXECUTABLE.with_borrow(|entry| entry.as_ref().is_some_and(|e| {
+        e.digest == wanted && e.ctime == ctime && e.size == original.len()
+           && e.file.metadata().is_ok_and(|m| m.dev() == original.dev() && m.ino() == original.ino())
+    }));
+    if !cached {
+        let mut digest = Sha256::new();
+        io::copy(&mut file, &mut digest).map_err(broker_error)?;
+        if format!("sha256:{:x}", digest.finalize()) != wanted {
+            return Err(Fault::new("E_BUNDLE_UNAVAILABLE", "peer executable does not match registered bundle"));
+        }
+    }
     let current = fs::metadata(path).map_err(broker_error)?;
-    if original.dev() != current.dev()
-        || original.ino() != current.ino()
-        || pid_start(pid).ok() != Some(start)
-        || pid_exited(pidfd).map_err(broker_error)?
-    {
+    if original.dev() != current.dev() || original.ino() != current.ino()
+        || original.len() != current.len() || ctime != (current.ctime(),current.ctime_nsec())
+        || pid_start(pid).ok() != Some(start) || pid_exited(pidfd).map_err(broker_error)? {
         return Err(stale_execution());
     }
-    if format!("sha256:{:x}", digest.finalize()) != wanted {
-        return Err(Fault::new(
-            "E_BUNDLE_UNAVAILABLE",
-            "peer executable does not match registered bundle",
-        ));
+    if cacheable && !cached {
+        MEASURED_EXECUTABLE.with_borrow_mut(|entry| *entry=Some(MeasuredExecutable {
+            file, digest:wanted.to_owned(), ctime, size:original.len()
+        }));
     }
     Ok((original.dev(), original.ino()))
 }
@@ -516,6 +538,31 @@ impl Worker {
                     .update_lease(&lease, input.expected_revision, false)?;
                 self.statepoints.finish_restore(&self.catalog, &lease)?;
                 Ok(json!(lease))
+            }
+            "AcquireManagedForkMetadata" => {
+                self.authenticated_execution(request, peer)?;
+                let op = self.catalog.active_operation(request)?;
+                let (result, table, descriptors) =
+                    crate::managed_fork::metadata(&self.catalog, &op)?;
+                return Ok(Reply {
+                    result,
+                    table,
+                    descriptors,
+                    delivered: None,
+                });
+            }
+            "PrepareManagedForkAuthority" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                let op = self.catalog.active_operation(request)?;
+                let input = match crate::managed_state_restore::plan(&self.catalog, &op)? {
+                    Some(restore) => crate::managed_state_restore::activation_input(&self.catalog, &op, &restore)?,
+                    None => crate::managed_fork::activation_input(&self.catalog, &op)?,
+                };
+                Ok(json!(self.activation.prepare(
+                    &self.catalog,
+                    &execution,
+                    &request.derived("PrepareTargetActivation", input)
+                )?))
             }
             "AcquireManagedLaunchDisks" => {
                 let execution = self.authenticated_execution(request, peer)?;
@@ -888,12 +935,104 @@ impl Worker {
                 self.statepoints
                     .prepare_restore(&self.catalog, &self.objects, request)
             }
+            "PrepareManagedStateRestore" => {
+                let op = self.catalog.active_operation(request)?;
+                let restore = crate::managed_state_restore::plan(&self.catalog, &op)?
+                    .ok_or_else(|| Fault::invalid("missing managed durable restore"))?;
+                let durable = restore.durable.ok_or_else(|| Fault::invalid("missing durable representation"))?;
+                let prepare = request.derived("PrepareStatePointRestore", json!({
+                    "capture_id":restore.capture_id,"volume_restore_policy":durable.mode
+                }));
+                match self.statepoints.prepare_restore(&self.catalog, &self.objects, &prepare) {
+                    Err(error) if matches!(error.code, "E_STATEPOINT_CORRUPT" | "E_VOLUME_GENERATION_MISMATCH"
+                        | "E_RESOURCE_UNAVAILABLE" | "E_BUNDLE_UNAVAILABLE" | "E_FENCE_UNPROVEN") => {
+                        crate::managed_state_restore::fail(&self.catalog, &op.operation_id, &error)?;
+                        self.catalog.finish(request, true, op.revision)?;
+                        Ok(json!({"phase":"aborted"}))
+                    }
+                    result => result,
+                }
+            }
             "StopCommit" => self.stop_statepoint(request),
             "AbortStatePoint" => self.abort_statepoint(request),
+            "ProgressManagedForkTarget" => {
+                let execution = self.scoped_execution(request)?;
+                self.verify_live_execution(&execution)?;
+                let op = self.catalog.active_operation(request)?;
+                let durable = crate::managed_state_restore::plan(&self.catalog, &op)?.is_some();
+                if !durable && crate::managed_fork::restore(&self.catalog, &op.operation_id)?.is_none() {
+                    return Err(Fault::invalid("missing managed target"));
+                }
+                if crate::managed_fork::target_cancelled(&self.catalog, &op.operation_id)? {
+                    return Err(Fault::new("E_CANCELLED","the batch cancelled this unpublished target"));
+                }
+                let record = activation_runtime::receipt(&self.catalog, &execution, request)?;
+                let outcome = match record.phase.as_str() {
+                    "offered" => {
+                        let frame = if durable {
+                            crate::managed_state_restore::identity_frame(&self.catalog, &op, &record)?
+                        } else {
+                            crate::managed_fork::identity_frame(&self.catalog, &op, &record)?
+                        };
+                        self.activation.begin(
+                            &self.catalog,
+                            &execution,
+                            &request.derived(
+                                "BeginTargetIdentity",
+                                json!({"frame_hex":frame,"expected_revision":record.revision}),
+                            ),
+                        )?
+                    }
+                    "identity_ready" => self.activation.commit(
+                        &self.catalog,
+                        &self.network,
+                        &execution,
+                        &request.derived(
+                            "CommitActivation",
+                            json!({"expected_revision":record.revision}),
+                        ),
+                        || self.verify_live_execution(&execution),
+                    )?,
+                    "applying" | "policy_armed" | "committing" => self.activation.poll(
+                        &self.catalog,
+                        &self.network,
+                        &execution,
+                        request,
+                        || self.verify_live_execution(&execution),
+                    )?,
+                    "released" => record,
+                    _ => {
+                        return Err(Fault::new(
+                            "E_FENCE_UNPROVEN",
+                            "target has no releasable scoped authority",
+                        ))
+                    }
+                };
+                Ok(json!({"phase":outcome.phase,"execution":execution}))
+            }
+            "SubmitManagedFork" | "SubmitManagedStatePoint" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Submit {
+                    kind: String,
+                    parameters: crate::managed_fork::Input,
+                }
+                let input: Submit = request.payload()?;
+                Ok(json!(crate::managed_fork::submit(
+                    &mut self.catalog,
+                    &self.boot,
+                    request,
+                    &input.kind,
+                    input.parameters
+                )?))
+            }
             "SubmitManagedLaunch" => Ok(json!(crate::managed::submit(
                 &mut self.catalog,
                 request,
                 request.payload()?
+            )?)),
+            "SubmitManagedStateRestore" => Ok(json!(crate::managed_state_restore::submit(
+                &mut self.catalog, request, request.payload()?
             )?)),
             "PendingManagedLaunches" => {
                 let namespace = request
@@ -949,7 +1088,12 @@ impl Worker {
                 let _ = self.native_signal.try_send(());
                 Ok(json!(op))
             }
+            "RetryManagedFork" => Ok(json!(crate::managed_fork::retry(&mut self.catalog,request,request.payload()?)?)),
             "CancelNativeOperation" => {
+                let op=self.catalog.matching_operation(request)?;
+                if matches!(op.kind.as_str(),"independent_fork"|"fork_batch"|"hibernate"|"vm_rollback"|"vm_snapshot") {
+                    return Ok(json!(crate::managed_fork::cancel(&mut self.catalog, request, request.payload()?)?));
+                }
                 let op = crate::native_operations::cancel(
                     &mut self.catalog,
                     request,
@@ -1016,6 +1160,34 @@ impl Worker {
                 .network
                 .prepare(&self.catalog, request)
                 .map(|lease| json!(lease)),
+            "PrepareManagedLaunchNetwork" => {
+                let op = self.catalog.active_operation(request)?;
+                let plan = crate::managed::plan(&self.catalog, &op)?
+                    .ok_or_else(|| Fault::invalid("managed launch intent is required"))?;
+                let attachment_id = plan
+                    .network_attachment_id()
+                    .ok_or_else(|| Fault::invalid("managed launch has no network intent"))?;
+                let network = plan
+                    .machine
+                    .network
+                    .as_ref()
+                    .expect("network attachment ID");
+                let dns = format!("{}.private", crate::managed::key(&op.instance_id, "vm", 0));
+                self.catalog
+                    .reserve_managed_network(request, &attachment_id, &dns, network)?;
+                let fixed = network.fixed_route();
+                let prepare = request.derived(
+                    "PrepareNetworkAttachment",
+                    json!({
+                        "attachment_id":attachment_id,
+                        "guest_gateway_ipv4":fixed.map(|(_, gateway, _)| gateway),
+                        "guest_prefix":fixed.map(|(_, _, prefix)| prefix),
+                    }),
+                );
+                self.network
+                    .prepare(&self.catalog, &prepare)
+                    .map(|lease| json!(lease))
+            }
             "QueryNetworkAttachment" => {
                 crate::network_runtime::NetworkRuntime::query(&self.catalog, request)
                     .map(|lease| json!(lease))
@@ -1037,7 +1209,10 @@ impl Worker {
                     ));
                 };
                 let operation = self.catalog.operation(&execution.last_operation_id)?;
-                Ok(json!({"lease": lease, "request_digest": operation.request_digest}))
+                let (network_id, dns_name) = self.catalog.tap_network_metadata(lease)?;
+                Ok(
+                    json!({"lease": lease, "request_digest": operation.request_digest, "network_id": network_id, "dns_name": dns_name}),
+                )
             }
             "FenceNetworkAttachment" => {
                 self.network.fence(&self.catalog, request)?;
@@ -1655,12 +1830,82 @@ impl Worker {
         }
     }
 
+    fn reconcile_fork_cancellations(&mut self) -> Result<()> {
+        let ids = {
+            let mut q=self.catalog.db.prepare("SELECT o.operation_id FROM managed_fork_children ch
+                JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.cancelled=1 AND o.phase='NEW'
+                AND NOT EXISTS (SELECT 1 FROM target_activations a WHERE a.operation_id=o.operation_id AND a.decision='commit')")?;
+            let rows=q.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for id in ids {
+            let op=self.catalog.operation(&id)?;
+            let plan=crate::managed::plan(&self.catalog,&op)?.ok_or_else(||Fault::invalid("cancelled target has no launch plan"))?;
+            let inc=plan.launch.execution.incarnation_id.as_deref().ok_or_else(stale_execution)?;
+            let mut epoch=op.expected_execution_epoch;
+            match self.catalog.execution(inc) {
+                Ok(execution) => {
+                    epoch=execution.execution_epoch;
+                    if execution.phase!="exited" {
+                        if execution.host_boot_id==self.boot && pid_start(execution.pid).ok()==Some(execution.pid_start_time) {
+                            let pidfd=process_fd(execution.pid).map_err(broker_error)?;
+                            if !pid_exited(&pidfd).map_err(broker_error)? && pid_start(execution.pid).ok()==Some(execution.pid_start_time) {
+                                verify_executable(execution.pid,execution.pid_start_time,&pidfd,&self.catalog.bundle(&op.bundle_digest)?)?;
+                            let rc=unsafe{libc::syscall(libc::SYS_pidfd_send_signal,pidfd.as_raw_fd(),libc::SIGTERM,std::ptr::null::<libc::siginfo_t>(),0u32)};
+                            if rc<0 && io::Error::last_os_error().raw_os_error()!=Some(libc::ESRCH) {return Err(broker_error(io::Error::last_os_error()))}
+                                continue;
+                            }
+                        }
+                        self.finalize_scoped_execution(execution)?;
+                    }
+                }
+                Err(e) if e.code=="E_NOT_FOUND" => (),
+                Err(e) => return Err(e),
+            }
+            let expected=crate::ipc::Expected { instance_id:op.instance_id.clone(), incarnation_id:None, execution_epoch:epoch };
+            let request=crate::ipc::Request {
+                protocol:crate::ipc::PROTOCOL.into(),method:"FinishOperation".into(),request_id:"cancel-parked-target".into(),
+                route_id:Some(op.route_id.clone()),bundle_digest:Some(op.bundle_digest.clone()),
+                operation_id:Some(id),request_digest:Some(op.request_digest.clone()),expected:Some(expected),
+                fd_table:Vec::new(),payload:Value::Null
+            };
+            if let Some(attachment)=plan.network_attachment_id() {
+                let mut prior=request.derived("FenceNetworkAttachment",json!({"attachment_id":attachment}));
+                prior.expected=Some(crate::ipc::Expected{instance_id:op.instance_id.clone(),incarnation_id:None,execution_epoch:op.expected_execution_epoch});
+                if let Err(e)=self.network.fence(&self.catalog,&prior) {
+                    if e.code!="E_NOT_FOUND" {return Err(e)}
+                }
+            }
+            self.catalog.finish(&request,true,op.revision)?;
+        }
+        Ok(())
+    }
     fn reconcile_statepoints(&mut self) -> Result<()> {
         for record in self
             .statepoints
             .complete_exports(&mut self.catalog, &self.objects)?
         {
             self.release_checkpoint_export(&record);
+        }
+        let cancellations = {
+            let mut q=self.catalog.db.prepare("SELECT operation_id,capture_id,original FROM managed_fork_batches WHERE stage='abort_export'")?;
+            let rows=q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (id,capture,original) in cancellations {
+            let op=self.catalog.operation(&id)?;
+            let request=crate::managed_statepoint::request(&op,json!({"capture_id":capture}));
+            match self.abort_statepoint(&request) {
+                Ok(_) if original=="STANDBY" => crate::managed_fork::finish_abort(&mut self.catalog,&id,None)?,
+                Ok(_) => {self.catalog.db.execute("UPDATE managed_fork_batches SET stage='waking',error=NULL WHERE operation_id=?",[id])?;},
+                Err(error)=> {self.catalog.db.execute("UPDATE managed_fork_batches SET error=? WHERE operation_id=?",rusqlite::params![error.message,id])?;}
+            }
+        }
+        let stops=crate::managed_statepoint::tick(&mut self.catalog,&mut self.statepoints,&self.objects,&self.boot)?;
+        for stop in stops {
+            if let Err(error)=self.stop_statepoint(&stop) {
+                self.catalog.db.execute("UPDATE managed_fork_batches SET error=? WHERE operation_id=? AND error IS NOT ?",rusqlite::params![error.message,stop.operation_id,error.message])?;
+            }
         }
         for record in self.catalog.pending_statepoint_stops()? {
             if let Err(fault) = self.drive_statepoint_stop(record) {
@@ -2043,6 +2288,7 @@ fn serve(
         network: crate::network_runtime::NetworkRuntime::default(),
         activation: ActivationRuntime::default(),
         statepoints: StatePoints::new(statepoints),
+        forks: Default::default(),
     };
     worker
         .reconnect_native_endpoints()
@@ -2057,14 +2303,23 @@ fn serve(
     let bound = socket.bind(&address);
     unsafe { libc::umask(previous) };
     bound?;
-    if let Some(gid) = socket_gid {
-        std::os::unix::fs::chown(socket_path, None, Some(gid))?;
+    if admin_uid.is_some() || socket_gid.is_some() {
+        std::os::unix::fs::chown(socket_path, admin_uid, socket_gid)?;
+    }
+    if socket_gid.is_some() {
         fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))?;
     }
     socket.listen(32)?;
     let mut next_stop_check = Instant::now() + Duration::from_secs(1);
     loop {
         if Instant::now() >= next_stop_check {
+            worker
+                .forks
+                .tick(&mut worker.catalog, &mut worker.escrow, &worker.boot)
+                .map_err(|e| io::Error::other(e.message))?;
+            if let Err(error)=worker.reconcile_fork_cancellations() {
+                eprintln!("resourced fork cancellation: {error}");
+            }
             worker
                 .reconcile_statepoints()
                 .map_err(|fault| io::Error::other(fault.message))?;

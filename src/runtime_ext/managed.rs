@@ -2,7 +2,8 @@
 use crate::agent::KrunFunctions;
 use crate::{deep_state, process, systemd_scope, Error, Result};
 use smolvm_resourced::managed::Plan;
-use smolvm_resourced::native_client::Client;
+use smolvm_resourced::native_client::{Client, ExecutionRef};
+use smolvm_resourced::network_client::WorkerNetworkScope;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -29,6 +30,8 @@ struct Boot {
     uid: u32,
     gid: u32,
     scope: String,
+    #[serde(default)]
+    network: Option<WorkerNetworkScope>,
 }
 static DISPATCH: Once = Once::new();
 pub(super) fn dispatch(socket: PathBuf) {
@@ -144,19 +147,33 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
     if binding.incarnation_id.is_none()
         && binding.execution_epoch == launch.execution.execution_epoch
     {
-        let op = smolvm_resourced::client::query_operation(
-            client.socket,
-            client.bundle,
-            &launch.operation_id,
-        )
-        .map_err(failed)?;
-        return client
-            .finish_launch(launch, &binding.expected(), true, op.revision)
-            .map_err(failed);
+        return abort_launch(client, plan, &binding.expected());
+    }
+    if binding.incarnation_id.is_none()
+        && plan.restore.as_ref().is_some_and(|restore| restore.durable.is_some())
+        && !client.prepare_state_restore(launch, &binding.expected()).map_err(failed)?
+    {
+        return Ok(());
     }
     let (control, log, uid, gid) = paths(plan)?;
     let mut child = None;
     if binding.incarnation_id.is_none() {
+        let prior = binding.expected();
+        let network = match client.prepare_managed_network(&prior, plan) {
+            Ok(network) => network,
+            Err(error) => {
+                if plan.restore.is_none() && matches!(
+                    error.code.as_str(),
+                    "E_RESOURCE_LIMIT"
+                        | "E_INVALID_REQUEST"
+                        | "E_NETWORK_ATTACHMENT_CONFLICT"
+                        | "E_HOST_IO"
+                ) {
+                    abort_launch(client, plan, &prior)?;
+                }
+                return Err(failed(error));
+            }
+        };
         let file = OpenOptions::new()
             .append(true)
             .create(true)
@@ -200,6 +217,7 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
                 uid,
                 gid,
                 scope: systemd_scope::scope_name(&plan.machine.name),
+                network,
             };
             let mut channel = proc
                 .stdin
@@ -236,10 +254,17 @@ fn confirm(
     child: &mut Option<Child>,
 ) -> Result<()> {
     let launch = &plan.launch;
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut bound = false;
     loop {
         if control.exists() {
-            if client.bind_control(launch, control).is_ok() {
+            if !bound && client.bind_control(launch, control).is_ok() {
+                bound = true;
+            }
+            if bound
+                && (plan.restore.is_none()
+                    || client.progress_fork_target(launch).map_err(failed)?)
+            {
                 let op = smolvm_resourced::client::query_operation(
                     client.socket,
                     client.bundle,
@@ -279,16 +304,7 @@ fn confirm(
                 if current.incarnation_id.is_some() {
                     return Err(failed("execution exit not yet fenced"));
                 }
-                let op = smolvm_resourced::client::query_operation(
-                    client.socket,
-                    client.bundle,
-                    &launch.operation_id,
-                )
-                .map_err(failed)?;
-                client
-                    .finish_launch(launch, &current, true, op.revision)
-                    .map_err(failed)?;
-                return Ok(());
+                return abort_launch(client, plan, &current);
             }
         }
         if Instant::now() >= deadline {
@@ -296,6 +312,19 @@ fn confirm(
         }
         thread::sleep(Duration::from_millis(120));
     }
+}
+
+fn abort_launch(client: &Client<'_>, plan: &Plan, expected: &ExecutionRef) -> Result<()> {
+    client.fence_managed_network(plan).map_err(failed)?;
+    let op = smolvm_resourced::client::query_operation(
+        client.socket,
+        client.bundle,
+        &plan.launch.operation_id,
+    )
+    .map_err(failed)?;
+    client
+        .finish_launch(&plan.launch, expected, true, op.revision)
+        .map_err(failed)
 }
 
 /// Internal VMM entry point. The parent sends the permit after systemd adopts this PID.
@@ -311,6 +340,10 @@ pub fn boot() -> Result<()> {
     }
     systemd_scope::verify_boot_scope(&boot.scope)?;
     process::close_inherited_fds_from(3);
+    // Guest RAM overlays need this VMM's own page map to capture private pages
+    // on a recursive fork. Open it before dropping the execution identity.
+    let pagemap = File::open("/proc/self/pagemap")?;
+    std::env::set_var("KRUN_PAGEMAP_FD", pagemap.as_raw_fd().to_string());
     let null = File::open("/dev/null")?;
     if unsafe { libc::dup2(null.as_raw_fd(), 0) } < 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -354,6 +387,12 @@ pub fn boot() -> Result<()> {
     let ctx = ctx as u32;
     let configured = (|| -> Result<()> {
         let (sets, files) = client.managed_disks(&boot.plan).map_err(failed)?;
+        let network = boot
+            .network
+            .as_ref()
+            .map(|scope| k.attach_prepared_worker_network(ctx, scope))
+            .transpose()
+            .map_err(failed)?;
         k.managed_boot(
             ctx,
             &boot.plan,
@@ -363,12 +402,30 @@ pub fn boot() -> Result<()> {
             &boot.control,
             &boot.worker,
             &boot.bundle,
+            network.as_ref().map(|lease| &lease.attachment),
         )
         .map_err(failed)?;
         client
             .ack_managed_disks(&boot.plan.launch)
             .map_err(failed)?;
+        if let Some(restore) = &boot.plan.restore {
+            if let Some(durable) = &restore.durable {
+                k.managed_statepoint(ctx, &boot.plan, restore, durable).map_err(failed)?;
+                let authority = client.restore_authority(&boot.plan.launch, restore).map_err(failed)?;
+                k.managed_target_authority(ctx, &boot.plan, restore, &authority).map_err(failed)?;
+            } else {
+                let memory = client.fork_memory(&boot.plan, restore).map_err(failed)?;
+                k.managed_restore(ctx, &boot.plan, restore, &memory, work).map_err(failed)?;
+            }
+        }
         process::install_configured_seccomp_filter(false).map_err(failed)?;
+        // A cold Guest starts with carrier. The restore path opens its TAP
+        // only after the Worker records the Guest identity release.
+        if boot.plan.restore.is_none() {
+            if let Some((scope, lease)) = boot.network.as_ref().zip(network.as_ref()) {
+                scope.publish_initial(lease).map_err(failed)?;
+            }
+        }
         Ok(())
     })();
     if let Err(e) = configured {

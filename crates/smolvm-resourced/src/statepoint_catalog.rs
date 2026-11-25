@@ -199,9 +199,7 @@ impl Catalog {
         manifest: &Manifest,
         digest: &str,
     ) -> Result<Record> {
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         if tx.execute("UPDATE statepoints SET phase='durable',manifest_digest=?,error=NULL,revision=revision+1
             WHERE capture_id=? AND phase='exporting' AND revision=?", params![digest, record.export.capture_id, record.revision])? != 1
         {
@@ -213,6 +211,7 @@ impl Catalog {
             "manifest_digest":digest,"commit_id":manifest.commit_id,
         }).to_string())?;
         add_disks(&tx, id, &record.point.disk_generations)?;
+        crate::activation_catalog::publish_statepoint_tap(&tx, record, digest)?;
         tx.execute(
             "INSERT INTO root_refs VALUES(?,?,?,'active',1,?)",
             params![
@@ -266,15 +265,14 @@ impl Catalog {
             return Err(Fault::new("E_FENCE_UNPROVEN", "StatePoint source exit has not been proved"));
         }
         release_export(&tx, record, true)?;
+        tx.execute("UPDATE managed_fork_batches SET source_released=1,error=NULL,
+                    stage=CASE WHEN restore_capture_id IS NULL THEN 'complete' ELSE 'rollback_target' END
+                    WHERE operation_id=?", [&record.operation_id])?;
         tx.execute(
             "UPDATE operations SET phase='COMPLETED',revision=revision+1
-            WHERE operation_id=? AND phase='NEW'",
-            [&record.operation_id],
-        )?;
-        tx.execute(
-            "UPDATE instance_bindings SET active_operation_id=NULL WHERE active_operation_id=?",
-            [&record.operation_id],
-        )?;
+            WHERE operation_id=? AND phase='NEW' AND kind<>'vm_rollback'", [&record.operation_id])?;
+        tx.execute("UPDATE instance_bindings SET active_operation_id=NULL WHERE active_operation_id=?1
+                   AND NOT EXISTS(SELECT 1 FROM operations WHERE operation_id=?1 AND kind='vm_rollback')",[&record.operation_id])?;
         tx.commit()?;
         self.require_statepoint(&record.export.capture_id)
     }

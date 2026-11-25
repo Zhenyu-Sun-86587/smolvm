@@ -1,6 +1,7 @@
 use crate::catalog::{Catalog, Execution};
 use crate::escrow_catalog::{LeaseRecord, TransferRecord};
 use crate::ipc::{valid_digest, valid_id, Fault, FdEntry, Request, Result, MAX_FDS};
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -283,6 +284,105 @@ impl Escrow {
                 .sum::<usize>()
     }
 
+    /// Import a capture already authenticated by the Worker native endpoint.
+    pub(crate) fn import_native(
+        &mut self,
+        catalog: &Catalog,
+        resource: &str,
+        op: &crate::catalog::Operation,
+        source: &Execution,
+        capture: &mut crate::statepoint_capture::Capture,
+    ) -> Result<()> {
+        let mut descriptor = capture.descriptor_json.clone();
+        descriptor.sort_all_objects();
+        let encoded = descriptor.to_string();
+        let digest = format!("sha256:{:x}", Sha256::digest(encoded.as_bytes()));
+        let mut backings = BTreeMap::new();
+        for (id, file) in std::mem::take(&mut capture.backings) {
+            let length = *capture
+                .descriptor
+                .backing_sizes
+                .get(&id)
+                .ok_or_else(|| Fault::invalid("undeclared captured backing"))?;
+            backings.insert(id, check_backing(file.into(), length)?);
+        }
+        if backings.len() != capture.descriptor.backing_sizes.len() {
+            return Err(unavailable("incomplete native capture"));
+        }
+        if self.parked_descriptors().saturating_add(backings.len()) > MAX_ESCROW_FDS {
+            return Err(Fault::new(
+                "E_RESOURCE_LIMIT",
+                "Worker RAM FD budget exhausted",
+            ));
+        }
+        let identities: Vec<_> = backings
+            .iter()
+            .map(|(id, b)| (id, b.device, b.inode, b.length))
+            .collect();
+        let transfer = crate::managed::key(&op.operation_id, "transfer", 0);
+        let tx = catalog.db.unchecked_transaction()?;
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT descriptor_digest FROM fd_transfers WHERE transfer_id=?",
+                [&transfer],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match stored {
+            Some(previous) if previous != digest => {
+                return Err(Fault::new(
+                    "E_IDEMPOTENCY_CONFLICT",
+                    "held capture descriptor changed",
+                ))
+            }
+            Some(_) => {
+                for (index, batch) in identities.chunks(MAX_FDS).enumerate() {
+                    let previous:String=tx.query_row("SELECT identities_json FROM fd_transfer_batches WHERE transfer_id=? AND batch_index=?",rusqlite::params![transfer,index as i64],|r|r.get(0))?;
+                    if previous != json!(batch).to_string() {
+                        return Err(unavailable("the held capture returned different inodes"));
+                    }
+                }
+                tx.execute("UPDATE fd_transfers SET state='committed' WHERE transfer_id=? AND state IN ('missing','committed')",[&transfer])?;
+                tx.execute("UPDATE resources SET state='available' WHERE resource_id=? AND state IN ('unknown','available')",[resource])?;
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO fd_transfers VALUES(?,?,?,?,?,?,'committed')",
+                    rusqlite::params![
+                        transfer,
+                        resource,
+                        op.operation_id,
+                        source.incarnation_id,
+                        encoded,
+                        digest
+                    ],
+                )?;
+                for (index, batch) in identities.chunks(MAX_FDS).enumerate() {
+                    tx.execute(
+                        "INSERT INTO fd_transfer_batches VALUES(?,?,?)",
+                        rusqlite::params![transfer, index as i64, json!(batch).to_string()],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO resources VALUES(?,'descriptor','available','volatile',1,?,?,?,1)",
+                    rusqlite::params![resource, encoded, digest, op.operation_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO root_refs VALUES('fork_capture',?,?,'active',1,?)",
+                    rusqlite::params![op.operation_id, resource, op.operation_id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        self.generations.insert(
+            resource.to_string(),
+            Generation {
+                bundle_digest: source.bundle_digest.clone(),
+                backings,
+            },
+        );
+        Ok(())
+    }
     pub fn begin(
         &mut self,
         catalog: &Catalog,

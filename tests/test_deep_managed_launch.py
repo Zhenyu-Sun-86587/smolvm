@@ -34,7 +34,124 @@ def digest(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def verify(bundle, root, guest, system_image, product_volumes):
+def settled(endpoint, operation_id, timeout=150):
+    latest = {}
+    def terminal():
+        nonlocal latest
+        latest=http(endpoint,f"{EXT}/operations/{operation_id}")
+        return latest if latest["phase"] in ("COMPLETED","ABORTED") else None
+    try: return until(terminal,timeout)
+    except TimeoutError: raise AssertionError(latest)
+
+
+def durable_points(endpoint, source, name, logfile):
+    def invoke(kind, key, params, expected=source):
+        envelope=dict(kind=kind,operation_id=key,request_digest=digest(key.encode()),expected=expected,parameters=params)
+        first=http(endpoint,EXT+"/operations",envelope)
+        assert first["phase"]=="NEW",first
+        result=settled(endpoint,key,180)
+        assert result["phase"]=="COMPLETED",result
+        assert http(endpoint,EXT+"/operations",envelope)==result
+        return result
+    snapshot=invoke("vm_snapshot","managed-checkpoint",{"capture_id":"checkpoint-"+name})["statepoint"]
+    assert snapshot["phase"]=="durable" and snapshot["source_released"] and snapshot["manifest_digest"].startswith("sha256:"),snapshot
+    count=lambda:sum(line.startswith("PARKED_BLOCK_TICK ") for line in logfile.read_text(errors="replace").splitlines())
+    before=count()
+    until(lambda:count()>before+1,10)
+    invoke("standby","standby-before-hibernate",{"mode":"managed"})
+    before=count()
+    hibernated=invoke("hibernate","managed-hibernate",{"capture_id":"hibernate-"+name})["statepoint"]
+    assert hibernated["phase"]=="hibernated" and hibernated["original_source_disposition"]=="STANDBY" and hibernated["source_released"],hibernated
+    assert hibernated["manifest_digest"].startswith("sha256:") and count()==before,hibernated
+    binding=http(endpoint,f"{EXT}/machines/{name}/binding")
+    assert binding["incarnation_id"] is None and binding["execution_epoch"]==source["execution_epoch"]
+    print("Checkpoint publication returned a verified durable manifest while the guest continued. Hibernate stopped the parked execution without advancing its counter.",flush=True)
+
+    def slot(machine):
+        result=http(endpoint,f"{EXT}/machines/{machine}/binding")
+        return {field:result[field] for field in ("instance_id","incarnation_id","execution_epoch")}
+
+    def watch(machine):
+        current=http(endpoint,f"{EXT}/machines/{machine}/execution")
+        log=logfile.parent/(current["incarnation_id"]+".log")
+        def ticks():
+            if log.exists():
+                lines=[line.split() for line in log.read_text(errors="replace").splitlines() if line.startswith("PARKED_BLOCK_TICK ")]
+                if len(lines)>=2:return lines
+        return current,until(ticks,20)
+
+    resumed=invoke("vm_restore","resume-hibernated",{"name":name,"capture_id":hibernated["capture_id"],"mode":"exact"},slot(name))
+    assert resumed["statepoint"]["stage"]=="released" and resumed["statepoint"]["manifest_digest"]==hibernated["manifest_digest"],resumed
+    volumes=resumed["statepoint"]["volume_map"]
+    assert volumes and all(old==new for old,new in volumes.items()),volumes
+    again,active_ticks=watch(name)
+    old_ticks=[l.split() for l in logfile.read_text(errors="replace").splitlines() if l.startswith("PARKED_BLOCK_TICK ")]
+    assert again["execution_epoch"]==source["execution_epoch"]+1 and again["incarnation_id"]!=source["incarnation_id"],again
+    assert active_ticks[0][2]==old_ticks[-1][2] and int(active_ticks[0][1])==int(old_ticks[-1][1])+1,(active_ticks[0],old_ticks[-1])
+    print("Exact hibernate restore continued the original guest PID and next counter tick with the same writable volume IDs.",flush=True)
+
+    rolled=invoke("vm_rollback","rollback-before-hibernate",{"capture_id":snapshot["capture_id"],"mode":"clone_conflicts"},again)["statepoint"]
+    assert rolled["manifest_digest"]==snapshot["manifest_digest"] and rolled["rescue_manifest_digest"].startswith("sha256:") and rolled["rescue_capture_id"]!=snapshot["capture_id"],rolled
+    current,ticks=watch(name)
+    assert current["execution_epoch"]==again["execution_epoch"]+1 and int(ticks[0][1])<int(active_ticks[0][1]) and ticks[0][2]==old_ticks[0][2],ticks[:2]
+    print("Rollback fenced the previous execution, retained its durable rescue and resumed the earlier counter in a new epoch.",flush=True)
+
+    clone="checkpoint-copy"
+    clone_op=invoke("vm_restore","clone-checkpoint",{"name":clone,"capture_id":snapshot["capture_id"],"mode":"clone_conflicts"},slot(clone))["statepoint"]
+    assert clone_op["manifest_digest"]==snapshot["manifest_digest"] and any(a!=b for a,b in clone_op["volume_map"].items()),clone_op
+    copy,clone_ticks=watch(clone)
+    assert copy["instance_id"]!=current["instance_id"] and clone_ticks[0][1:3]==ticks[0][1:3] ,clone_ticks[:2]
+    # If the cut landed after gethostname(), the suspended loop can print its cached
+    # value once. The next iteration reads each target's installed identity.
+    assert clone_ticks[1][3]==clone and ticks[1][3]==name and clone_ticks[1][4]!=ticks[1][4],(clone_ticks[1],ticks[1])
+    assert clone_ticks[0][5:7]==ticks[0][5:7],(clone_ticks[0],ticks[0])
+    print("A separate restore from the original checkpoint reproduced the RAM and two-disk boundary in another logical instance.",flush=True)
+
+
+def partial_fork(endpoint, root, ref):
+    import threading
+    names=["partial-keep","partial-retry"]
+    key="partial-batch"
+    req=dict(kind="fork_batch",operation_id=key,request_digest=digest(key.encode()),expected=ref,parameters={"children":names})
+    killed=threading.Event()
+    def interrupt_unpublished():
+        dbfile=root/"catalog/catalog.sqlite"
+        def inject():
+            with sqlite3.connect(f"file:{dbfile}?mode=ro",uri=True) as c:
+                match=c.execute("""SELECT e.pid,e.pid_start_time FROM managed_fork_children ch
+                    JOIN executions e ON e.last_operation_id=ch.operation_id WHERE ch.batch_id=? AND ch.name=?
+                    AND NOT EXISTS(SELECT 1 FROM target_activations a WHERE a.operation_id=ch.operation_id AND a.decision='commit')""",
+                    (key,names[1])).fetchone()
+            if match:
+                pid,start=match
+                fd=os.pidfd_open(pid)
+                try:
+                    if int(Path(f"/proc/{pid}/stat").read_text().rsplit(")",1)[1].split()[19])==start:
+                        signal.pidfd_send_signal(fd,signal.SIGKILL)
+                        killed.set()
+                finally:os.close(fd)
+            return killed.is_set()
+        until(inject,120)
+    thread=threading.Thread(target=interrupt_unpublished,daemon=True)
+    thread.start()
+    original=http(endpoint,EXT+"/operations",req)
+    batch=settled(endpoint,key)
+    thread.join(5)
+    assert killed.is_set() and batch["fork"]["outcome"]=="partial",batch
+    good,failed=batch["fork"]["children"]
+    assert good["phase"]=="COMPLETED" and failed["phase"]=="ABORTED",batch
+    retry=dict(request_digest=req["request_digest"],expected=ref,expected_revision=batch["revision"])
+    http(endpoint,f"{EXT}/operations/{key}/retry",retry)
+    recovered=settled(endpoint,key)
+    assert recovered["fork"]["outcome"]=="applied" and recovered["fork"]["capture_id"]==original["fork"]["capture_id"],recovered
+    old,new=recovered["fork"]["children"]
+    assert good==old and failed["instance_id"]==new["instance_id"] and new["attempt"]==1
+    assert new["execution_epoch"]>failed["execution_epoch"] and new["incarnation_id"]!=failed["incarnation_id"]
+    assert http(endpoint,f"{EXT}/operations/{key}/retry",retry)==recovered
+    print("One of two targets was killed before activation. Retry kept the successful execution and original capture, and advanced only the failed child's epoch.",flush=True)
+
+
+def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
@@ -183,7 +300,8 @@ def verify(bundle, root, guest, system_image, product_volumes):
                 if dbfile.suffix not in (".sqlite",".sqlite3"):continue
                 with suppress(Exception),sqlite3.connect(dbfile) as db:
                     for pid, start in db.execute("select pid,pid_start_time from executions"):
-                        pidfd = os.pidfd_open(pid)
+                        try: pidfd = os.pidfd_open(pid)
+                        except ProcessLookupError: continue
                         try:
                             actual=int(Path(f"/proc/{pid}/stat").read_text().rsplit(")",1)[1].split()[19])
                             if actual==start: signal.pidfd_send_signal(pidfd,signal.SIGKILL)
@@ -211,7 +329,7 @@ def verify(bundle, root, guest, system_image, product_volumes):
                 assert actual["attachments"][0]["state"] == "attached", actual
         logs=root/"state/managed"
         def guest_log():
-            return next(logs.glob("*.log")).read_text(errors="replace")
+            return (logs/(ref["incarnation_id"]+".log")).read_text(errors="replace")
         if system_image:
             agent=Path("/run/smolvm-custom/managed")/handshake["runtime_instance_id"]/ref["incarnation_id"]/"agent.sock"
             def system_pid():
@@ -237,6 +355,90 @@ def verify(bundle, root, guest, system_image, product_volumes):
         until(lambda:http(endpoint,EXT+"/capabilities"))
         assert http(endpoint,EXT+"/operations",submit)==op and http(endpoint,inventory_url)["execution"]==record["execution"]
         assert rpc(worker,"QueryWorkerBudget")["allocated"]["vcpus"]==2
+        if fork:
+            names=["alpha-branch","beta-branch"]
+            call=dict(operation_id="fork-counter-batch",request_digest=digest(b"counter-batch"),expected=ref,kind="fork_batch",parameters={"children":names})
+            batch=http(endpoint,EXT+"/operations",call)
+            assert batch["phase"]=="NEW" and len(batch["fork"]["children"])==2
+            capture=batch["fork"]["capture_id"]
+            latest={}
+            def forked():
+                nonlocal latest
+                latest=http(endpoint,EXT+"/operations/"+call["operation_id"])
+                progress=latest["fork"]
+                if progress.get("error"):print("capture",progress["stage"],progress["error"],flush=True)
+                assert progress["capture_id"]==capture and latest["phase"]!="ABORTED",latest
+                return latest if latest["phase"]=="COMPLETED" else None
+            try:finished=until(forked,150)
+            except TimeoutError:raise AssertionError(latest)
+            assert finished["fork"]["source_released"] and all(ch["phase"]=="COMPLETED" for ch in finished["fork"]["children"]),finished
+            assert http(endpoint,EXT+"/operations",call)==finished
+            source_ticks=[line.split() for line in guest_log().splitlines() if line.startswith("PARKED_BLOCK_TICK")]
+            boundary=None
+            for child in finished["fork"]["children"]:
+                file=logs/(child["incarnation_id"]+".log")
+                until(lambda:file.exists() and "PARKED_BLOCK_TICK" in file.read_text(errors="replace"),15)
+                first=next(line for line in file.read_text(errors="replace").splitlines() if line.startswith("PARKED_BLOCK_TICK")).split()
+                marker=int(first[1])-1
+                assert (int(first[5]),int(first[6]))==(marker,marker^0xbeef12349876),first
+                boundary=boundary or first[1]
+                assert first[1]==boundary,first
+                assert first[2]==source_ticks[0][2] and first[3]==child["name"] and first[4]!=source_ticks[0][4],first
+            def fence_machine(vm_name):
+                active=http(endpoint,f"{EXT}/machines/{vm_name}/execution")
+                identity=http(endpoint,f"{EXT}/instances/{active['instance_id']}/inventory")["execution"]
+                handle=os.pidfd_open(identity["pid"])
+                try:
+                    signal.pidfd_send_signal(handle,signal.SIGKILL)
+                finally:
+                    os.close(handle)
+                until(lambda:http(endpoint,f"{EXT}/machines/{vm_name}/binding")["incarnation_id"] is None,20)
+            def native(kind, source, key, parameters):
+                request=dict(operation_id=key,request_digest=digest(key.encode()),expected=source,kind=kind,parameters=parameters)
+                http(endpoint,EXT+"/operations",request)
+                def observed():
+                    result=http(endpoint,EXT+"/operations/"+key)
+                    if result["phase"]=="ABORTED": raise AssertionError(result)
+                    return result if result["phase"]=="COMPLETED" else None
+                return until(observed,150)
+            print("One held cut restored two distinct KVM children at the same RAM and two-writer boundary.",flush=True)
+            fence_machine(name)
+            assert http(endpoint,EXT+"/operations",call)==finished
+            first_name,second_name=names
+            first_ref=http(endpoint,f"{EXT}/machines/{first_name}/execution")
+            native("standby",first_ref,"standby-branch-a",{"mode":"managed"})
+            child_inv=f"{EXT}/instances/{first_ref['instance_id']}/inventory"
+            assert http(endpoint,child_inv)["inventory"]["source_disposition"]=="STANDBY"
+            descendant=native("independent_fork",first_ref,"fork-after-parent-exit",{"children":["grandchild"]})["fork"]
+            assert descendant["original_source_disposition"]=="STANDBY" and descendant["source_released"]
+            assert http(endpoint,child_inv)["inventory"]["source_disposition"]=="STANDBY"
+            grandchild,=descendant["children"]
+            assert grandchild["phase"]=="COMPLETED",grandchild
+            logfile=logs/(grandchild["incarnation_id"]+".log")
+            count=lambda:sum(line.startswith("PARKED_BLOCK_TICK ") for line in logfile.read_text(errors="replace").splitlines())
+            until(lambda:logfile.exists() and count()>=1,20)
+            fence_machine(first_name)
+            fence_machine(second_name)
+            prior=count()
+            until(lambda:count()>prior+2,10)
+            last=next(line for line in reversed(logfile.read_text(errors="replace").splitlines()) if line.startswith("PARKED_BLOCK_TICK ")).split()
+            inherited=next(line for line in logfile.read_text(errors="replace").splitlines() if line.startswith("PARKED_BLOCK_TICK ")).split()
+            inherited_marker=(int(inherited[1])-1)^(ord(first_name[0])<<48)
+            assert (int(inherited[5]),int(inherited[6]))==(inherited_marker,inherited_marker^0xbeef12349876),inherited
+            marker=(int(last[1])-1)^(ord("g")<<48)
+            assert last[2]==source_ticks[0][2] and last[3]=="grandchild"
+            assert (int(last[5]),int(last[6]))==(marker,marker^0xbeef12349876),last
+            print("A parked child forked after its parent exited. The grandchild continued its captured process and both disks after fencing both ancestors and the sibling.",flush=True)
+            if fork_faults or statepoint:
+                grand_ref=http(endpoint,f"{EXT}/machines/grandchild/execution")
+                if fork_faults:
+                    partial_fork(endpoint,root,grand_ref)
+                    if statepoint:fence_machine("partial-keep")
+                if statepoint:durable_points(endpoint,grand_ref,"grandchild",logfile)
+            return
+        if statepoint:
+            durable_points(endpoint,ref,name,logs/(ref["incarnation_id"]+".log"))
+            return
         if not system_image:
             old=record["execution"]
             fd=os.pidfd_open(old["pid"])
@@ -289,16 +491,24 @@ def main():
     parser.add_argument("--bundle",type=Path,required=True)
     parser.add_argument("--guest",type=Path,help="prebuilt static kvm-parked-block-guest test binary")
     parser.add_argument("--system-image",type=Path,help="managed Debian ext4 image containing the systemd Guest Agent service")
+    parser.add_argument("--fork",action="store_true",help="fork a batch of two managed guests from one live capture")
     parser.add_argument("--product-volumes", action="store_true", help="open existing registered product disk heads")
+    parser.add_argument("--statepoint",action="store_true",help="checkpoint the guest and hibernate from managed standby")
+    parser.add_argument("--fork-faults",action="store_true",help="kill one unpublished target and retry it from the original capture")
     args=parser.parse_args()
+    if args.fork_faults: args.fork=True
     if os.geteuid()!=0:parser.error("requires root, KVM and systemd")
     if not os.environ.get("SMOLVM_MANAGED_TEST_ISOLATED"):
-        os.execvpe("unshare",["unshare","--mount","--propagation","private","--net","--",sys.executable,__file__,
-                             "--bundle",str(args.bundle.resolve()),*(["--guest",str(args.guest.resolve())] if args.guest else []),*(["--system-image",str(args.system_image.resolve())] if args.system_image else []), *(["--product-volumes"] if args.product_volumes else [])],{**os.environ,"SMOLVM_MANAGED_TEST_ISOLATED":"1"})
+        args_for_child=["unshare","--mount","--propagation","private","--net","--",sys.executable,__file__,"--bundle",str(args.bundle.resolve())]
+        for flag,path in (("--guest",args.guest),("--system-image",args.system_image)):
+            if path:args_for_child.extend([flag,str(path.resolve())])
+        for flag,enabled in (("--fork",args.fork),("--product-volumes",args.product_volumes),("--statepoint",args.statepoint),("--fork-faults",args.fork_faults)):
+            if enabled:args_for_child.append(flag)
+        os.execvpe("unshare",args_for_child,{**os.environ,"SMOLVM_MANAGED_TEST_ISOLATED":"1"})
     with tempfile.TemporaryDirectory(dir="/var/tmp",prefix="smm-") as tmp:
         root=Path(tmp)
         root.chmod(0o755)
-        try: verify(args.bundle.resolve(),root,args.guest,args.system_image,args.product_volumes)
+        try: verify(args.bundle.resolve(),root,args.guest,args.system_image,args.fork,args.product_volumes,args.statepoint,args.fork_faults)
         except BaseException:
             for log in [root/"serve.log",root/"worker.log",*(root/"state/managed").glob("*.log")]:
                 if log.exists():print(f"{log.name}\n{log.read_text(errors='replace')[-7000:]}",file=sys.stderr)
