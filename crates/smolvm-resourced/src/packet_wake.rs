@@ -1,6 +1,7 @@
 //! Authorize private ingress as a wake demand for a specific managed endpoint.
 mod ingress;
 pub(crate) use ingress::open as open_ingress;
+pub(crate) use ingress::Datagram;
 
 use crate::catalog::Catalog;
 use crate::ipc::{valid_id, Expected, Fault, Request, Result, PROTOCOL};
@@ -22,6 +23,9 @@ const MAX_RULES_PER_SOURCE: i64 = 32;
 const RATE_LIMIT_MS: i64 = 5_000;
 const DEMAND_TIMEOUT_MS: i64 = 120_000;
 const MAX_PACKET_AGE_NS: i64 = 3_000_000_000;
+const DATAGRAM_TIMEOUT_MS: i64 = 15_000;
+const MAX_BUFFERED_DATAGRAMS: usize = 64;
+const MAX_RECORDED_CUTS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -118,9 +122,9 @@ impl Rule {
     }
 
     fn reply(&self, db: &Connection, current: Option<&TapLease>) -> Result<Value> {
-        let last = db.query_row("SELECT operation_id,rule_revision,target_epoch,authorized FROM private_packet_wake_results WHERE rule_id=?", [&self.id], |r| {
+        let last = db.query_row("SELECT operation_id,rule_revision,target_epoch,authorized,datagram FROM private_packet_wake_results WHERE rule_id=?", [&self.id], |r| {
             Ok(json!({"operation_id":r.get::<_,String>(0)?,"rule_revision":r.get::<_,i64>(1)?,
-                "execution_epoch":r.get::<_,i64>(2)?,"authorized":r.get::<_,bool>(3)?}))
+                "execution_epoch":r.get::<_,i64>(2)?,"authorized":r.get::<_,bool>(3)?,"datagram":r.get::<_,Option<String>>(4)?}))
         }).optional()?;
         Ok(
             json!({"rule_id":self.id,"source_attachment_id":self.source,"target_attachment_id":self.target,
@@ -142,11 +146,25 @@ impl Rule {
 struct Monitor {
     lease_id: String,
     socket: OwnedFd,
+    sequence: u64,
+}
+
+struct RouteCut {
+    epoch: i64,
+    sequence: u64,
+}
+
+struct HeldDatagram {
+    data: Datagram,
+    until: i64,
 }
 
 #[derive(Default)]
 pub(crate) struct Observer {
     monitors: HashMap<String, Monitor>,
+    cuts: HashMap<String, RouteCut>,
+    datagrams: HashMap<String, HeldDatagram>,
+    sequence: u64,
 }
 
 fn unavailable(detail: &str) -> Fault {
@@ -196,12 +214,17 @@ fn current_tap(
 }
 
 impl Observer {
-    fn monitor(&mut self, lease: &TapLease, port: &QuarantinedPort) -> Result<&OwnedFd> {
+    fn monitor(
+        &mut self,
+        lease: &TapLease,
+        port: &QuarantinedPort,
+        after: u64,
+    ) -> Result<&Monitor> {
         let id = &lease.attachment.attachment_id;
         if self
             .monitors
             .get(id)
-            .is_none_or(|existing| existing.lease_id != lease.lease_id)
+            .is_none_or(|existing| existing.lease_id != lease.lease_id || existing.sequence < after)
         {
             let socket = port.observe_ingress().map_err(|error| {
                 eprintln!("could not read private router ingress: {error}");
@@ -215,14 +238,65 @@ impl Observer {
                 Monitor {
                     lease_id: lease.lease_id.clone(),
                     socket,
+                    sequence: self.sequence,
                 },
             );
         }
-        Ok(&self.monitors[id].socket)
+        Ok(&self.monitors[id])
     }
 
-    pub(crate) fn fence(&mut self, attachment: &str) {
-        self.monitors.remove(attachment);
+    pub(crate) fn replaced_port(&mut self, attachment: &str) {
+        self.cuts.remove(attachment);
+    }
+
+    pub(crate) fn closed_port(
+        &mut self,
+        catalog: &Catalog,
+        ports: &HashMap<String, QuarantinedPort>,
+        lease: &TapLease,
+    ) -> Result<()> {
+        let target = &lease.attachment.attachment_id;
+        self.monitors.remove(target);
+        let Some(epoch) = lease.execution_epoch else {
+            return Ok(());
+        };
+        if self.cuts.len() >= MAX_RECORDED_CUTS {
+            if let Some(oldest) = self
+                .cuts
+                .iter()
+                .min_by_key(|(_, cut)| cut.sequence)
+                .map(|(id, _)| id.clone())
+            {
+                self.cuts.remove(&oldest);
+            }
+        }
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| unavailable("private wake observer sequence exhausted"))?;
+        self.cuts.insert(
+            target.clone(),
+            RouteCut {
+                epoch,
+                sequence: self.sequence,
+            },
+        );
+        // Discard queues opened before the destination's route disappeared. A
+        // datagram from the fresh socket cannot have traversed that old route.
+        let sources = {
+            let mut query = catalog.db.prepare("SELECT DISTINCT source_attachment FROM private_packet_wake_rules
+                WHERE target_attachment=? AND enabled=1 AND transport='udp' ORDER BY source_attachment LIMIT ?")?;
+            let rows = query.query_map(params![target, MAX_BUFFERED_DATAGRAMS as i64], |r| {
+                r.get::<_, String>(0)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for source in sources {
+            if let Some(lease) = current_tap(catalog, ports, &source)? {
+                self.monitor(&lease, &ports[&source], self.sequence)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn rule(
@@ -358,7 +432,14 @@ impl Observer {
                     "private packet wake rule limit reached for this source",
                 ));
             }
-            self.monitor(lease, &ports[&input.source_attachment_id])?;
+            let after = if input.transport == Transport::Udp {
+                self.cuts
+                    .get(&input.target_attachment_id)
+                    .map_or(0, |cut| cut.sequence)
+            } else {
+                0
+            };
+            self.monitor(lease, &ports[&input.source_attachment_id], after)?;
             Some(lease)
         } else {
             if previous.is_none() {
@@ -388,9 +469,13 @@ impl Observer {
     ) -> Result<()> {
         if catalog.ready().is_err() {
             self.monitors.clear();
+            self.datagrams.clear();
+            self.cuts.clear();
             return Ok(());
         }
-        reconcile(catalog, ports)?;
+        let now = monotonic()?;
+        self.datagrams.retain(|_, held| held.until > now);
+        reconcile(catalog, ports, &mut self.datagrams)?;
         let rules = {
             let mut query = catalog.db.prepare(&format!(
                 "SELECT {RULE_COLUMNS} FROM private_packet_wake_rules WHERE enabled=1"
@@ -420,11 +505,18 @@ impl Observer {
             if !rules.iter().any(|(rule, _)| rule.matches(&lease)) {
                 continue;
             }
-            let socket = match self.monitor(&lease, &ports[&source]) {
-                Ok(socket) => socket,
+            let after = rules
+                .iter()
+                .filter(|(rule, _)| rule.transport == "udp" && rule.matches(&lease))
+                .filter_map(|(rule, _)| self.cuts.get(&rule.target).map(|cut| cut.sequence))
+                .max()
+                .unwrap_or(0);
+            let monitor = match self.monitor(&lease, &ports[&source], after) {
+                Ok(monitor) => monitor,
                 Err(_) => continue,
             };
-            let packets = match ingress::drain(socket) {
+            let sequence = monitor.sequence;
+            let packets = match ingress::drain(&monitor.socket) {
                 Ok(packets) => packets,
                 Err(error) => {
                     eprintln!("private packet wake observer closed: {error}");
@@ -432,7 +524,7 @@ impl Observer {
                 }
             };
             active.insert(source);
-            for pkt in packets {
+            for mut pkt in packets {
                 if pkt.source != lease.attachment.private_ipv4
                     || wall.saturating_sub(pkt.received_ns) > MAX_PACKET_AGE_NS
                     || pkt.received_ns > wall.saturating_add(MAX_PACKET_AGE_NS)
@@ -446,7 +538,24 @@ impl Observer {
                         && pkt.transport.name() == rule.transport
                         && pkt.received_ns >= rule.since_ns
                     {
-                        enqueue(catalog, rule, target)?;
+                        if let Some(queued) = enqueue(catalog, rule, target)? {
+                            let after_cut = self.cuts.get(&rule.target).is_some_and(|cut| {
+                                sequence >= cut.sequence && queued.offline_epoch == Some(cut.epoch)
+                            });
+                            if after_cut && self.datagrams.len() < MAX_BUFFERED_DATAGRAMS {
+                                if let Some(data) = pkt.datagram.take() {
+                                    let age_ms =
+                                        wall.saturating_sub(pkt.received_ns).max(0) / 1_000_000;
+                                    self.datagrams.insert(
+                                        queued.id,
+                                        HeldDatagram {
+                                            data,
+                                            until: now + DATAGRAM_TIMEOUT_MS - age_ms,
+                                        },
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -488,24 +597,29 @@ fn request(method: &str, target: &Endpoint, expected: &Expected, payload: Value)
     }
 }
 
-fn enqueue(catalog: &mut Catalog, rule: &Rule, target: &Endpoint) -> Result<()> {
+struct Queued {
+    id: String,
+    offline_epoch: Option<i64>,
+}
+
+fn enqueue(catalog: &mut Catalog, rule: &Rule, target: &Endpoint) -> Result<Option<Queued>> {
     let now = monotonic()?;
     let db = &catalog.db;
     let Some(expected) = current_target(db, target)? else {
-        return Ok(());
+        return Ok(None);
     };
     let Ok((policy_revision, policy)) = row_policy(db, &expected.instance_id) else {
-        return Ok(());
+        return Ok(None);
     };
     if !policy.permits_wake(TRIGGER) {
-        return Ok(());
+        return Ok(None);
     }
     let available: bool = db.query_row("SELECT NOT EXISTS(SELECT 1 FROM private_packet_wake_demands WHERE instance_id=?1)
         AND NOT EXISTS(SELECT 1 FROM private_packet_wake_limits WHERE instance_id=?1 AND next_request_at>?2)
         AND EXISTS(SELECT 1 FROM instance_bindings WHERE instance_id=?1 AND route_id='deep' AND active_operation_id IS NULL)",
         params![expected.instance_id,now], |r|r.get(0))?;
     if !available {
-        return Ok(());
+        return Ok(None);
     }
     let sleeping: bool = if let Some(incarnation) = &expected.incarnation_id {
         db.query_row("SELECT EXISTS(SELECT 1 FROM native_standby s JOIN native_transitions n USING(operation_id)
@@ -521,7 +635,7 @@ fn enqueue(catalog: &mut Catalog, rule: &Rule, target: &Endpoint) -> Result<()> 
             params![expected.instance_id,expected.execution_epoch,rule.target], |r|r.get(0))?
     };
     if !sleeping {
-        return Ok(());
+        return Ok(None);
     }
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce)
@@ -538,7 +652,7 @@ fn enqueue(catalog: &mut Catalog, rule: &Rule, target: &Endpoint) -> Result<()> 
         .db
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     if current_target(&tx, target)?.as_ref() != Some(&expected) {
-        return Ok(());
+        return Ok(None);
     }
     protections::mutate(&tx, &req, &expected)?;
     tx.execute(
@@ -555,7 +669,13 @@ fn enqueue(catalog: &mut Catalog, rule: &Rule, target: &Endpoint) -> Result<()> 
     tx.execute("INSERT INTO private_packet_wake_limits VALUES(?,?) ON CONFLICT(instance_id) DO UPDATE SET next_request_at=excluded.next_request_at",
         params![expected.instance_id,now+RATE_LIMIT_MS])?;
     tx.commit()?;
-    Ok(())
+    Ok(Some(Queued {
+        id,
+        offline_epoch: expected
+            .incarnation_id
+            .is_none()
+            .then_some(expected.execution_epoch),
+    }))
 }
 
 struct Demand {
@@ -574,7 +694,11 @@ struct Demand {
     kind: Option<String>,
 }
 
-fn reconcile(catalog: &mut Catalog, ports: &HashMap<String, QuarantinedPort>) -> Result<()> {
+fn reconcile(
+    catalog: &mut Catalog,
+    ports: &HashMap<String, QuarantinedPort>,
+    datagrams: &mut HashMap<String, HeldDatagram>,
+) -> Result<()> {
     let demands = {
         let mut query = catalog.db.prepare("SELECT d.instance_id,d.protection_id,d.rule_id,d.rule_revision,d.policy_revision,d.expires_at,
             p.incarnation_id,p.epoch,p.endpoint_revision,p.revision,p.wake_operation,s.stage,s.kind FROM private_packet_wake_demands d
@@ -600,11 +724,12 @@ fn reconcile(catalog: &mut Catalog, ports: &HashMap<String, QuarantinedPort>) ->
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for demand in demands {
+        let now = monotonic()?;
         let rule = Rule::read(&catalog.db, &demand.rule)?
             .ok_or_else(|| unavailable("private wake rule disappeared"))?;
         let target = endpoint(&catalog.db, &rule.target)?;
         let policy = row_policy(&catalog.db, &demand.machine).ok();
-        let eligible = demand.expires > monotonic()?
+        let eligible = demand.expires > now
             && rule.enabled
             && rule.revision == demand.revision
             && policy.is_some_and(|(rev, policy)| {
@@ -613,10 +738,12 @@ fn reconcile(catalog: &mut Catalog, ports: &HashMap<String, QuarantinedPort>) ->
             && current_tap(catalog, ports, &rule.source)?.is_some_and(|lease| rule.matches(&lease));
         let Some(target) = target else {
             cleanup(&mut catalog.db, &demand)?;
+            datagrams.remove(&demand.id);
             continue;
         };
         let Some(expected) = current_target(&catalog.db, &target)? else {
             cleanup(&mut catalog.db, &demand)?;
+            datagrams.remove(&demand.id);
             continue;
         };
         let completed =
@@ -675,13 +802,41 @@ fn reconcile(catalog: &mut Catalog, ports: &HashMap<String, QuarantinedPort>) ->
             Err(error) if matches!(error.code, "E_STATE_CONFLICT" | "E_NOT_FOUND") => false,
             Err(error) => return Err(error),
         };
-        if let Some(operation) = demand.operation.filter(|_| completed && applied) {
-            tx.execute("INSERT INTO private_packet_wake_results VALUES(?,?,?,?,?) ON CONFLICT(rule_id) DO UPDATE SET
-                operation_id=excluded.operation_id,rule_revision=excluded.rule_revision,target_epoch=excluded.target_epoch,authorized=excluded.authorized",
-                params![rule.id,operation,demand.revision,expected.execution_epoch,authorized])?;
+        let operation = demand.operation.filter(|_| completed && applied);
+        let datagram = datagrams
+            .remove(&demand.id)
+            .filter(|held| authorized && held.until > now);
+        if let Some(operation) = &operation {
+            let status = (rule.transport == "udp" && demand.incarnation.is_none()).then_some(
+                if datagram.is_some() {
+                    "unknown"
+                } else {
+                    "dropped"
+                },
+            );
+            tx.execute("INSERT INTO private_packet_wake_results(rule_id,operation_id,rule_revision,target_epoch,authorized,datagram)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(rule_id) DO UPDATE SET operation_id=excluded.operation_id,
+                rule_revision=excluded.rule_revision,target_epoch=excluded.target_epoch,authorized=excluded.authorized,datagram=excluded.datagram",
+                params![rule.id,operation,demand.revision,expected.execution_epoch,authorized,status])?;
         }
         remove_demand(&tx, &demand.machine, &demand.id)?;
         tx.commit()?;
+        if let (Some(held), Some(operation)) = (datagram, operation) {
+            // The delivery is consumed before injecting it. A Worker crash can
+            // leave the outcome unknown and can never replay it on restart.
+            let sender = current_tap(catalog, ports, &rule.source)?
+                .is_some_and(|lease| rule.matches(&lease));
+            let recipient = current_tap(catalog, ports, &rule.target)?.is_some_and(|lease| {
+                lease.incarnation_id == expected.incarnation_id
+                    && lease.execution_epoch == Some(expected.execution_epoch)
+            });
+            let forwarded = sender
+                && recipient
+                && held.until > monotonic()?
+                && ports[&rule.target].forward_wake_datagram(held.data).is_ok();
+            catalog.db.execute("UPDATE private_packet_wake_results SET datagram=? WHERE rule_id=? AND operation_id=?",
+                params![if forwarded {"forwarded"} else {"dropped"},rule.id,operation])?;
+        }
     }
     Ok(())
 }

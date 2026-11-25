@@ -2,8 +2,47 @@ use super::Transport;
 use std::ffi::CStr;
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+const MAX_DATAGRAM: usize = 1200;
+
+pub(crate) struct Datagram {
+    source: Ipv4Addr,
+    target: Ipv4Addr,
+    source_port: u16,
+    target_port: u16,
+    payload: Vec<u8>,
+}
+
+impl Datagram {
+    /// Reinject the one opted-in datagram inside its Worker private router.
+    /// The kernel supplies the IPv4 length, checksum and ID for IPPROTO_RAW.
+    pub(crate) fn forward(self) -> io::Result<()> {
+        let udp_len = (self.payload.len() + 8) as u16;
+        let mut bytes = vec![0u8; 28];
+        bytes[0] = 0x45;
+        bytes[8] = 64;
+        bytes[9] = libc::IPPROTO_UDP as u8;
+        bytes[12..16].copy_from_slice(&self.source.octets());
+        bytes[16..20].copy_from_slice(&self.target.octets());
+        bytes[20..22].copy_from_slice(&self.source_port.to_be_bytes());
+        bytes[22..24].copy_from_slice(&self.target_port.to_be_bytes());
+        bytes[24..26].copy_from_slice(&udp_len.to_be_bytes());
+        bytes.extend(self.payload);
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::from(libc::SOCK_RAW),
+            Some(socket2::Protocol::from(libc::IPPROTO_RAW)),
+        )?;
+        socket.set_nonblocking(true)?;
+        let target = SocketAddrV4::new(self.target, 0).into();
+        if socket.send_to(&bytes, &target)? != bytes.len() {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        Ok(())
+    }
+}
 
 pub(super) struct Packet {
     pub source: Ipv4Addr,
@@ -11,6 +50,7 @@ pub(super) struct Packet {
     pub transport: Transport,
     pub port: u16,
     pub received_ns: i64,
+    pub datagram: Option<Datagram>,
 }
 
 pub(crate) fn open(interface: &CStr) -> io::Result<OwnedFd> {
@@ -66,8 +106,8 @@ pub(crate) fn open(interface: &CStr) -> io::Result<OwnedFd> {
 
 pub(super) fn drain(socket: &OwnedFd) -> io::Result<Vec<Packet>> {
     let mut packets = Vec::new();
-    // Read the longest IPv4 header and twenty transport bytes. No application data is retained.
-    let mut header = [0u8; 80];
+    // Inspect bounded IPv4/TCP/UDP headers and at most one supported UDP payload size.
+    let mut header = [0u8; 60 + 8 + MAX_DATAGRAM];
     for _ in 0..24 {
         let mut address: libc::sockaddr_ll = unsafe { zeroed() };
         let mut control: [libc::cmsghdr; 4] = unsafe { zeroed() };
@@ -166,16 +206,32 @@ fn classify(header: &[u8], frame_len: usize, received_ns: i64) -> Option<Packet>
         }
         _ => return None,
     };
+    let source_port = u16::from_be_bytes([header[ip_header], header[ip_header + 1]]);
     let port = u16::from_be_bytes([header[ip_header + 2], header[ip_header + 3]]);
-    if port == 0 || header[ip_header..ip_header + 2] == [0, 0] {
+    if port == 0 || source_port == 0 {
         return None;
     }
+    let source = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
+    let target = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
+    let datagram =
+        if transport == Transport::Udp && ip_header == 20 && transport_len <= 8 + MAX_DATAGRAM {
+            header.get(ip_header + 8..total).map(|data| Datagram {
+                source,
+                target,
+                source_port,
+                target_port: port,
+                payload: data.to_vec(),
+            })
+        } else {
+            None
+        };
     Some(Packet {
-        source: Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]),
-        target: Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]),
+        source,
+        target,
         transport,
         port,
         received_ns,
+        datagram,
     })
 }
 
@@ -205,12 +261,18 @@ mod tests {
         bytes[6] = 0;
         bytes[3] = 36;
         bytes[9] = 17;
+        bytes[28..36].fill(0);
         bytes[25] = 16;
         assert_eq!(
             classify(&bytes[..28], 36, 42).unwrap().transport,
             Transport::Udp
         );
         assert!(classify(&bytes[..27], 36, 42).is_none());
+        assert!(classify(&bytes[..28], 36, 42).unwrap().datagram.is_none());
+        assert_eq!(
+            classify(&bytes, 36, 42).unwrap().datagram.unwrap().payload,
+            [0; 8]
+        );
         bytes[25] = 8;
         assert!(classify(&bytes[..28], 36, 42).is_none());
     }

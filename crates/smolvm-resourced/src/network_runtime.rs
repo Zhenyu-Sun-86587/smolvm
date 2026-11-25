@@ -208,6 +208,7 @@ impl NetworkRuntime {
         let descriptor = descriptor(reservation, mac, &port);
         let lease =
             catalog.record_quarantined_tap(&operation, &hex::encode(lease_id), &descriptor)?;
+        self.packet_wake.replaced_port(&data.attachment_id);
         self.ports.insert(data.attachment_id, port);
         Ok(lease)
     }
@@ -434,7 +435,9 @@ impl NetworkRuntime {
         port.fence().map_err(host_error)?;
         catalog.retire_fenced_tap(lease)?;
         self.ports.remove(attachment_id);
-        self.packet_wake.fence(attachment_id);
+        if let Err(error) = self.packet_wake.closed_port(catalog, &self.ports, lease) {
+            eprintln!("could not refresh private wake observers after fencing: {error}");
+        }
         let domain = &lease.attachment.route_domain_id;
         if self.routers.get(domain).is_some_and(PrivateRouter::idle) {
             self.routers.remove(domain);
