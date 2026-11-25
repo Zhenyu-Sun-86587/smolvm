@@ -111,6 +111,20 @@ impl NetworkRuntime {
             },
             _ => return Err(Fault::invalid("invalid guest route for attachment mode")),
         };
+        if let Some(prior) = catalog.prior_tap_descriptor(&data.attachment_id)? {
+            if data
+                .guest_gateway_ipv4
+                .is_some_and(|gateway| gateway != prior.gateway_ipv4)
+                || data
+                    .guest_prefix
+                    .is_some_and(|prefix| prefix != prior.guest_prefix)
+            {
+                return Err(Fault::new(
+                    "E_IDEMPOTENCY_CONFLICT",
+                    "stable attachment has another guest route",
+                ));
+            }
+        }
         match catalog.tap_lease(&data.attachment_id) {
             Ok(lease) => {
                 if !self.ports.contains_key(&data.attachment_id) || lease.state == "unknown" {

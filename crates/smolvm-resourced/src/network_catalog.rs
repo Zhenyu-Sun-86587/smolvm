@@ -37,6 +37,7 @@ pub(crate) struct ReserveNetwork {
     device_id: String,
     mode: Mode,
     guest_ipv4: Option<Ipv4Addr>,
+    rebind_revision: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -234,8 +235,7 @@ impl Catalog {
             return Err(Fault::invalid("invalid network attachment profile"));
         }
         if let Some(prior) = lookup(&self.db, &data.attachment_id)? {
-            if prior.operation_id != operation.operation_id
-                || prior.network_id != data.network_id
+            if prior.network_id != data.network_id
                 || prior.device_id != data.device_id
                 || prior.mode != data.mode.as_str()
                 || data
@@ -247,7 +247,17 @@ impl Catalog {
                     "attachment ID already has another intent",
                 ));
             }
-            return Ok(prior);
+            return if prior.operation_id == operation.operation_id {
+                Ok(prior)
+            } else {
+                self.rebind_network(request, prior, data.rebind_revision)
+            };
+        }
+        if data.rebind_revision.is_some() {
+            return Err(Fault::new(
+                "E_NOT_FOUND",
+                "network reservation to rebind does not exist",
+            ));
         }
         self.ready()?;
         let operation = self.active_operation(request)?;
@@ -299,6 +309,71 @@ impl Catalog {
             .ok_or_else(|| Fault::new("E_CATALOG", "network reservation was not stored"))?;
         tx.commit()?;
         Ok(reservation)
+    }
+
+    fn rebind_network(
+        &self,
+        request: &Request,
+        prior: NetworkReservation,
+        expected_revision: Option<i64>,
+    ) -> Result<NetworkReservation> {
+        let old_operation = self.operation(&prior.operation_id)?;
+        let new_operation = self.matching_operation(request)?;
+        if expected_revision.is_none()
+            || old_operation.route_id != new_operation.route_id
+            || old_operation.instance_id != new_operation.instance_id
+            || old_operation.bundle_digest != new_operation.bundle_digest
+        {
+            return Err(Fault::new(
+                "E_IDEMPOTENCY_CONFLICT",
+                "attachment ID already has another intent",
+            ));
+        }
+        if expected_revision != Some(prior.revision) {
+            return Err(Fault::new(
+                "E_STALE_REVISION",
+                "network reservation revision changed",
+            ));
+        }
+        self.ready()?;
+        let active = self.active_operation(request)?;
+        if prior.state != "reserved"
+            || old_operation.phase == "NEW"
+            || !active.launches_execution()
+            || active.expected_incarnation_id.is_some()
+        {
+            return Err(Fault::new(
+                "E_FENCE_UNPROVEN",
+                "previous network owner has not been fenced",
+            ));
+        }
+        match self.tap_lease(&prior.attachment_id) {
+            Ok(_) => {
+                return Err(Fault::new(
+                    "E_FENCE_UNPROVEN",
+                    "previous TAP still owns the reservation",
+                ))
+            }
+            Err(error) if error.code == "E_NOT_FOUND" => (),
+            Err(error) => return Err(error),
+        }
+        if self.db.execute(
+            "UPDATE network_attachments SET operation_id=?,revision=revision+1
+             WHERE attachment_id=? AND operation_id=? AND revision=? AND state='reserved'",
+            params![
+                active.operation_id,
+                prior.attachment_id,
+                prior.operation_id,
+                prior.revision
+            ],
+        )? != 1
+        {
+            return Err(Fault::new(
+                "E_STALE_REVISION",
+                "network reservation changed before rebinding",
+            ));
+        }
+        self.scoped_network_reservation(request, &prior.attachment_id)
     }
 
     pub(crate) fn get_network_reservation(
@@ -386,7 +461,7 @@ mod tests {
     use super::*;
     use crate::ipc::{Expected, PROTOCOL};
 
-    fn operation(catalog: &mut Catalog, id: &str, instance: &str) -> Request {
+    fn operation(catalog: &mut Catalog, id: &str, instance: &str, kind: &str) -> Request {
         let request = Request {
             protocol: PROTOCOL.to_owned(),
             request_id: id.to_owned(),
@@ -403,7 +478,7 @@ mod tests {
             fd_table: Vec::new(),
             payload: serde_json::Value::Null,
         };
-        catalog.begin(&request, "network_reservation").unwrap();
+        catalog.begin(&request, kind).unwrap();
         request
     }
 
@@ -414,6 +489,7 @@ mod tests {
             device_id: "net0".to_owned(),
             mode: Mode::Native,
             guest_ipv4: None,
+            rebind_revision: None,
         }
     }
 
@@ -435,8 +511,18 @@ mod tests {
             catalog.register_private_network(&config).unwrap();
         }
 
-        let create_a = operation(&mut catalog, "reserve-a", "machine-a");
-        let create_b = operation(&mut catalog, "reserve-b", "machine-b");
+        let create_a = operation(
+            &mut catalog,
+            "reserve-a",
+            "machine-a",
+            "network_reservation",
+        );
+        let create_b = operation(
+            &mut catalog,
+            "reserve-b",
+            "machine-b",
+            "network_reservation",
+        );
         let attachment_a = reserve("attachment-a", "home");
         let a = catalog.reserve_network(&create_a, &attachment_a).unwrap();
         assert_eq!(a.private_ipv4, Ipv4Addr::new(10, 20, 0, 2));
@@ -504,7 +590,12 @@ mod tests {
 
         let mut catalog = Catalog::open(&path, "boot", "second").unwrap();
         catalog.complete_recovery("second").unwrap();
-        let create_c = operation(&mut catalog, "reserve-c", "machine-c");
+        let create_c = operation(
+            &mut catalog,
+            "reserve-c",
+            "machine-c",
+            "network_reservation",
+        );
         let unknown = catalog
             .get_network_reservation(
                 &create_a,
@@ -533,6 +624,57 @@ mod tests {
                 .unwrap()
                 .code,
             "E_RESOURCE_EXHAUSTED"
+        );
+    }
+
+    #[test]
+    fn rebind_preserves_the_reserved_address_and_fences_the_predecessor() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::open(&temp.path().join("worker.db"), "boot", "first").unwrap();
+        catalog
+            .register_bundle(&format!("sha256:{}", "a".repeat(64)), &"c".repeat(64))
+            .unwrap();
+        catalog
+            .register_private_network(&RegisterNetwork {
+                network_id: "stable".to_owned(),
+                route_domain_id: "router".to_owned(),
+                cidr: "10.20.0.0/30".to_owned(),
+            })
+            .unwrap();
+        let first = operation(
+            &mut catalog,
+            "original",
+            "same-machine",
+            "network_reservation",
+        );
+        let mut intent = reserve("endpoint", "stable");
+        let prior = catalog.reserve_network(&first, &intent).unwrap();
+        catalog.finish(&first, false, 1).unwrap();
+
+        let next = operation(&mut catalog, "relaunch", "same-machine", "launch");
+        intent.rebind_revision = Some(prior.revision + 1);
+        assert_eq!(
+            catalog.reserve_network(&next, &intent).err().unwrap().code,
+            "E_STALE_REVISION"
+        );
+        intent.rebind_revision = Some(prior.revision);
+        let rebound = catalog.reserve_network(&next, &intent).unwrap();
+        assert_eq!(rebound.revision, prior.revision + 1);
+        assert_eq!(rebound.private_ipv4, prior.private_ipv4);
+        assert_eq!(
+            catalog.reserve_network(&next, &intent).unwrap().revision,
+            rebound.revision
+        );
+        let id = NetworkReservationId {
+            attachment_id: "endpoint".to_owned(),
+        };
+        assert_eq!(
+            catalog
+                .get_network_reservation(&first, &id)
+                .err()
+                .unwrap()
+                .code,
+            "E_NOT_FOUND"
         );
     }
 }

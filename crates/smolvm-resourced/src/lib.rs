@@ -19,6 +19,8 @@ mod escrow_catalog;
 #[cfg(target_os = "linux")]
 mod grants;
 #[cfg(target_os = "linux")]
+mod guest_transport;
+#[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]
 pub mod native_client;

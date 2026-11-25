@@ -128,6 +128,21 @@ fn owned(db: &Connection, attachment_id: &str) -> Result<TapLease> {
 }
 
 impl Catalog {
+    pub(crate) fn prior_tap_descriptor(
+        &self,
+        attachment_id: &str,
+    ) -> Result<Option<AttachmentDescriptor>> {
+        let json: Option<String> = self.db.query_row(
+            "SELECT descriptor_json FROM network_tap_leases WHERE attachment_id=? ORDER BY rowid DESC LIMIT 1",
+            [attachment_id], |row| row.get(0),
+        ).optional()?;
+        json.map(|value| {
+            serde_json::from_str(&value)
+                .map_err(|_| Fault::new("E_CATALOG", "cannot read previous TAP descriptor"))
+        })
+        .transpose()
+    }
+
     pub(crate) fn tap_lease(&self, attachment_id: &str) -> Result<TapLease> {
         owned(&self.db, attachment_id)
     }

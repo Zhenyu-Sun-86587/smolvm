@@ -106,6 +106,10 @@ def boot(args, config):
     permit = json.loads(sys.stdin.readline())["launch_permit"]
     registered = rpc(worker, "RegisterExecution", {"launch_permit": permit}, **operation)
     assert registered["execution"]["pid"] == os.getpid(), registered
+    relay = None
+    if relay_path := config.get("relay"):
+        relay = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        relay.connect(relay_path)
     net_fd, tap = None, None
     if attachment := config.get("attachment"):
         tap, fds = rpc(worker, "AcquireNetworkAttachment", {"attachment_id": attachment},
@@ -158,6 +162,8 @@ def boot(args, config):
     if tap is None and (point := config.get("restore")):
         configure_restore(point)
     probe.boot(args, config, tap_attached=tap_attached if tap else None)
+    if relay:
+        relay.close()
 
 
 def frame_for(receipt, network):
@@ -225,6 +231,13 @@ def run(args):
         return process
 
     worker_process = start_worker()
+    relay = None
+    relay_connections = []
+    if args.test_guest_transport:
+        relay = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        relay.settimeout(5)
+        relay.bind(str(directory / "relay.sock"))
+        relay.listen(2)
 
     try:
         probe.until(lambda: rpc(worker, "Health"))
@@ -259,6 +272,8 @@ def run(args):
         def launch(name, config):
             ctl = directory / (name + ".sock")
             active = scope(bundle, name, name + "-op", 1)
+            if relay:
+                config["relay"] = relay.getsockname()
             rpc(worker, "BeginOperation", {"kind": "restore_target" if name == "child" else "launch"},
                 **scope(bundle, name, name + "-op"))
             if args.network:
@@ -285,13 +300,23 @@ def run(args):
                 proc.stdin.write(json.dumps(data) + "\n")
                 proc.stdin.flush()
             send(rpc(worker, "IssueLaunchPermit", {"pid": proc.pid, "uid": os.getuid()}, **active))
+            if relay:
+                connection, _ = relay.accept()
+                relay_connections.append(connection)
             def rows():
                 if proc.poll() is not None:
                     raise RuntimeError(f"{name} terminated: {path.read_text()[-6000:]}")
                 return probe.ROWS.findall(path.read_bytes())
             return active, ctl, send, rows
 
+        def verify_peer(scope, connection, error=None):
+            return rpc(worker, "VerifyGuestTransport", descriptors=[connection.fileno()],
+                       table=[{"index": 0, "resource_id": scope["expected"]["incarnation_id"],
+                               "role": "guest_transport"}], error=error, **scope)
+
         src, control, source_command, source_rows = launch("source", {})
+        if relay:
+            verify_peer(src, relay_connections[0], "E_PERMISSION_DENIED")
         if args.network:
             router_ns = private_router()
             def attached():
@@ -316,6 +341,8 @@ def run(args):
             probe.until(lambda: ping(router_ns, source_ip), 12)
         launch_record = rpc(worker, "QueryOperation", **{k: src[k] for k in ("operation_id", "bundle_digest", "route_id")})
         rpc(worker, "FinishOperation", {"abort": False, "expected_revision": launch_record["revision"]}, **src)
+        if relay:
+            assert verify_peer(src, relay_connections[0])["pid"] == processes[-1].pid
         generation = scope(bundle, "source", "capture", 1)
         rpc(worker, "BeginOperation", {"kind": "generation"}, **generation)
         token = "1 " + secrets.token_hex(16)
@@ -373,6 +400,9 @@ def run(args):
             return status if status["phase"] == "identity_ready" else None
         identity_ready = probe.until(ready)
         assert not child_rows() and source_rows() == parked
+        if relay:
+            verify_peer(child, relay_connections[1], "E_PERMISSION_DENIED")
+            verify_peer(src, relay_connections[1], "E_PERMISSION_DENIED")
         if args.network:
             tap = rpc(worker, "QueryNetworkAttachment", {"attachment_id": "child-tap"}, **child)
             assert tap["gate"] == "closed", tap
@@ -422,6 +452,9 @@ def run(args):
                 service_dial(worker, src, tap, error="E_STALE_EXECUTION")
         assert source_rows() == parked
         rpc(worker, "FinishOperation", {"abort": False, "expected_revision": 1}, **child)
+        if relay:
+            assert verify_peer(child, relay_connections[1])["pid"] == child_process.pid
+            verify_peer(child, relay_connections[0], "E_PERMISSION_DENIED")
         if args.network:
             assert not ping(router_ns, source_ip), "opening the child released the source packet gate"
             assert probe.wire(control, f"STANDBY_WAKE {token}").startswith("OK")
@@ -438,6 +471,10 @@ def run(args):
         print(f"Worker pidfd + sealed RAM + KVM target authority passed; network={args.network}; "
               f"source and child retain PID {parked[-1][1].decode()}; journal revision {released['revision']}")
     finally:
+        for connection in relay_connections:
+            connection.close()
+        if relay:
+            relay.close()
         for proc in reversed(processes):
             if proc.poll() is None:
                 proc.terminate()
@@ -461,6 +498,7 @@ if __name__ == "__main__":
     parser.add_argument("--fixed-internal", action="store_true")
     parser.add_argument("--restart-before-commit", action="store_true")
     parser.add_argument("--test-service-dial", action="store_true", help="use guest-service-counter on both boot fixtures")
+    parser.add_argument("--test-guest-transport", action="store_true")
     args = parser.parse_args()
     if args.fixed_internal:
         args.network = True
