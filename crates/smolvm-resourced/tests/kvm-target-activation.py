@@ -133,15 +133,16 @@ def boot(args, config):
         config.update(authority=endpoint[0], context=authority["context_digest"],
                       fds=fds, descriptor=descriptor.hex(), anchor=authority["binding"]["input"]["capture_anchor"])
 
-    if not config.get("restore"):
-        def await_capture():
-            for line in sys.stdin:
-                try:
-                    publish_capture(probe, worker, config["control"], json.loads(line))
-                except Exception:
-                    import traceback
-                    traceback.print_exc()
-                    os._exit(6)
+    def await_capture():
+        for line in sys.stdin:
+            try:
+                publish_capture(probe, worker, config["control"], json.loads(line))
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                os._exit(6)
+
+    if tap is None and not config.get("restore"):
         threading.Thread(target=await_capture, daemon=True).start()
 
     def tap_attached():
@@ -149,6 +150,9 @@ def boot(args, config):
                                                "expected_revision": tap["revision"]}, **operation)
         if point := config.get("restore"):
             configure_restore(point)
+        else:
+            assert json.loads(sys.stdin.readline()) == {"boot": True}
+            threading.Thread(target=await_capture, daemon=True).start()
 
     if tap is None and (point := config.get("restore")):
         configure_restore(point)
@@ -250,7 +254,7 @@ def run(args):
                 proc = subprocess.Popen([sys.executable, __file__, str(args.lib), str(args.probe),
                                          "--boot", str(cfg)],
                     stdin=subprocess.PIPE, stdout=log, stderr=log, text=True,
-                    env={**os.environ, "SMOLVM_FORKABLE": "1", "RUST_LOG": "error"})
+                    env={**os.environ, "SMOLVM_FORKABLE": "1", "RUST_LOG": os.environ.get("RUST_LOG", "error")})
             processes.append(proc)
             def send(data):
                 proc.stdin.write(json.dumps(data) + "\n")
@@ -263,7 +267,26 @@ def run(args):
             return active, ctl, send, rows
 
         src, control, source_command, source_rows = launch("source", {})
+        if args.network:
+            router_ns = private_router()
+            def attached():
+                intent = scope(bundle, "source", "source-op")
+                tap = rpc(worker, "QueryNetworkAttachment", {"attachment_id": "source-tap"}, **intent)
+                return tap if tap["state"] == "attached" else None
+            tap = probe.until(attached)
+            source_ip = tap["attachment"]["private_ipv4"]
+            assert tap["gate"] == "closed" and not ping(router_ns, source_ip), tap
+            publish = {"attachment_id": "source-tap", "lease_id": tap["lease_id"],
+                       "expected_revision": tap["revision"]}
+            rpc(worker, "PublishInitialNetworkAttachment", {**publish, "expected_revision": tap["revision"] - 1},
+                error="E_STALE_REVISION", **src)
+            active_tap = rpc(worker, "PublishInitialNetworkAttachment", publish, **src)
+            assert active_tap["gate"] == "open", active_tap
+            assert rpc(worker, "PublishInitialNetworkAttachment", publish, **src) == active_tap
+            source_command({"boot": True})
         probe.until(lambda: len(source_rows()) >= 3, 35)
+        if args.network:
+            probe.until(lambda: ping(router_ns, source_ip), 12)
         launch_record = rpc(worker, "QueryOperation", **{k: src[k] for k in ("operation_id", "bundle_digest", "route_id")})
         rpc(worker, "FinishOperation", {"abort": False, "expected_revision": launch_record["revision"]}, **src)
         generation = scope(bundle, "source", "capture", 1)
@@ -274,8 +297,12 @@ def run(args):
             return probe.wire(control, f"GUEST_GATE_{verb} {token} {suffix}")
         assert gate("PREPARE", "2500 5000").startswith("OK")
         probe.until(lambda: " armed 0" in gate("QUERY"))
+        if args.network:
+            assert ping(router_ns, source_ip), "source must answer before the Guest packet gate closes"
         assert gate("PARK_NETWORK" if args.network else "PARK", anchor).startswith("OK")
         probe.until(lambda: " parked 0" in gate("QUERY"))
+        if args.network:
+            assert not ping(router_ns, source_ip), "the parked source answered through its open Worker TAP"
         assert '"source_disposition":"STANDBY"' in probe.wire(control, f"STANDBY_ENTER {token} managed")
         assert '"source_disposition":"HELD"' in probe.wire(control, f"CAPTURE_PREPARE {token} parked")
         point = directory / "point"
@@ -321,7 +348,9 @@ def run(args):
         if args.network:
             tap = rpc(worker, "QueryNetworkAttachment", {"attachment_id": "child-tap"}, **child)
             assert tap["gate"] == "closed", tap
-            router_ns = private_router()
+            rpc(worker, "PublishInitialNetworkAttachment", {"attachment_id": "child-tap", "lease_id": tap["lease_id"],
+                                                               "expected_revision": tap["revision"]},
+                error="E_INVALID_REQUEST", **child)
             assert not ping(router_ns, tap["attachment"]["private_ipv4"])
         rpc(worker, "CommitActivation", {"expected_revision": identity_ready["revision"] - 1},
             error="E_STALE_REVISION", **child)
@@ -342,6 +371,12 @@ def run(args):
             assert network_line in (directory / "child.log").read_bytes()
         assert source_rows() == parked
         rpc(worker, "FinishOperation", {"abort": False, "expected_revision": 1}, **child)
+        if args.network:
+            assert not ping(router_ns, source_ip), "opening the child released the source packet gate"
+            assert probe.wire(control, f"STANDBY_WAKE {token}").startswith("OK")
+            probe.until(lambda: len(source_rows()) >= len(parked) + 2)
+            assert source_rows()[-1][1:] == parked[-1][1:]
+            assert ping(router_ns, source_ip) and ping(router_ns, att["private_ipv4"])
         print(f"Worker pidfd + sealed RAM + KVM target authority passed; network={args.network}; "
               f"source and child retain PID {parked[-1][1].decode()}; journal revision {released['revision']}")
     finally:

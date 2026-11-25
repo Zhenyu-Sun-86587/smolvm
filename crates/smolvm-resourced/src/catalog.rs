@@ -226,9 +226,10 @@ impl Catalog {
                 crate::network_lease_catalog::install(&tx)?;
                 crate::activation_catalog::install(&tx)?;
                 tx.execute_batch(include_str!("schema_native_operations.sql"))?;
-                tx.execute_batch("PRAGMA user_version=8")?;
+                crate::network_lease_catalog::install_initial_activations(&tx)?;
+                tx.execute_batch("PRAGMA user_version=9")?;
             }
-            1..=8 => {
+            1..=9 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -249,7 +250,10 @@ impl Catalog {
                 }
                 if version < 8 {
                     tx.execute_batch(include_str!("schema_native_operations.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=8")?;
+                }
+                if version < 9 {
+                    crate::network_lease_catalog::install_initial_activations(&tx)?;
+                    tx.execute_batch("PRAGMA user_version=9")?;
                 }
                 crate::network_lease_catalog::recover(&tx)?;
                 crate::activation_catalog::recover(&tx)?;
@@ -513,6 +517,22 @@ impl Catalog {
                 return Err(conflict(
                     "E_OPERATION_IN_PROGRESS",
                     "launch has no registered execution",
+                ));
+            }
+        }
+        if !abort && operation.kind == "launch" {
+            let unpublished: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM network_attachments a
+                 WHERE a.operation_id=? AND a.state<>'released' AND NOT EXISTS (
+                    SELECT 1 FROM network_tap_leases l JOIN initial_network_activations i USING(lease_id)
+                    WHERE l.attachment_id=a.attachment_id AND l.state='attached' AND i.phase='open'
+                 ))",
+                [id], |row| row.get(0),
+            )?;
+            if unpublished {
+                return Err(conflict(
+                    "E_FENCE_UNPROVEN",
+                    "cold execution network is still quarantined",
                 ));
             }
         }

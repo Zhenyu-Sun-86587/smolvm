@@ -454,6 +454,22 @@ impl Worker {
                     .acknowledge(&self.catalog, request, &execution)
                     .map(|lease| json!(lease))
             }
+            "PublishInitialNetworkAttachment" => {
+                let execution =
+                    if peer.uid == self.admin_uid || peer.uid == unsafe { libc::geteuid() } {
+                        let execution = self.scoped_execution(request)?;
+                        self.verify_live_execution(&execution)?;
+                        execution
+                    } else {
+                        self.authenticated_execution(request, peer)?
+                    };
+                Ok(json!(self.network.publish_initial(
+                    &self.catalog,
+                    request,
+                    &execution,
+                    || { self.verify_live_execution(&execution) }
+                )?))
+            }
             "AcquireWriterSet" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 return self.acquire_writer_set(request, &execution);
@@ -1095,6 +1111,8 @@ impl Worker {
             }
             self.catalog.release_confirmed_grant(&grant)?;
         }
+        self.network
+            .fence_execution(&self.catalog, &execution, &self.boot)?;
         let result = self.catalog.finalize_execution(&execution)?;
         self.executions.remove(&execution.incarnation_id);
         self.escrow.forget_execution(&execution.incarnation_id);

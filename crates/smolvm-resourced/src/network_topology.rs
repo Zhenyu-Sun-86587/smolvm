@@ -264,6 +264,7 @@ impl QuarantinedPort {
 
     /// Disconnect the host route before a released address can be reused.
     pub fn fence(&mut self) -> io::Result<()> {
+        self.close_identity()?;
         self.router_link.fence()
     }
 
@@ -425,6 +426,25 @@ mod tests {
             assert!(guard.contains("policy drop"));
             assert!(guard.contains("arp saddr ether"));
             assert!(!guard.contains("jump identity"));
+
+            port.arm_identity().unwrap();
+            port.publish_identity().unwrap();
+            let link = inspect(
+                port.namespace(),
+                "ip",
+                &["-j", "link", "show", "dev", TAP_PORT_NAME],
+            );
+            assert!(link.status.success());
+            let device: serde_json::Value = serde_json::from_slice(&link.stdout).unwrap();
+            assert!(
+                device[0]["flags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|flag| flag == "UP"),
+                "{device}"
+            );
+            port.close_identity().unwrap();
         }
         assert_eq!(
             std::fs::read_link("/proc/thread-self/ns/net").unwrap(),
