@@ -56,3 +56,18 @@ A consumer that has closed its references can release the lease. The broker can 
 cargo test --locked -p smolvm-resourced
 python3 crates/smolvm-resourced/tests/worker-resource.py target/debug/smolvm-resourced -v
 ```
+
+## Diskless KVM handoff probe
+
+Run on a private Linux x86-64 KVM worker. Use the Linux `BLK=1 NET=1` libkrun build with `krun_export_snapshot_ram_v1`, `krun_set_diskless_snapshot_ram_v1` and matching firmware. The worker sees three separate host processes as the source, child and grandchild, with explicit launch permits for their actual PIDs.
+
+```sh
+cc -O2 -Wall -Wextra -Werror -static \
+  crates/smolvm-resourced/tests/kvm-generation-guest.c -o "$GUEST_TEST_BIN"
+LD_LIBRARY_PATH="$FIRMWARE_DIR" python3 -B crates/smolvm-resourced/tests/kvm-generation.py \
+  target/debug/smolvm-resourced "$LIBKRUN_SO" "$GUEST_TEST_BIN"
+```
+
+The probe snapshots a two-vCPU, 512 MiB guest, sends the sealed RAM directly from the VMM process, kills the source and deletes its original capture directory. The child restores from the small checkpoint and the broker's read-only memfd lease. It advances the inherited guest counter, reads the saved sentinel and uses private mappings of the original backing. The probe then restarts the broker while the child keeps executing and confirms recovery from the child's retained lease. A grandchild resumes after its own parent exits using a generation that shares the original backings and adds private deltas.
+
+On the project KVM worker with Linux guest kernel 6.18.60, the source captured at tick 3 using three sealed backings. The child first ran at tick 4, read the sentinel at tick 9, and advanced to tick 11 through broker restart. The grandchild first ran at tick 12 using six sealed backings. The child and grandchild mapped those backings privately. The separate WorkerResource integration tests cover the two-bundle OFD writer-reservation conflict and restart fence. The diskless probe covers RAM and VMM continuation. Full writable block attachment, process isolation policy, guest identity, and product activation remain separate acceptance gates.
