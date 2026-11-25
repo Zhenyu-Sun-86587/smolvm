@@ -74,3 +74,17 @@ CREATE TABLE lifecycle_pressure (
     changed_at INTEGER NOT NULL,
     reclaimed_at INTEGER
 );
+ALTER TABLE lifecycle_policies ADD COLUMN freeze_session INTEGER;
+CREATE TABLE lifecycle_events (
+    seq INTEGER PRIMARY KEY, instance_id TEXT NOT NULL, decision_id TEXT NOT NULL,
+    kind TEXT NOT NULL, origin TEXT NOT NULL, stage TEXT NOT NULL, occurred_at INTEGER NOT NULL, error TEXT
+);
+CREATE INDEX lifecycle_instance_events ON lifecycle_events(instance_id,seq);
+CREATE TRIGGER record_lifecycle_decision AFTER INSERT ON lifecycle_decisions BEGIN
+    INSERT INTO lifecycle_events(instance_id,decision_id,kind,origin,stage,occurred_at,error)
+    VALUES(NEW.instance_id,NEW.id,NEW.kind,NEW.origin,NEW.stage,NEW.created_at,NEW.error);
+END;
+CREATE TRIGGER record_lifecycle_progress AFTER UPDATE OF stage ON lifecycle_decisions WHEN NEW.stage<>OLD.stage BEGIN
+    INSERT INTO lifecycle_events(instance_id,decision_id,kind,origin,stage,occurred_at,error)
+    VALUES(NEW.instance_id,NEW.id,NEW.kind,NEW.origin,NEW.stage,coalesce(NEW.finished_at,unixepoch()*1000),NEW.error);
+END;

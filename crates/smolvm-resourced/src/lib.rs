@@ -47,6 +47,8 @@ mod network_catalog;
 pub mod network_client;
 #[cfg(target_os = "linux")]
 mod network_dns;
+#[cfg(target_os="linux")]
+mod conntrack;
 #[cfg(target_os = "linux")]
 mod network_lease_catalog;
 #[cfg(target_os = "linux")]

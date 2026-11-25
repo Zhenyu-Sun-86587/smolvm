@@ -55,6 +55,17 @@ enum Transport {
 }
 
 impl NetworkRuntime {
+    pub(crate) fn activity(&self,catalog:&Catalog,execution:&Execution)->Result<serde_json::Value> {
+        let op=catalog.operation(&execution.last_operation_id)?;
+        let plan=crate::managed::plan(catalog,&op)?.ok_or_else(||Fault::new("E_RESOURCE_UNAVAILABLE","no authoritative network inventory"))?;
+        if plan.machine.network.is_none(){return Ok(serde_json::json!({"inbound":0,"outbound":0}))}
+        let leases=catalog.tap_leases_for_execution(execution)?;
+        let [lease]=leases.as_slice() else {return Err(unknown_attachment())};
+        if lease.state!="attached" || lease.gate!="open" {return Err(unknown_attachment())}
+        let port=self.ports.get(&lease.attachment.attachment_id).ok_or_else(unknown_attachment)?;
+        let (incoming,outgoing)=port.activity(lease.attachment.private_ipv4).map_err(host_error)?;
+        Ok(serde_json::json!({"inbound":incoming,"outbound":outgoing}))
+    }
     pub(crate) fn query(catalog: &Catalog, request: &Request) -> Result<TapLease> {
         let data: PortId = request.payload()?;
         if !valid_id(&data.attachment_id) {

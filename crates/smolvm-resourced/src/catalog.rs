@@ -845,6 +845,8 @@ impl Catalog {
             [id],
         )?;
         crate::managed_fork::source_exited(&tx,id)?;
+        tx.execute("UPDATE lifecycle_protections SET state='released',reason='execution fenced',revision=revision+1
+            WHERE incarnation_id=? AND kind IN ('hold','lease') AND state IN ('suspect','active')",[id])?;
         tx.execute("UPDATE managed_budget_holds SET state='released' WHERE incarnation_id=? AND state='running'",[id])?;
         crate::escrow_catalog::release_execution(&tx, id)?;
         tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='managed_execution' AND owner_id=? AND state='active'",[id])?;

@@ -151,7 +151,7 @@ def partial_fork(endpoint, root, ref):
     print("One of two targets was killed before activation. Retry kept the successful execution and original capture, and advanced only the failed child's epoch.",flush=True)
 
 
-def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults):
+def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults, lifecycle):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
@@ -436,6 +436,10 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
                     if statepoint:fence_machine("partial-keep")
                 if statepoint:durable_points(endpoint,grand_ref,"grandchild",logfile)
             return
+        if lifecycle:
+            import managed_lifecycle_checks
+            managed_lifecycle_checks.verify(worker,bundle_id,endpoint,name,ref,rpc,http,EXT,until)
+            return
         if statepoint:
             durable_points(endpoint,ref,name,logs/(ref["incarnation_id"]+".log"))
             return
@@ -493,6 +497,7 @@ def main():
     parser.add_argument("--system-image",type=Path,help="managed Debian ext4 image containing the systemd Guest Agent service")
     parser.add_argument("--fork",action="store_true",help="fork a batch of two managed guests from one live capture")
     parser.add_argument("--product-volumes", action="store_true", help="open existing registered product disk heads")
+    parser.add_argument("--lifecycle",action="store_true",help="verify Worker idle policy, leases, two-stage sleep and coalesced wake")
     parser.add_argument("--statepoint",action="store_true",help="checkpoint the guest and hibernate from managed standby")
     parser.add_argument("--fork-faults",action="store_true",help="kill one unpublished target and retry it from the original capture")
     args=parser.parse_args()
@@ -502,13 +507,13 @@ def main():
         args_for_child=["unshare","--mount","--propagation","private","--net","--",sys.executable,__file__,"--bundle",str(args.bundle.resolve())]
         for flag,path in (("--guest",args.guest),("--system-image",args.system_image)):
             if path:args_for_child.extend([flag,str(path.resolve())])
-        for flag,enabled in (("--fork",args.fork),("--product-volumes",args.product_volumes),("--statepoint",args.statepoint),("--fork-faults",args.fork_faults)):
+        for flag,enabled in (("--lifecycle",args.lifecycle),("--fork",args.fork),("--product-volumes",args.product_volumes),("--statepoint",args.statepoint),("--fork-faults",args.fork_faults)):
             if enabled:args_for_child.append(flag)
         os.execvpe("unshare",args_for_child,{**os.environ,"SMOLVM_MANAGED_TEST_ISOLATED":"1"})
     with tempfile.TemporaryDirectory(dir="/var/tmp",prefix="smm-") as tmp:
         root=Path(tmp)
         root.chmod(0o755)
-        try: verify(args.bundle.resolve(),root,args.guest,args.system_image,args.fork,args.product_volumes,args.statepoint,args.fork_faults)
+        try: verify(args.bundle.resolve(),root,args.guest,args.system_image,args.fork,args.product_volumes,args.statepoint,args.fork_faults,args.lifecycle)
         except BaseException:
             for log in [root/"serve.log",root/"worker.log",*(root/"state/managed").glob("*.log")]:
                 if log.exists():print(f"{log.name}\n{log.read_text(errors='replace')[-7000:]}",file=sys.stderr)

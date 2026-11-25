@@ -297,6 +297,7 @@ fn finish(
             params![error, id],
         )?;
     }
+    if success {crate::lifecycle_controller::confirm_native(db,id,disposition)?;}
     if success && disposition == "STANDBY" {
         db.execute("INSERT INTO native_standby(incarnation_id,operation_id) SELECT incarnation_id,operation_id FROM native_transitions WHERE operation_id=?",[id])?;
     }
