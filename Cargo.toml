@@ -16,6 +16,7 @@ members = [
     "crates/smolvm-paths",
     "crates/smolvm-protocol",
     "crates/smolvm-runtime-protocol",
+    "crates/smolvm-identity-helper",
     "crates/smolvm-registry",
     "crates/smolvm-resourced",
     "crates/smolvm-s3fs",

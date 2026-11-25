@@ -18,6 +18,7 @@ PACKAGE_DB = "lib/apk/db/installed"
 CRANE = "usr/local/bin/crane"
 AGENT = "usr/local/bin/smolvm-agent"
 INIT = "sbin/init"
+IDENTITY_HELPER = "sbin/smolvm-identity-helper"
 REQUIRED_DIRS = {"usr", "usr/local", "usr/local/bin", "sbin"}
 SEED_DIGESTS = {"seed_sha256", "crun_build_sha256", "package_db_sha256", "crane_sha256"}
 
@@ -80,7 +81,7 @@ def verify_crun(seed, members, root, lock):
         raise ValueError("seed crun build does not match the pinned recipe, inputs and installed binary")
 
 
-def assemble(seed_path, agent, output, root, lock, timestamp):
+def assemble(seed_path, agent, helper, output, root, lock, timestamp):
     if file_digest(seed_path) != lock["seed_sha256"]:
         raise ValueError("OCI seed archive digest mismatch")
     with tarfile.open(seed_path, "r:gz") as seed:
@@ -91,7 +92,7 @@ def assemble(seed_path, agent, output, root, lock, timestamp):
                 raise ValueError(f"duplicate rootfs archive path {name}")
             if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
                 raise ValueError(f"unsupported rootfs archive entry at {name}")
-            if member.islnk() and archive_path(member.linkname) in {AGENT, INIT}:
+            if member.islnk() and archive_path(member.linkname) in {AGENT, INIT, IDENTITY_HELPER}:
                 raise ValueError(f"rootfs hardlink to overwritten content at {name}")
             members[name] = member
         for directory in REQUIRED_DIRS:
@@ -111,17 +112,18 @@ def assemble(seed_path, agent, output, root, lock, timestamp):
             with gzip.GzipFile(filename="", mode="wb", fileobj=stream, mtime=0) as compressed:
                 with tarfile.open(fileobj=compressed, mode="w|") as packed:
                     for name, member in members.items():
-                        if name in {AGENT, INIT}:
+                        if name in {AGENT, INIT, IDENTITY_HELPER}:
                             continue
                         if member.isfile():
                             with seed.extractfile(member) as content:
                                 packed.addfile(member, content)
                         else:
                             packed.addfile(member)
-                    entry = tarfile.TarInfo(AGENT)
-                    entry.mode, entry.size, entry.mtime = 0o755, agent.stat().st_size, timestamp
-                    with agent.open("rb") as content:
-                        packed.addfile(entry, content)
+                    for path, program in ((AGENT, agent), (IDENTITY_HELPER, helper)):
+                        entry = tarfile.TarInfo(path)
+                        entry.mode, entry.size, entry.mtime = 0o755, program.stat().st_size, timestamp
+                        with program.open("rb") as content:
+                            packed.addfile(entry, content)
                     link = tarfile.TarInfo(INIT)
                     link.type, link.linkname, link.mode, link.mtime = tarfile.SYMTYPE, "/" + AGENT, 0o777, timestamp
                     packed.addfile(link)
@@ -129,7 +131,7 @@ def assemble(seed_path, agent, output, root, lock, timestamp):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for option in ("source-root", "toolchain-lock", "input-lock", "seed", "agent", "output", "metadata"):
+    for option in ("source-root", "toolchain-lock", "input-lock", "seed", "agent", "identity-helper", "output", "metadata"):
         parser.add_argument(f"--{option}", type=Path, required=True)
     parser.add_argument("--timestamp", type=int, required=True)
     args = parser.parse_args()
@@ -142,13 +144,18 @@ def main():
         lock_digest = file_digest(lock_path)
         pin = {"repository": "smolvm", "path": args.input_lock.as_posix(), "sha256": lock_digest}
         toolchain = json.loads(args.toolchain_lock.read_text())
+        manifest = Path("crates/smolvm-identity-helper/Cargo.toml")
+        helper_pin = {"repository": "smolvm", "path": manifest.as_posix(), "sha256": file_digest(args.source_root / manifest)}
+        if helper_pin not in toolchain["lockfiles"]:
+            raise ValueError("runtime toolchain lock does not pin the identity helper manifest")
         if pin not in toolchain["lockfiles"]:
             raise ValueError("runtime toolchain lock does not pin the supplied OCI seed input lock")
-        assemble(args.seed, args.agent, args.output, args.source_root, lock, args.timestamp)
+        assemble(args.seed, args.agent, args.identity_helper, args.output, args.source_root, lock, args.timestamp)
         provenance = {key: lock[key] for key in SEED_DIGESTS}
-        provenance.update(schema="RuntimeRootfsProvenance/1", input_lock_path=args.input_lock.as_posix(),
+        provenance.update(schema="RuntimeRootfsProvenance/2", input_lock_path=args.input_lock.as_posix(),
                           input_lock_sha256=lock_digest, recipe_sha256=file_digest(args.source_root / RECIPE),
-                          agent_sha256=file_digest(args.agent), rootfs_sha256=file_digest(args.output))
+                          agent_sha256=file_digest(args.agent), identity_helper_sha256=file_digest(args.identity_helper),
+                          rootfs_sha256=file_digest(args.output))
         (args.metadata / "rootfs-input-lock.json").write_bytes(lock_path.read_bytes())
         (args.metadata / "rootfs-provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
     except (OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
