@@ -354,13 +354,15 @@ impl Catalog {
     }
 
     pub fn health(&self) -> Result<Value> {
+        let slice = crate::worker_scope::configured_slice()
+            .map_err(|error| Fault::invalid(error.to_string()))?;
         let (boot, session, recovering): (String, String, bool) = self.db.query_row(
             "SELECT host_boot_id,broker_session_id,recovering FROM worker_state",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         Ok(json!({"state":if recovering {"recovering"} else {"ready"},
-            "host_boot_id":boot, "broker_session_id":session,
+            "host_boot_id":boot, "broker_session_id":session, "vm_slice":slice,
             "writer_authority_supported":true, "writer_authority_mode":"managed_block_full_sync",
             "fd_transfer_supported":true, "fd_transfer_mode":"sealed_memfd"}))
     }

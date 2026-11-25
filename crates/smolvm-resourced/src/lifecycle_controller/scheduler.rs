@@ -4,7 +4,9 @@ use crate::catalog::Operation;
 use crate::native_control::Endpoint;
 
 #[derive(Default)]
-pub(crate) struct Controller;
+pub(crate) struct Controller {
+    cache_reclaim: pressure::CacheReclaim,
+}
 struct Machine {
     expected: Expected,
     bundle: String,
@@ -45,6 +47,74 @@ struct Observation {
     gate: Option<u32>,
     blockers: Vec<String>,
 }
+
+fn idle_deadlines(m: &Machine, observed: &Observation, since: i64) -> (Option<i64>, Option<i64>) {
+    if !observed.blockers.is_empty() || !matches!(observed.power.as_str(), "RUNNING" | "STANDBY") {
+        return (None, None);
+    }
+    let deadline = |seconds| (since + i64::from(seconds) * 1000).max(m.grace).max(m.next);
+    let standby = (m.policy.auto_standby && observed.power == "RUNNING")
+        .then(|| deadline(m.policy.standby_after_seconds));
+    let hibernate = m
+        .policy
+        .auto_hibernate
+        .then(|| deadline(m.policy.hibernate_after_seconds));
+    (standby, hibernate)
+}
+
+fn can_save(db: &Connection, expected: &Expected, unreserved_bytes: u64) -> Result<bool> {
+    let memory: Option<u32> = db
+        .query_row(
+            "SELECT memory_mib FROM managed_launches WHERE incarnation_id=?",
+            [&expected.incarnation_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(memory.is_some_and(|mib| {
+        unreserved_bytes
+            > u64::from(mib)
+                .saturating_mul(1 << 20)
+                .saturating_add(64 << 20)
+    }))
+}
+
+fn next_action(
+    c: &Catalog,
+    m: &Machine,
+    observed: &Observation,
+    now: i64,
+) -> Result<Option<Value>> {
+    if let Some(d) = pending(&c.db, &m.expected.instance_id)? {
+        return Ok(Some(
+            json!({"kind":d.kind,"origin":d.origin,"eligible_after_ms":0}),
+        ));
+    }
+    let (standby, hibernate) = idle_deadlines(m, observed, m.idle.unwrap_or(now));
+    let save_available = hibernate.is_some()
+        && can_save(
+            &c.db,
+            &m.expected,
+            crate::admission::unreserved_storage(&c.db)?,
+        )?;
+    let hibernate_due = hibernate.is_some_and(|deadline| deadline <= now);
+    let next = if hibernate_due {
+        hibernate
+            .filter(|_| save_available)
+            .map(|deadline| (deadline, "hibernate"))
+    } else {
+        [
+            standby.map(|deadline| (deadline, "standby")),
+            hibernate
+                .filter(|_| save_available)
+                .map(|deadline| (deadline, "hibernate")),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    };
+    Ok(next.map(|(deadline,kind)| json!({"kind":kind,"origin":"idle","eligible_after_ms":deadline.saturating_sub(now).max(0)})))
+}
+
 fn observe(c: &Catalog, m: &Machine, boot: &str, now: i64) -> Result<Observation> {
     let mut blockers = Vec::new();
     let id = &m.expected.instance_id;
@@ -132,6 +202,7 @@ pub(super) fn status(c: &Catalog, expected: &Expected) -> Result<Value> {
         c.db.query_row("SELECT host_boot_id FROM worker_state", [], |r| r.get(0))?;
     let now = monotonic()?;
     let o = observe(c, &m, &boot, now)?;
+    let next = next_action(c, &m, &o, now)?;
     let decision:Option<Value>=c.db.query_row("SELECT id,kind,origin,stage,error,start_memory,end_memory,created_at,finished_at FROM lifecycle_decisions
         WHERE instance_id=? ORDER BY rowid DESC LIMIT 1",[&expected.instance_id],|r|Ok(json!({"operation_id":r.get::<_,String>(0)?,"kind":r.get::<_,String>(1)?,
         "origin":r.get::<_,String>(2)?,"stage":r.get::<_,String>(3)?,"error":r.get::<_,Option<String>>(4)?,"start_worker_memory_bytes":r.get::<_,Option<i64>>(5)?,
@@ -152,7 +223,7 @@ pub(super) fn status(c: &Catalog, expected: &Expected) -> Result<Value> {
         json!({"collectors":collectors,"instance_id":expected.instance_id,"incarnation_id":expected.incarnation_id,"execution_epoch":expected.execution_epoch,
         "binding_revision":protections::revision(expected)?,"power":o.power,"statepoint":m.saved(&c.db)?,"applied_revision":m.rev,"effective_policy":m.policy,"activity_seq":m.seq,
         "blockers":o.blockers,"controlled_suspended":o.gate.is_some() && o.gate==m.freeze_session && m.freeze==Some(m.seq),"idle_ms":m.idle.map(|v|now.saturating_sub(v)),
-        "last_decision":decision,"pressure":pressure.map(|(held,raw)|json!({"admission_throttled":held,"sample":serde_json::from_str::<Value>(&raw).ok()}))}),
+        "last_decision":decision,"next_action":next,"pressure":pressure.map(|(held,raw)|json!({"admission_throttled":held,"sample":serde_json::from_str::<Value>(&raw).ok()}))}),
     )
 }
 struct Decision {
@@ -311,7 +382,9 @@ fn step(
             && (m.seq != d.seq
                 || !obs.blockers.is_empty()
                 || !matches!(obs.power.as_str(), "RUNNING" | "STANDBY")
-                || d.origin == "pressure" && !p.eligible));
+                || d.origin == "pressure" && !p.eligible
+                || d.kind == "hibernate"
+                    && !can_save(&c.db, &m.expected, p.sample.disk_available)?));
     if invalidated {
         c.db.execute("UPDATE lifecycle_decisions SET stage='cancelled',finished_at=?,error='evidence changed before dispatch' WHERE id=?",params![wall()?,d.id])?;
         c.db.execute("UPDATE lifecycle_protections SET wake_operation=NULL,revision=revision+1 WHERE wake_operation=? AND kind='wake' AND state='pending'",[&d.id])?;
@@ -392,7 +465,7 @@ fn attach_more(db: &Connection, machine: &str, op: &str) -> Result<()> {
 impl Controller {
     pub(crate) fn tick(&mut self, c: &mut Catalog, boot: &str) -> Result<()> {
         protections::expire(&c.db)?;
-        let p = pressure::refresh(&c.db)?;
+        let p = pressure::refresh(&c.db, &mut self.cache_reclaim)?;
         let ids = {
             let mut q=c.db.prepare("SELECT instance_id FROM lifecycle_policies ORDER BY json_extract(policy_json,'$.reclaim_priority'),idle_since,instance_id")?;
             let rows = q
@@ -478,26 +551,15 @@ impl Controller {
             return Ok(());
         }
         let idle_ms = now.saturating_sub(since);
+        let (standby, hibernate) = idle_deadlines(&m, &obs, since);
         let pressure = p.eligible
             && !*pressure_inflight
             && m.policy.pressure_reclaim == "idle_only"
             && idle_ms >= 1_000;
         if m.policy.auto_hibernate
-            && (idle_ms >= i64::from(m.policy.hibernate_after_seconds) * 1000 || pressure)
+            && (hibernate.is_some_and(|deadline| deadline <= now) || pressure)
         {
-            let memory: Option<u32> =
-                c.db.query_row(
-                    "SELECT memory_mib FROM managed_launches WHERE incarnation_id=?",
-                    [&m.expected.incarnation_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if memory.is_some_and(|mib| {
-                p.sample.disk_available
-                    > u64::from(mib)
-                        .saturating_mul(1 << 20)
-                        .saturating_add(64 << 20)
-            }) {
+            if can_save(&c.db, &m.expected, p.sample.disk_available)? {
                 record(
                     c,
                     &m,
@@ -508,10 +570,7 @@ impl Controller {
                 )?;
                 *pressure_inflight |= pressure;
             }
-        } else if m.policy.auto_standby
-            && obs.power == "RUNNING"
-            && idle_ms >= i64::from(m.policy.standby_after_seconds) * 1000
-        {
+        } else if standby.is_some_and(|deadline| deadline <= now) {
             record(c, &m, "standby", "idle", &obs, p.sample.slice_current)?;
         }
         Ok(())

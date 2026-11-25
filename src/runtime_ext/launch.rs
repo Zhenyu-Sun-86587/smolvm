@@ -22,6 +22,7 @@ fn failed(error: impl ToString) -> Error {
 }
 /// Enroll future named machine launches with this private Serve's Worker.
 pub fn configure_native_launch_worker(socket: &Path) -> Result<()> {
+    smolvm_resourced::client::verify_worker_slice(socket).map_err(failed)?;
     if WORKER.get_or_init(|| socket.to_owned()) != socket {
         return Err(failed("this Serve already uses another Worker"));
     }

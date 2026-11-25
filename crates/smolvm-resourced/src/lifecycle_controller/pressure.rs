@@ -1,17 +1,19 @@
 //! Worker-scoped sampling and bounded cache reclaim. Reads kernel aggregate
 //! counters once per sample so shared RAM is counted by its owning cgroup.
 use super::*;
-use std::{fs, path::Path, thread};
-const SLICE: &str = "/sys/fs/cgroup/smolvmdeep.slice";
+use std::{fs, io, path::Path, thread};
 const MIB: u64 = 1 << 20;
 
 #[derive(serde::Serialize, Deserialize)]
 pub(super) struct Sample {
     pub headroom_bytes: u64,
+    slice_name: String,
     pub slice_current: Option<u64>,
     slice_max: Option<u64>,
     memory_psi: Option<f64>,
     io_psi: Option<f64>,
+    slice_memory_psi: Option<f64>,
+    slice_io_psi: Option<f64>,
     memory_events: Option<String>,
     pub disk_available: u64,
 }
@@ -25,14 +27,10 @@ fn configure(name: &str, default: u64) -> Result<u64> {
         Err(e) => Err(invalid(e)),
     }
 }
-fn usage(name: &str) -> Option<u64> {
-    fs::read_to_string(Path::new(SLICE).join(name))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+fn usage(path: &Path) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
 }
-fn psi(path: &str) -> Option<f64> {
+fn psi(path: &Path) -> Option<f64> {
     let raw = fs::read_to_string(path).ok()?;
     raw.lines()
         .find(|line| line.starts_with("some "))?
@@ -50,18 +48,24 @@ fn measure(db: &Connection) -> Result<Sample> {
         .and_then(|v| v.parse::<u64>().ok())
         .ok_or_else(|| invalid("Worker memory headroom is unavailable"))?
         .saturating_mul(1024);
-    let current = usage("memory.current");
-    let max = usage("memory.max");
+    let group = crate::worker_scope::cgroup().map_err(invalid)?;
+    let current = usage(&group.join("memory.current"));
+    let max = usage(&group.join("memory.max"));
     let storage = crate::admission::unreserved_storage(db)?;
     Ok(Sample {
         headroom_bytes: current.zip(max).map_or(available, |(used, limit)| {
             available.min(limit.saturating_sub(used))
         }),
+        slice_name: crate::worker_scope::configured_slice()
+            .map_err(invalid)?
+            .into(),
         slice_current: current,
         slice_max: max,
-        memory_psi: psi("/proc/pressure/memory"),
-        io_psi: psi("/proc/pressure/io"),
-        memory_events: fs::read_to_string(Path::new(SLICE).join("memory.events")).ok(),
+        memory_psi: psi(Path::new("/proc/pressure/memory")),
+        io_psi: psi(Path::new("/proc/pressure/io")),
+        slice_memory_psi: psi(&group.join("memory.pressure")),
+        slice_io_psi: psi(&group.join("io.pressure")),
+        memory_events: fs::read_to_string(group.join("memory.events")).ok(),
         disk_available: storage,
     })
 }
@@ -69,7 +73,16 @@ pub(super) struct Pressure {
     pub eligible: bool,
     pub sample: Sample,
 }
-pub(super) fn refresh(db: &Connection) -> Result<Pressure> {
+pub(super) type CacheReclaim = Option<thread::JoinHandle<io::Result<()>>>;
+
+pub(super) fn refresh(db: &Connection, cache: &mut CacheReclaim) -> Result<Pressure> {
+    if cache.as_ref().is_some_and(|reclaim| reclaim.is_finished()) {
+        match cache.take().expect("finished cache reclaim").join() {
+            Ok(Ok(())) => (),
+            Ok(Err(error)) => eprintln!("Worker bounded cache reclaim: {error}"),
+            Err(_) => eprintln!("Worker bounded cache reclaim thread exited unexpectedly"),
+        }
+    }
     let sample = measure(db)?;
     let enter = configure("SMOLVM_WORKER_PRESSURE_HIGH_HEADROOM_MIB", 256)?.saturating_mul(MIB);
     let leave = configure("SMOLVM_WORKER_PRESSURE_LOW_HEADROOM_MIB", 512)?.saturating_mul(MIB);
@@ -85,11 +98,17 @@ pub(super) fn refresh(db: &Connection) -> Result<Pressure> {
         )
         .optional()?
         .unwrap_or((false, 0, None));
-    let high = sample.headroom_bytes <= enter || sample.memory_psi.is_some_and(|v| v >= max_psi);
+    let memory_psi = [sample.memory_psi, sample.slice_memory_psi]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max);
+    let io_psi = [sample.io_psi, sample.slice_io_psi]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max);
+    let high = sample.headroom_bytes <= enter || memory_psi.is_some_and(|v| v >= max_psi);
     let throttled = high
-        || old
-            && (sample.headroom_bytes < leave
-                || sample.memory_psi.is_some_and(|v| v > max_psi / 2.0));
+        || old && (sample.headroom_bytes < leave || memory_psi.is_some_and(|v| v > max_psi / 2.0));
     let now = monotonic()?;
     let since = if old != throttled || changed == 0 {
         now
@@ -97,26 +116,30 @@ pub(super) fn refresh(db: &Connection) -> Result<Pressure> {
         changed
     };
     let mut reclaimed = if old != throttled { None } else { last };
-    if throttled && reclaimed.is_none_or(|v| now.saturating_sub(v) > 60_000) {
+    if throttled && cache.is_none() && reclaimed.is_none_or(|v| now.saturating_sub(v) > 60_000) {
         let bytes = configure("SMOLVM_WORKER_CACHE_RECLAIM_MIB", 32)?.min(128) * MIB;
         if bytes > 0 {
-            thread::spawn(move || {
-                let _ = fs::write(Path::new(SLICE).join("memory.reclaim"), bytes.to_string());
-            });
+            let path = crate::worker_scope::cgroup()
+                .map_err(invalid)?
+                .join("memory.reclaim");
+            *cache = Some(
+                thread::Builder::new()
+                    .name("worker-cache-reclaim".into())
+                    .spawn(move || fs::write(path, bytes.to_string()))
+                    .map_err(invalid)?,
+            );
         }
         reclaimed = Some(now);
     }
     let eligible = throttled
         && now.saturating_sub(since) >= 5_000
-        && sample.io_psi.is_none_or(|v| v < 70.0)
+        && cache.is_none()
+        && io_psi.is_none_or(|v| v < 70.0)
         && reclaimed.is_some_and(|v| now > v + 1000);
     db.execute("INSERT INTO lifecycle_pressure VALUES(1,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET throttled=excluded.throttled,
         sample_json=excluded.sample_json,changed_at=excluded.changed_at,reclaimed_at=excluded.reclaimed_at",
         params![throttled,serde_json::to_string(&sample).map_err(invalid)?,since,reclaimed])?;
-    Ok(Pressure {
-        eligible,
-        sample,
-    })
+    Ok(Pressure { eligible, sample })
 }
 pub(crate) fn check_admission(tx: &Transaction<'_>, requested_mib: u64) -> Result<()> {
     // Sample as part of admission as well. A burst cannot consume the reserve

@@ -17,6 +17,8 @@ mod catalog;
 #[cfg(target_os = "linux")]
 pub mod client;
 #[cfg(target_os = "linux")]
+pub mod worker_scope;
+#[cfg(target_os = "linux")]
 mod escrow;
 #[cfg(target_os = "linux")]
 mod escrow_catalog;
