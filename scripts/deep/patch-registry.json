@@ -1,0 +1,306 @@
+{
+  "schema": "DeepPatchRegistry/1",
+  "upstream_bases": {
+    "smolvm": "5bd7c2f8e8e2d29869226a91f766bf4147b5e693",
+    "libkrun": "36b0846191bf8dbfc044c98cf43922c2f1f221e4",
+    "libkrunfw": "168e68a068c43a0fd48b71d1f52ca0081d079803"
+  },
+  "patches": [
+    {
+      "id": "guest-freezer",
+      "purpose": "Park guest tasks behind the measured kernel gate",
+      "commits": {
+        "libkrunfw": [
+          "3fe3c83d984e0ca272d55c7a7ff8c554594f93fe",
+          "2bf28bc686074f0b216f5fc7524655a6dc69d676",
+          "03310bd645321856df9842297f8c7613fbd10d6b",
+          "083867bc7a327fc2146e0593e2978f5d09dee9a7"
+        ],
+        "libkrun": [
+          "a4aa2ec62219353852ad6333367d16a661521154"
+        ],
+        "smolvm": [
+          "034bad332d92a2aba16a636e0a773932486e0a54"
+        ]
+      },
+      "depends_on": [],
+      "hooks": [
+        "crates/smolvm-identity-helper",
+        "src/devices/src/virtio"
+      ],
+      "profiles": [
+        "oci-v1",
+        "system-debian-v1"
+      ],
+      "gates": [
+        "A06",
+        "A07",
+        "A08",
+        "A14",
+        "A15"
+      ],
+      "replacement_condition": "Verify equivalent contracts and run the listed gates against the candidate and the retained reader corpus.",
+      "removal": "Drop the replaced commits in a candidate branch and keep installed readers for referenced captures."
+    },
+    {
+      "id": "held-block-cut",
+      "purpose": "Fence the source and preserve all writable disk generations",
+      "commits": {
+        "libkrun": [
+          "ce28dd6b8315678550eb1613da42dacd69990731",
+          "40b4d644acd43538f474fd769413492328844d02",
+          "2e6a05c868ce597388cac310c2ce3e6299978adb",
+          "bcb09dcd2e69da1ce6b4a5c7da7b3978a3cc2c13"
+        ],
+        "smolvm": [
+          "180c40a51b14e2c11776095e0ccff24c098a15b8",
+          "92629a6931d01bc7d0f49981bd84af585cb79f43",
+          "d99d0690292daaf5ea75779b9b7e3694aac8fbee"
+        ]
+      },
+      "depends_on": [
+        "guest-freezer"
+      ],
+      "hooks": [
+        "src/vmm/src",
+        "src/devices/src/virtio/block",
+        "crates/smolvm-resourced"
+      ],
+      "profiles": [
+        "oci-v1",
+        "system-debian-v1"
+      ],
+      "gates": [
+        "A06",
+        "A09",
+        "A10",
+        "A11",
+        "A12"
+      ],
+      "replacement_condition": "Verify equivalent contracts and run the listed gates against the candidate and the retained reader corpus.",
+      "removal": "Drop the replaced commits in a candidate branch and keep installed readers for referenced captures."
+    },
+    {
+      "id": "isolated-runtime",
+      "purpose": "Separate native execution authority, routes and service lifecycle",
+      "commits": {
+        "smolvm": [
+          "e896c37f43a294ddcb235aa7a527e4b7ff6c734c",
+          "63d92cfbf7725ad269e721469a6f6698df80c9da",
+          "731ac65325be79fffe78a13a1b07dc26c6c248cc"
+        ]
+      },
+      "depends_on": [],
+      "hooks": [
+        "src/process.rs",
+        "src/api",
+        "crates/smolvm-resourced"
+      ],
+      "profiles": [
+        "oci-v1",
+        "system-debian-v1"
+      ],
+      "gates": [
+        "A04",
+        "A05",
+        "A19",
+        "A20",
+        "A25"
+      ],
+      "replacement_condition": "Verify equivalent contracts and run the listed gates against the candidate and the retained reader corpus.",
+      "removal": "Drop the replaced commits in a candidate branch and keep installed readers for referenced captures."
+    },
+    {
+      "id": "managed-statepoints",
+      "purpose": "Restore an exact source cut from a retained RAM and disk closure",
+      "commits": {
+        "libkrun": [
+          "ebe8feca1a48353ac2140fee2d2e59760b69443c",
+          "70525823fc65bd657af5ce33ff12da2c5d97fd99",
+          "4ea0ff4174e5ecabea82a6a20bb51649f80b7209",
+          "fb04f22558304c6625d5144e8a053d7244ff8b26",
+          "c6c81d149f83b5f5853556a5b20561bc89486bd1"
+        ],
+        "smolvm": [
+          "c940b2b2b4f5034ec88e05609c3e19f02201dca6",
+          "d3f96bcb3b1a5f8fbd43775265336f032b9cc672",
+          "f67d23205f70c1a633b7683470c9c636cfb5d394"
+        ]
+      },
+      "depends_on": [
+        "held-block-cut",
+        "isolated-runtime"
+      ],
+      "hooks": [
+        "src/vmm/src",
+        "crates/smolvm-resourced"
+      ],
+      "profiles": [
+        "oci-v1",
+        "system-debian-v1"
+      ],
+      "gates": [
+        "A02",
+        "A03",
+        "A07",
+        "A09",
+        "A11",
+        "A19"
+      ],
+      "replacement_condition": "Verify equivalent contracts and run the listed gates against the candidate and the retained reader corpus.",
+      "removal": "Drop the replaced commits in a candidate branch and keep installed readers for referenced captures."
+    },
+    {
+      "id": "target-identity",
+      "purpose": "Keep each live fork target private until its execution and identity are committed",
+      "commits": {
+        "libkrun": [
+          "285fd5de31e9cda0df85c967026870b40a85807f",
+          "5759ea84e8e3db265a6887a1e7ee784e2a16efe5"
+        ],
+        "smolvm": [
+          "41b0179913388cad676b31b453d5921fe532dd28",
+          "eae995d491f56fd27dd9bc51ef88fe59cea524a5",
+          "ea1be886a2d980b99b8203dcbc1d4d7d046177e5",
+          "37805f09c8a3c2643f9cb66d5d857d6f3b157da4",
+          "0efc6e2932effc2c90f8013139aa837b42daff0b",
+          "d3fd761b3806c8107d3c1508149dab872dc34769"
+        ]
+      },
+      "depends_on": [
+        "managed-statepoints"
+      ],
+      "hooks": [
+        "src/vmm/src",
+        "crates/smolvm-identity-helper",
+        "crates/smolvm-resourced"
+      ],
+      "profiles": [
+        "oci-v1",
+        "system-debian-v1"
+      ],
+      "gates": [
+        "A01",
+        "A03",
+        "A13",
+        "A14",
+        "A16",
+        "A18"
+      ],
+      "replacement_condition": "Verify equivalent contracts and run the listed gates against the candidate and the retained reader corpus.",
+      "removal": "Drop the replaced commits in a candidate branch and keep installed readers for referenced captures."
+    },
+    {
+      "id": "managed-networks",
+      "purpose": "Allocate and authorize Worker TAP networking and recover attached identities",
+      "commits": {
+        "libkrun": [
+          "b962522c04573c6b2e44ba6c175f4e92ce00ceb4",
+          "fcca08273a70b95b3f23b41565358ea80550067d"
+        ],
+        "smolvm": [
+          "e4efd5c09fe82de5c3dd3a4a2e9a6e319c9ad117",
+          "722fa2ca931f840adb0092af1106db375bb432a1",
+          "8adb867484a473b75a988077fd3a9e0a1c1cca36",
+          "4dd58b7320a927eec8eee31e69f86eb8c99b6c45",
+          "90143a7a1e29fb9f753ad473e6e04634f7f2e16e"
+        ]
+      },
+      "depends_on": [
+        "isolated-runtime"
+      ],
+      "hooks": [
+        "src/devices/src/virtio/net",
+        "crates/smolvm-network",
+        "crates/smolvm-resourced"
+      ],
+      "profiles": [
+        "oci-v1",
+        "system-debian-v1"
+      ],
+      "gates": [
+        "A13",
+        "A14",
+        "A20",
+        "A21"
+      ],
+      "replacement_condition": "Verify equivalent contracts and run the listed gates against the candidate and the retained reader corpus.",
+      "removal": "Drop the replaced commits in a candidate branch and keep installed readers for referenced captures."
+    },
+    {
+      "id": "managed-guest",
+      "purpose": "Launch managed OCI and System workloads with the current volume lease",
+      "commits": {
+        "smolvm": [
+          "2a1d53816514f1fe09f49c263e3e1a24724730cb",
+          "74b95b3bf4c9d725433e3587ed3d833222cc7882",
+          "84c1717ce51f21a61321e2e9473cc2fa701930a2",
+          "d567794d72b76441c688acac4fe4de43352df47e"
+        ],
+        "libkrun": [
+          "c0f17a0f15bb0a201538358282f047b7f841b841"
+        ]
+      },
+      "depends_on": [
+        "held-block-cut",
+        "managed-networks",
+        "target-identity"
+      ],
+      "hooks": [
+        "src/api",
+        "src/vmm/src",
+        "crates/smolvm-resourced",
+        "crates/smolvm-agent"
+      ],
+      "profiles": [
+        "oci-v1",
+        "system-debian-v1"
+      ],
+      "gates": [
+        "A10",
+        "A12",
+        "A17",
+        "A20",
+        "A21"
+      ],
+      "replacement_condition": "Verify equivalent contracts and run the listed gates against the candidate and the retained reader corpus.",
+      "removal": "Drop the replaced commits in a candidate branch and keep installed readers for referenced captures."
+    },
+    {
+      "id": "native-standby",
+      "purpose": "Park and wake the same registered execution under the Guest freezer",
+      "commits": {
+        "libkrun": [
+          "f4a3c926e8a564d0f1368971019fc4bada22ef80",
+          "2f24a86e1c0ea6f40ccaf7bb56d527183ebb593b",
+          "5281c0399da1789bc5a6dfe650d5b63ab7b1f665"
+        ],
+        "smolvm": [
+          "e860768f837e40b996ae5efdd18d98f08cccc9fd",
+          "0d2931ff5b21016ea6de6378a2c882c5c33cb742"
+        ]
+      },
+      "depends_on": [
+        "guest-freezer",
+        "isolated-runtime"
+      ],
+      "hooks": [
+        "src/vmm/src",
+        "crates/smolvm-resourced"
+      ],
+      "profiles": [
+        "oci-v1",
+        "system-debian-v1"
+      ],
+      "gates": [
+        "A06",
+        "A08",
+        "A15",
+        "A28",
+        "A32"
+      ],
+      "replacement_condition": "Verify equivalent contracts and run the listed gates against the candidate and the retained reader corpus.",
+      "removal": "Drop the replaced commits in a candidate branch and keep installed readers for referenced captures."
+    }
+  ]
+}
