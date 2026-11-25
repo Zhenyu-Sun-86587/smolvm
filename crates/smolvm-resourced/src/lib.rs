@@ -1,6 +1,12 @@
 //! Local worker resource service and Linux control client.
 
 #[cfg(target_os = "linux")]
+mod activation_authority;
+#[cfg(target_os = "linux")]
+mod activation_catalog;
+#[cfg(target_os = "linux")]
+mod activation_runtime;
+#[cfg(target_os = "linux")]
 mod blocks;
 #[cfg(target_os = "linux")]
 mod catalog;

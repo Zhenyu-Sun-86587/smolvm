@@ -1,3 +1,4 @@
+use crate::activation_catalog::NetworkBinding;
 use crate::catalog::{Catalog, Execution};
 use crate::ipc::{valid_id, Fault, Request, Result};
 use crate::network::topology::{AttachmentMode, PortPolicy, PrivateRouter, QuarantinedPort};
@@ -39,12 +40,26 @@ struct Acknowledge {
 impl NetworkRuntime {
     pub(crate) fn query(catalog: &Catalog, request: &Request) -> Result<TapLease> {
         let data: PortId = request.payload()?;
-        let reservation = catalog.scoped_network_reservation(request, &data.attachment_id)?;
+        if !valid_id(&data.attachment_id) {
+            return Err(Fault::invalid("invalid network attachment ID"));
+        }
+        let operation = catalog.matching_operation(request)?;
+        let (_, _, expected) = request.scope()?;
         let lease = catalog.tap_lease(&data.attachment_id)?;
-        if lease.operation_id != reservation.operation_id {
+        if lease.operation_id != operation.operation_id {
             return Err(Fault::new(
                 "E_NOT_FOUND",
                 "TAP lease not found within the operation",
+            ));
+        }
+        let matches_intent = expected.incarnation_id == operation.expected_incarnation_id
+            && expected.execution_epoch == operation.expected_execution_epoch;
+        let matches_lease = expected.incarnation_id == lease.incarnation_id
+            && Some(expected.execution_epoch) == lease.execution_epoch;
+        if !matches_intent && !matches_lease {
+            return Err(Fault::new(
+                "E_STALE_EXECUTION",
+                "network attachment query has a different expected execution",
             ));
         }
         Ok(lease)
@@ -54,7 +69,7 @@ impl NetworkRuntime {
         catalog.ready()?;
         let data: Prepare = request.payload()?;
         let operation = catalog.active_operation(request)?;
-        if operation.kind != "launch" {
+        if !operation.launches_execution() {
             return Err(Fault::invalid(
                 "TAP preparation requires the reserving launch operation",
             ));
@@ -145,7 +160,8 @@ impl NetworkRuntime {
         execution: &Execution,
     ) -> Result<(TapLease, OwnedFd)> {
         let operation = catalog.active_operation(request)?;
-        if operation.operation_id != execution.last_operation_id || operation.kind != "launch" {
+        if operation.operation_id != execution.last_operation_id || !operation.launches_execution()
+        {
             return Err(Fault::new(
                 "E_STALE_EXECUTION",
                 "network lease does not belong to this launch",
@@ -185,6 +201,30 @@ impl NetworkRuntime {
             &data.lease_id,
             data.expected_revision,
         )
+    }
+
+    pub(crate) fn target_port(&self, binding: &NetworkBinding) -> Result<&QuarantinedPort> {
+        self.ports
+            .get(&binding.target.attachment.attachment_id)
+            .ok_or_else(unknown_attachment)
+    }
+
+    pub(crate) fn arm_target(&self, binding: &NetworkBinding) -> Result<()> {
+        self.target_port(binding)?
+            .arm_identity()
+            .map_err(host_error)
+    }
+
+    pub(crate) fn publish_target(&self, binding: &NetworkBinding) -> Result<()> {
+        self.target_port(binding)?
+            .publish_identity()
+            .map_err(host_error)
+    }
+
+    pub(crate) fn close_target(&self, binding: &NetworkBinding) -> Result<()> {
+        self.target_port(binding)?
+            .close_identity()
+            .map_err(host_error)
     }
 
     pub(crate) fn fence(&mut self, catalog: &Catalog, request: &Request) -> Result<()> {

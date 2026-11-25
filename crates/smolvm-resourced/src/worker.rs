@@ -1,3 +1,4 @@
+use crate::activation_runtime::{self, ActivationRuntime};
 use crate::catalog::{Catalog, Execution, NewExecution, VolumeHead};
 use crate::escrow::Escrow;
 use crate::grants::{fence_unproven, prove_live_ofd, GrantRequest};
@@ -156,6 +157,7 @@ struct Worker {
     reserved: HashMap<String, Vec<File>>,
     escrow: Escrow,
     network: crate::network_runtime::NetworkRuntime,
+    activation: ActivationRuntime,
 }
 
 struct Reply {
@@ -371,6 +373,21 @@ impl Worker {
                     descriptors,
                 )
             }
+            "AcquireTargetAuthority" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                let (record, descriptor) =
+                    self.activation.offer(&self.catalog, &execution, request)?;
+                return Ok(Reply {
+                    table: vec![ipc::FdEntry {
+                        index: 0,
+                        resource_id: execution.incarnation_id,
+                        role: "target_authority".to_owned(),
+                    }],
+                    result: json!(record),
+                    descriptors: vec![descriptor],
+                    delivered: None,
+                });
+            }
             "AcquireNetworkAttachment" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 let (lease, fd) = self
@@ -539,6 +556,47 @@ impl Worker {
             "ReleaseNetworkReservation" => Ok(json!(self
                 .catalog
                 .release_network_reservation(request, &request.payload()?)?)),
+            "QueryTargetActivation" => {
+                let execution = self.scoped_execution(request)?;
+                Ok(json!(activation_runtime::receipt(
+                    &self.catalog,
+                    &execution,
+                    request
+                )?))
+            }
+            "PrepareTargetActivation"
+            | "BeginTargetIdentity"
+            | "PollTargetIdentity"
+            | "CommitActivation" => {
+                let execution = self.scoped_execution(request)?;
+                self.verify_live_execution(&execution)?;
+                let record = match request.method.as_str() {
+                    "PrepareTargetActivation" => {
+                        self.activation
+                            .prepare(&self.catalog, &execution, request)?
+                    }
+                    "BeginTargetIdentity" => {
+                        self.activation.begin(&self.catalog, &execution, request)?
+                    }
+                    "PollTargetIdentity" => self.activation.poll(
+                        &self.catalog,
+                        &self.network,
+                        &execution,
+                        request,
+                        || self.verify_live_execution(&execution),
+                    )?,
+                    "CommitActivation" => self.activation.commit(
+                        &self.catalog,
+                        &self.network,
+                        &execution,
+                        request,
+                        || self.verify_live_execution(&execution),
+                    )?,
+                    _ => unreachable!(),
+                };
+                self.verify_live_execution(&execution)?;
+                Ok(json!(record))
+            }
             "PrepareNetworkAttachment" => self
                 .network
                 .prepare(&self.catalog, request)
@@ -569,6 +627,7 @@ impl Worker {
                     data.kind.as_str(),
                     "catalog"
                         | "launch"
+                        | "restore_target"
                         | "writer_reservation"
                         | "generation"
                         | "resource_lease"
@@ -716,7 +775,7 @@ impl Worker {
     fn issue_permit(&mut self, r: &Request) -> Result<Value> {
         let (_, bundle, expected) = r.scope()?;
         let op = self.catalog.matching_operation(r)?;
-        if op.kind != "launch" {
+        if !op.launches_execution() {
             return Err(Fault::invalid("launch permits require a launch operation"));
         }
         self.catalog.verify_launch(&op, expected)?;
@@ -853,17 +912,24 @@ impl Worker {
                 "descriptor operation requires the recorded execution peer",
             ));
         }
+        self.verify_live_execution(&execution)?;
+        Ok(execution)
+    }
+
+    fn verify_live_execution(&self, execution: &Execution) -> Result<()> {
+        if execution.phase != "registered" || execution.host_boot_id != self.boot {
+            return Err(stale_execution());
+        }
         let pidfd = self
             .executions
             .get(&execution.incarnation_id)
             .ok_or_else(stale_execution)?;
         verify_executable(
-            peer.pid,
+            execution.pid,
             execution.pid_start_time,
             pidfd,
             &self.catalog.bundle(&execution.bundle_digest)?,
-        )?;
-        Ok(execution)
+        )
     }
 
     fn reconcile_execution(&mut self, r: &Request, peer: libc::ucred) -> Result<Value> {
@@ -947,6 +1013,7 @@ impl Worker {
         let result = self.catalog.finalize_execution(&execution)?;
         self.executions.remove(&execution.incarnation_id);
         self.escrow.forget_execution(&execution.incarnation_id);
+        self.activation.forget(&execution);
         Ok(json!(result))
     }
 
@@ -1308,6 +1375,7 @@ fn serve(
         reserved: HashMap::new(),
         escrow: Escrow::default(),
         network: crate::network_runtime::NetworkRuntime::default(),
+        activation: ActivationRuntime::default(),
     };
 
     let socket = ipc::new_socket()?;

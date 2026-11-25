@@ -45,6 +45,12 @@ fn operation_row(row: &Row<'_>) -> rusqlite::Result<Operation> {
     })
 }
 
+impl Operation {
+    pub(crate) fn launches_execution(&self) -> bool {
+        matches!(self.kind.as_str(), "launch" | "restore_target")
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Execution {
     pub incarnation_id: String,
@@ -215,9 +221,10 @@ impl Catalog {
                 crate::network_catalog::install(&tx)?;
                 tx.execute_batch(include_str!("schema_writer_pivots.sql"))?;
                 crate::network_lease_catalog::install(&tx)?;
-                tx.execute_batch("PRAGMA user_version=6")?;
+                crate::activation_catalog::install(&tx)?;
+                tx.execute_batch("PRAGMA user_version=7")?;
             }
-            1..=6 => {
+            1..=7 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -232,9 +239,13 @@ impl Catalog {
                 }
                 if version < 6 {
                     crate::network_lease_catalog::install(&tx)?;
-                    tx.execute_batch("PRAGMA user_version=6")?;
+                }
+                if version < 7 {
+                    crate::activation_catalog::install(&tx)?;
+                    tx.execute_batch("PRAGMA user_version=7")?;
                 }
                 crate::network_lease_catalog::recover(&tx)?;
+                crate::activation_catalog::recover(&tx)?;
                 let old_boot: String =
                     tx.query_row("SELECT host_boot_id FROM worker_state", [], |r| r.get(0))?;
                 tx.execute(
@@ -465,7 +476,7 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !abort && operation.kind == "launch" {
+        if !abort && operation.launches_execution() {
             let registered: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM executions WHERE last_operation_id=?)",
                 [id],
@@ -478,17 +489,33 @@ impl Catalog {
                 ));
             }
         }
+        if operation.kind == "restore_target" {
+            let finalized: bool = tx.query_row(
+                "SELECT CASE WHEN ?1 THEN NOT EXISTS (
+                    SELECT 1 FROM target_activations WHERE operation_id=?2 AND decision='commit'
+                ) ELSE EXISTS (
+                    SELECT 1 FROM target_activations WHERE operation_id=?2 AND phase='released' AND decision='commit'
+                ) END",
+                params![abort, id], |r| r.get(0),
+            )?;
+            if !finalized {
+                return Err(conflict(
+                    "E_FENCE_UNPROVEN",
+                    "restore target activation has no compatible final decision",
+                ));
+            }
+        }
         let occupied: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM writer_reservations r LEFT JOIN writer_grants g USING(operation_id)
                 WHERE r.operation_id=? AND (? OR g.grant_id IS NULL OR g.state!='attached'))
-             OR (? AND EXISTS (SELECT 1 FROM executions WHERE last_operation_id=?))
+             OR (? AND EXISTS (SELECT 1 FROM executions WHERE last_operation_id=? AND (? OR phase<>'exited')))
              OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='operation' AND owner_id=? AND state='active')
              OR EXISTS (SELECT 1 FROM fd_transfers WHERE operation_id=? AND state='staging')
              OR EXISTS (SELECT 1 FROM fd_leases WHERE operation_id=? AND state='pending')
              OR EXISTS (SELECT 1 FROM managed_blocks WHERE operation_id=? AND backing_identity IS NULL)
              OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='block_seal' AND owner_id=? AND state='active')
              OR EXISTS (SELECT 1 FROM writer_pivots WHERE operation_id=? AND state NOT IN ('complete','aborted'))",
-            params![id, abort, abort, id, id, id, id, id, id, id], |r| r.get(0))?;
+            params![id, abort, abort, id, operation.kind != "restore_target", id, id, id, id, id, id], |r| r.get(0))?;
         if occupied {
             return Err(conflict(
                 "E_OPERATION_HAS_EFFECTS",
@@ -621,6 +648,7 @@ impl Catalog {
             [id],
         )?;
         crate::escrow_catalog::release_execution(&tx, id)?;
+        crate::activation_catalog::record_exit(&tx, id)?;
         tx.commit()?;
         self.execution(id)
     }

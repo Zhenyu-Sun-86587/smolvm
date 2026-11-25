@@ -535,9 +535,12 @@ impl Escrow {
     ) -> Result<LeasePacket> {
         catalog.ready()?;
         let operation = catalog.active_operation(request)?;
-        if operation.kind != "resource_lease" {
+        if operation.kind != "resource_lease"
+            && !(operation.kind == "restore_target"
+                && operation.operation_id == execution.last_operation_id)
+        {
             return Err(Fault::invalid(
-                "descriptor leases require a resource_lease operation",
+                "descriptor leases require a resource lease operation or the exact restored execution",
             ));
         }
         let input: Acquire = request.payload()?;

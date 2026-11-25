@@ -241,6 +241,27 @@ impl PrivateRouter {
 }
 
 impl QuarantinedPort {
+    /// Install the exact prepared identity policy while the TAP is still down.
+    pub(crate) fn arm_identity(&self) -> io::Result<()> {
+        self.close_identity()?;
+        nft(
+            self.namespace(),
+            "flush chain netdev tapguard ingress\nadd rule netdev tapguard ingress jump identity\n",
+        )
+    }
+
+    /// Publish the link only after the private Guest authority reported release.
+    pub(crate) fn publish_identity(&self) -> io::Result<()> {
+        ip(self.namespace(), &format!("link set {TAP_PORT_NAME} up\n"))
+    }
+
+    pub(crate) fn close_identity(&self) -> io::Result<()> {
+        ip(
+            self.namespace(),
+            &format!("link set {TAP_PORT_NAME} down\n"),
+        )
+    }
+
     /// Disconnect the host route before a released address can be reused.
     pub fn fence(&mut self) -> io::Result<()> {
         self.router_link.fence()

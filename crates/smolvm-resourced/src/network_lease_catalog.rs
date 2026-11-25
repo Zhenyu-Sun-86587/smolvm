@@ -84,13 +84,25 @@ pub(crate) fn recover(db: &Connection) -> Result<()> {
 fn read(db: &Connection, id: &str) -> Result<Option<TapLease>> {
     Ok(db.query_row(
         "SELECT lease_id,operation_id,route_id,bundle_digest,instance_id,incarnation_id,execution_epoch,
-                host_boot_id,broker_session_id,state,revision,descriptor_json
+                host_boot_id,broker_session_id,state,revision,descriptor_json,
+                CASE
+                  WHEN state='unknown' THEN 'unknown'
+                  WHEN state='attached' THEN COALESCE((
+                    SELECT CASE a.phase WHEN 'policy_armed' THEN 'armed' WHEN 'released' THEN 'open' WHEN 'unknown' THEN 'unknown' ELSE 'closed' END
+                    FROM target_activations a
+                    WHERE a.operation_id=network_tap_leases.operation_id
+                      AND a.incarnation_id=network_tap_leases.incarnation_id
+                      AND a.execution_epoch=network_tap_leases.execution_epoch
+                      AND json_extract(a.binding_json, '$.network.target.lease_id')=network_tap_leases.lease_id
+                  ),'closed')
+                  ELSE 'closed'
+                END
          FROM network_tap_leases WHERE attachment_id=? AND state<>'retired'",
         [id],
         |row: &Row<'_>| {
             let descriptor: String = row.get(11)?;
             let state = row.get::<_, String>(9)?;
-            let gate = if state == "unknown" { "unknown" } else { "closed" }.to_owned();
+            let gate = row.get(12)?;
             let attachment = serde_json::from_str(&descriptor).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(error))
             })?;

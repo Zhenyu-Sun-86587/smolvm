@@ -251,7 +251,7 @@ impl Catalog {
         }
         self.ready()?;
         let operation = self.active_operation(request)?;
-        if !matches!(operation.kind.as_str(), "launch" | "network_reservation") {
+        if !operation.launches_execution() && operation.kind != "network_reservation" {
             return Err(Fault::invalid(
                 "network reservation requires a launch or network_reservation operation",
             ));
