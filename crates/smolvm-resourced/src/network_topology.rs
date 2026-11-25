@@ -100,7 +100,10 @@ impl PrivateRouter {
             &format!("link set lo up\naddr add {gateway}/32 dev lo\n"),
         )?;
         // Register conntrack hooks for forwarded traffic and locally dialed services.
-        nft(router.namespace(),"table ip sm_activity { chain ingress { type filter hook prerouting priority filter; policy accept; ct state established counter; } chain local { type filter hook output priority filter; policy accept; ct state established counter; } }")?;
+        nft(router.namespace(), "table ip sm_activity {\n\
+            chain ingress { type filter hook prerouting priority filter; policy accept; ct state established counter; }\n\
+            chain local { type filter hook output priority filter; policy accept; ct state established counter; }\n\
+        }\n")?;
         Ok(router)
     }
 
