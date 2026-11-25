@@ -1,0 +1,8 @@
+{
+  "crane_sha256": "sha256:0c1197dad5538e8e6350817a9d596fbbfa85e610464d3668d5e1ffc102c74082",
+  "crun_build_sha256": "sha256:f83e15905d21a357da519851eaff891aa1fc4030f0a7e75914a942abb168e0b7",
+  "package_db_sha256": "sha256:670c92d8988c5eb4c9d6ea2c4302657cf78b486c78ec8490ba7f0ddd7574dfff",
+  "recipe": "scripts/build-agent-rootfs.sh",
+  "schema": "RuntimeRootfsSeed/1",
+  "seed_sha256": "sha256:5961914bd8eef1c627e21b029a2d569a9d9979b089ba56aa4d4e68ebbdef14db"
+}
