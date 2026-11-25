@@ -212,15 +212,19 @@ impl Catalog {
                 )?;
                 tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 tx.execute_batch(include_str!("schema_blocks.sql"))?;
-                tx.execute_batch("PRAGMA user_version=3")?;
+                crate::network_catalog::install(&tx)?;
+                tx.execute_batch("PRAGMA user_version=4")?;
             }
-            1 | 2 | 3 => {
+            1 | 2 | 3 | 4 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
                 if version < 3 {
                     tx.execute_batch(include_str!("schema_blocks.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=3")?;
+                }
+                if version < 4 {
+                    crate::network_catalog::install(&tx)?;
+                    tx.execute_batch("PRAGMA user_version=4")?;
                 }
                 let old_boot: String =
                     tx.query_row("SELECT host_boot_id FROM worker_state", [], |r| r.get(0))?;

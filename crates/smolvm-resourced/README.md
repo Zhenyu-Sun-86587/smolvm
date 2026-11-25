@@ -98,3 +98,18 @@ LD_LIBRARY_PATH="$FIRMWARE_DIR" python3 -B crates/smolvm-resourced/tests/kvm-blo
 ```
 
 The current ABI attaches managed disk sets at cold boot. Captured multi-disk pivots, live detach, online expansion and exact-generation restore require the held capture and activation path.
+### Private IPv4 reservations
+
+The Worker administrator registers an RFC1918 CIDR and its isolated route
+domain with `RegisterPrivateNetwork`. Each active `launch` or
+`network_reservation` operation can call `ReserveNetworkAttachment` with its
+attachment ID, network ID, stable device ID, and mode. `native` assigns the
+private address to the Guest. `fixed_internal` keeps the requested
+`guest_ipv4` and allocates a distinct private address in the route domain.
+
+`QueryNetworkReservation` reads the original operation's reservation.
+`ReleaseNetworkReservation` takes the attachment ID and expected revision,
+and releases only an unissued reservation. Unknown reservations retain their
+address and device pins. This API reserves identifiers and addresses, while
+TAP delivery, traffic publication, and identity activation require their
+own Worker admission.

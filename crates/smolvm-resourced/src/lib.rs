@@ -17,6 +17,8 @@ mod ipc;
 #[cfg(target_os = "linux")]
 pub mod network;
 #[cfg(target_os = "linux")]
+mod network_catalog;
+#[cfg(target_os = "linux")]
 mod worker;
 
 #[cfg(target_os = "linux")]
