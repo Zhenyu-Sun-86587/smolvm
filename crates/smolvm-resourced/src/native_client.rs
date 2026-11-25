@@ -404,6 +404,44 @@ impl Client<'_> {
         }
         Ok(())
     }
+    pub fn open_guest_agent(&self, expected: &ExecutionRef) -> Result<OwnedFd, QueryError> {
+        let incarnation = expected
+            .incarnation_id
+            .as_deref()
+            .filter(|id| valid_id(id))
+            .ok_or_else(|| {
+                fault(
+                    "E_INVALID_REQUEST",
+                    "Guest Agent requires an execution incarnation",
+                )
+            })?;
+        if expected.execution_epoch < 1 || !valid_id(&expected.instance_id) {
+            return Err(fault(
+                "E_INVALID_REQUEST",
+                "Guest Agent requires a live execution",
+            ));
+        }
+        let (execution, table, mut descriptors): (Value, _, _) =
+            self.exchange("OpenGuestAgent", Some(expected), None, empty())?;
+        if execution["route_id"] != "deep"
+            || execution["bundle_digest"] != self.bundle
+            || execution["instance_id"] != expected.instance_id
+            || execution["incarnation_id"] != incarnation
+            || execution["execution_epoch"] != expected.execution_epoch
+            || execution["phase"] != "registered"
+            || descriptors.len() != 1
+            || table.len() != 1
+            || table[0].index != 0
+            || table[0].role != "guest_agent"
+            || table[0].resource_id != incarnation
+        {
+            return Err(fault(
+                "E_PROTOCOL_UNSUPPORTED",
+                "Guest Agent descriptor scope differs from the verified execution",
+            ));
+        }
+        Ok(descriptors.pop().expect("one checked descriptor"))
+    }
     pub fn binding(&self, instance: &str) -> Result<Binding, QueryError> {
         let r: Binding = self.call(
             "QueryInstanceBinding",

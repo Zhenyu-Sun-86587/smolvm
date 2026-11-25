@@ -2,7 +2,7 @@
 use crate::catalog::{Catalog, Execution};
 use crate::ipc::{self, Fault, Result};
 use crate::worker::{observe_pid, pid_exited, pid_start, verify_executable};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use socket2::{Domain, SockAddr, Socket, Type};
@@ -145,6 +145,9 @@ impl Endpoint {
         ipc::peer(&socket).map_err(unavailable)
     }
     pub(crate) fn connect(&self) -> Result<(Socket, OwnedFd)> {
+        self.connect_path(&self.path)
+    }
+    fn connect_path(&self, path: &Path) -> Result<(Socket, OwnedFd)> {
         let (start, pidfd) = observe_pid(self.pid)?;
         if start != self.start {
             return Err(stale());
@@ -152,7 +155,7 @@ impl Endpoint {
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(unavailable)?;
         socket
             .connect_timeout(
-                &SockAddr::unix(&self.path).map_err(unavailable)?,
+                &SockAddr::unix(path).map_err(unavailable)?,
                 Duration::from_secs(2),
             )
             .map_err(unavailable)?;
@@ -169,6 +172,17 @@ impl Endpoint {
             return Err(stale());
         }
         Ok((socket, pidfd))
+    }
+    pub(crate) fn connect_guest_agent(&self) -> Result<OwnedFd> {
+        if self.inventory()?.source_disposition != "RUNNING" {
+            return Err(Fault::new(
+                "E_STATE_CONFLICT",
+                "Guest management requires a running execution",
+            ));
+        }
+        let path = self.path.with_file_name("agent.sock");
+        let (socket, _pidfd) = self.connect_path(&path)?;
+        Ok(socket.into())
     }
     pub fn command(&self, line: &str) -> Result<String> {
         let (socket, pidfd) = self.connect()?;

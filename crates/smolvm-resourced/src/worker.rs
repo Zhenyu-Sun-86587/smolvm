@@ -631,6 +631,36 @@ impl Worker {
                 self.verify_live_execution(&execution)?;
                 Ok(json!(execution))
             }
+            "OpenGuestAgent" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new(
+                        "E_PERMISSION_DENIED",
+                        "Worker control peer required for Guest Agent access",
+                    ));
+                }
+                if request.payload != json!({}) {
+                    return Err(Fault::invalid(
+                        "Guest Agent endpoint is chosen by the Worker",
+                    ));
+                }
+                let execution = self.scoped_execution(request)?;
+                let endpoint = crate::native_control::Endpoint::load(
+                    &self.catalog.db,
+                    &execution.incarnation_id,
+                    &self.boot,
+                )?;
+                let fd = endpoint.connect_guest_agent()?;
+                return Ok(Reply {
+                    table: vec![ipc::FdEntry {
+                        index: 0,
+                        resource_id: execution.incarnation_id.clone(),
+                        role: "guest_agent".to_owned(),
+                    }],
+                    result: json!(execution),
+                    descriptors: vec![fd],
+                    delivered: None,
+                });
+            }
             "DialNetworkAttachment" => {
                 if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
                     return Err(Fault::new(
