@@ -1,6 +1,7 @@
 """Exercise WorkerResource/1 through the real Linux daemon and kernel sockets."""
 
 import array
+import errno
 import fcntl
 import hashlib
 import json
@@ -208,9 +209,17 @@ class WorkerResource(unittest.TestCase):
         second = operation(self.bundle_b, "reserve-b", fence("second", 1))
         for scope in (first, second):
             self.call("BeginOperation", {"kind": "writer_reservation"}, **scope)
+        with backing.open("r+b") as external:
+            fcntl.lockf(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.call("ReserveWriterSet", {"heads": [heads[0]]}, error="E_VOLUME_WRITER_CONFLICT", **first)
+            fcntl.lockf(external, fcntl.LOCK_UN)
         pending = self.call("ReserveWriterSet", {"heads": [heads[0]]}, **first)
         self.assertEqual(pending["state"], "reserved")
         self.assertFalse(pending["writer_authority"])
+        with (self.state / "objects/head-b/data").open("r+b") as external:
+            with self.assertRaises(OSError) as blocked:
+                fcntl.lockf(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIn(blocked.exception.errno, (errno.EACCES, errno.EAGAIN))
         self.assertEqual(pending, self.call("ReserveWriterSet", {"heads": [heads[0]]}, **first))
         self.call("ReserveWriterSet", {"heads": [heads[0]]}, error="E_VOLUME_WRITER_CONFLICT", **second)
         self.call("ReserveWriterSet", {"heads": [heads[2], heads[1]]}, error="E_VOLUME_WRITER_CONFLICT", **second)
@@ -222,6 +231,8 @@ class WorkerResource(unittest.TestCase):
         health = self.call("Health")
         self.assertEqual(health["state"], "recovering")
         self.assertEqual(self.call("QueryWriterSet", operation_id="reserve-a")["state"], "unknown")
+        with backing.open("r+b") as external:
+            fcntl.lockf(external, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.call("ReserveWriterSet", {"heads": [heads[2]]}, error="E_RECOVERING", **second)
         self.call("MarkResourceForGC", {"resource_id": "absent", "expected_revision": 1}, error="E_RECOVERING")
         session = {"broker_session_id": health["broker_session_id"]}
@@ -353,6 +364,56 @@ class WorkerResource(unittest.TestCase):
         self.call("ReleaseResourceLease", {"lease_id": "lease", "expected_revision": 5}, **lease_scope)
         self.assertEqual(self.call("QueryResource", {"resource_id": "generation"})["state"], "lost")
         self.assertEqual(self.call("CompleteRecovery", session)["state"], "ready")
+
+    def test_generation_publisher_recovers_while_operation_pin_is_held(self):
+        launch = operation(self.bundle_a, "launch-publisher", fence("publisher"))
+        self.call("BeginOperation", {"kind": "launch"}, **launch)
+        launch["expected"] = fence("publisher", 1)
+        permit = self.call("IssueLaunchPermit", {"pid": os.getpid(), "uid": os.getuid()}, **launch)
+        self.call("RegisterExecution", {"launch_permit": permit["launch_permit"]}, **launch)
+        self.finish(launch)
+        scope = operation(self.bundle_a, "publisher-op", fence("publisher", 1))
+        self.call("BeginOperation", {"kind": "generation"}, **scope)
+        page = os.sysconf("SC_PAGE_SIZE")
+        descriptor = {"backing_sizes": {"base": page}, "regions": [{
+            "gpa": 0, "length": page,
+            "extents": [{"offset": 0, "length": page, "backing_id": "base", "backing_offset": 0}],
+        }]}
+        transfer = {"transfer_id": "publisher-transfer"}
+        resource = {"resource_id": "publisher-generation"}
+        self.call("RegisterGenerationBegin", {**transfer, **resource, "descriptor": descriptor,
+            "descriptor_digest": digest(json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode())}, **scope)
+        table = [{"index": 0, "resource_id": "base", "role": "immutable_backing"}]
+        fd = os.memfd_create("publisher-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+        with os.fdopen(fd, "wb"):
+            os.ftruncate(fd, page)
+            fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK)
+            batch = request("RegisterGenerationBatch", {**transfer, "batch_index": 0}, fd_table=table, **scope)
+            self.assertEqual(rpc(self.path, batch, [fd])["result"]["next_batch"], 1)
+            self.call("RegisterGenerationCommit", transfer, **scope)
+
+            self.stop(self.process)
+            self.start()
+            self.assertEqual(self.call("QueryResource", resource)["state"], "missing")
+            reconcile = request("ReconcileExecutionExports", transfer, fd_table=table, **scope)
+            self.assertEqual(rpc(self.path, reconcile, [fd])["error"]["code"], "E_PERMISSION_DENIED")
+            self.call("ReconcileExecution", **launch)
+            receipt = rpc(self.path, reconcile, [fd])
+            self.assertEqual(receipt["result"]["state"], "committed")
+            self.assertEqual(rpc(self.path, reconcile, [fd]), receipt)
+            self.assertEqual(self.call("QueryResource", resource)["state"], "available")
+
+            self.stop(self.process)
+            self.start()
+            self.assertEqual(self.call("QueryResource", resource)["state"], "missing")
+            self.call("ReconcileExecution", **launch)
+            self.call("DropOwnerRef", {**resource, "owner_kind": "operation",
+                      "owner_id": "publisher-op", "expected_revision": 1}, **scope)
+            self.assertEqual(rpc(self.path, reconcile, [fd])["error"]["code"], "E_RESOURCE_UNAVAILABLE")
+            self.assertEqual(self.call("QueryResource", resource)["state"], "lost")
+            self.finish(scope)
+            session = {"broker_session_id": self.call("Health")["broker_session_id"]}
+            self.assertEqual(self.call("CompleteRecovery", session)["state"], "ready")
 
 
 if __name__ == "__main__":

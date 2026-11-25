@@ -66,7 +66,7 @@ def resource_id(instance):
     return instance + "-generation"
 
 
-def generation_upload(worker, instance, directory, krun):
+def generation_upload(worker, instance, directory, krun, reexport=False):
     scope = operation(instance, "generation")
     transfer = {"transfer_id": instance + "-transfer"}
     callback_kind = ct.CFUNCTYPE(ct.c_int, ct.POINTER(ct.c_uint8), ct.c_size_t,
@@ -81,13 +81,19 @@ def generation_upload(worker, instance, directory, krun):
             require(len(ids) == count, "exported backing count differs from manifest")
             encoded = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
             digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
-            rpc(worker, "RegisterGenerationBegin", dict(**transfer, resource_id=resource_id(instance),
-                descriptor_digest=digest, descriptor=data), **scope)
+            if not reexport:
+                rpc(worker, "RegisterGenerationBegin", dict(**transfer, resource_id=resource_id(instance),
+                    descriptor_digest=digest, descriptor=data), **scope)
             for offset in range(0, count, 64):
                 batch = ids[offset:offset + 64]
-                rpc(worker, "RegisterGenerationBatch", dict(**transfer, batch_index=offset // 64),
+                method = "ReconcileExecutionExports" if reexport else "RegisterGenerationBatch"
+                payload = transfer if reexport else dict(**transfer, batch_index=offset // 64)
+                receipt = rpc(worker, method, payload,
                     fd_table=table(batch), fds=fds[offset:offset + len(batch)], **scope)
-            rpc(worker, "RegisterGenerationCommit", transfer, **scope)
+            if reexport:
+                require(receipt["state"] == "committed", receipt)
+            else:
+                rpc(worker, "RegisterGenerationCommit", transfer, **scope)
             outcome.update(descriptor=data, fds=count)
             return 0
         except Exception as error:
@@ -112,8 +118,11 @@ def worker(args):
             if method == "register":
                 result = rpc(path, "RegisterExecution", {"launch_permit": cmd["permit"]},
                              **operation(instance, "launch"))
-            elif method == "export":
-                result = generation_upload(path, instance, cmd["capture"], krun)
+            elif method in ("export", "recover_source"):
+                recovering = method == "recover_source"
+                if recovering:
+                    rpc(path, "ReconcileExecution", **operation(instance, "launch"))
+                result = generation_upload(path, instance, cmd["capture"], krun, reexport=recovering)
             elif method == "recover":
                 rpc(path, "ReconcileExecution", **operation(instance, "launch"))
                 ids = sorted(held)
@@ -240,12 +249,14 @@ def orchestration(broker, library, guest):
                     for match in re.findall(r"RESOURCE_GUEST tick=(\d+) cold=([0-9a-f]+) private=(\d+) pid=(\d+)",
                                              log.read_text(errors="replace"))] if log.exists() else []
 
-        def capture_and_exit(process, name, endpoint, log):
+        def capture_and_exit(process, name, endpoint, log, before_exit=None):
             capture, detached = work / (name + "-capture"), work / (name + "-detached")
             print(control(endpoint, "FORK " + str(capture)), flush=True)
             last_tick = ticks(log)[-1]
             admin("BeginOperation", {"kind": "generation"}, **operation(name, "generation"))
             outcome = command(process, "export", capture=str(capture))
+            if before_exit:
+                before_exit(capture, outcome)
             detached.mkdir()
             shutil.copy2(capture / "checkpoint.bin", detached / "checkpoint.bin")
             process.kill()
@@ -285,10 +296,29 @@ def orchestration(broker, library, guest):
             command(source, "boot")
             until(lambda: source_control.exists() and ticks(source_log) and ticks(source_log)[-1][0] >= 3,
                   source, "source guest output")
-            source_last, detached, outcome = capture_and_exit(source, "source", source_control, source_log)
+
+            def recover_source(capture, outcome):
+                nonlocal service, status
+                scope = operation("source", "generation")
+                admin("AddOwnerRef", {"owner_kind": "capture", "owner_id": "source-capture",
+                    "resource_id": resource_id("source"), "expected_revision": 0}, **scope)
+                service.terminate()
+                service.wait(10)
+                service, status = start_broker()
+                require(status["state"] == "recovering", status)
+                require(admin("QueryResource", {"resource_id": resource_id("source")})["state"] == "missing",
+                        "live source must preserve a recovery candidate")
+                recovered = command(source, "recover_source", capture=str(capture))
+                require(recovered == outcome, outcome, recovered)
+                print("SOURCE_REEXPORT", recovered["fds"], flush=True)
+
+            source_last, detached, outcome = capture_and_exit(
+                source, "source", source_control, source_log, recover_source)
             print("SOURCE_CAPTURE", source_last, "SEALED_BACKINGS", outcome["fds"], flush=True)
-            child, child_control, child_log = boot_from("child", "source", detached, outcome["descriptor"], roots[1])
             retire_exporter("source")
+            require(admin("CompleteRecovery", {"broker_session_id": status["broker_session_id"]})["state"] == "ready",
+                    "broker must complete recovery from source before child acquires")
+            child, child_control, child_log = boot_from("child", "source", detached, outcome["descriptor"], roots[1])
             observed = until(lambda: ticks(child_log) if ticks(child_log) and ticks(child_log)[-1][0] >= 9 else None,
                              child, "restored guest execution")
             require(observed[0][0] == source_last[0] + 1, source_last, observed)

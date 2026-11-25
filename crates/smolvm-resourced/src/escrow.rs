@@ -104,14 +104,22 @@ struct Generation {
 
 struct Reexport {
     incarnation_id: String,
+    resource_id: String,
+    operation_id: String,
     backings: BTreeMap<String, Backing>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ReexportKey {
+    Lease(String),
+    Transfer(String),
 }
 
 #[derive(Default)]
 pub struct Escrow {
     staging: HashMap<String, Transfer>,
     generations: HashMap<String, Generation>,
-    reexports: HashMap<String, Reexport>,
+    reexports: HashMap<ReexportKey, Reexport>,
 }
 
 pub struct LeasePacket {
@@ -615,7 +623,7 @@ impl Escrow {
         }
         let updated = catalog.update_lease(&lease, input.expected_revision, release)?;
         if release {
-            self.reexports.remove(&input.lease_id);
+            self.reexports.remove(&ReexportKey::Lease(input.lease_id));
         }
         Ok(json!(updated))
     }
@@ -647,11 +655,51 @@ impl Escrow {
         execution: &Execution,
         fds: Vec<OwnedFd>,
     ) -> Result<Value> {
-        let (input, lease) = Self::scoped_lease(catalog, request, execution)?;
+        let (key, resource_id, operation_id, lease, already_attached) =
+            if request.payload.get("transfer_id").is_some() {
+                let input: TransferId = request.payload()?;
+                let record =
+                    self.scoped_transfer(catalog, request, execution, &input.transfer_id)?;
+                if !matches!(record.state.as_str(), "missing" | "committed")
+                    || !catalog.provider_pinned(&record.resource_id, &record.operation_id)?
+                {
+                    return Err(unavailable(
+                        "generation publisher does not have a recovery pin",
+                    ));
+                }
+                let attached = self.generations.contains_key(&record.resource_id);
+                (
+                    ReexportKey::Transfer(input.transfer_id),
+                    record.resource_id,
+                    record.operation_id,
+                    None,
+                    attached,
+                )
+            } else {
+                let (input, lease) = Self::scoped_lease(catalog, request, execution)?;
+                let attached = lease.state == "attached"
+                    && input.expected_revision.checked_add(1) == Some(lease.revision)
+                    && self.generations.contains_key(&lease.resource_id);
+                if !attached
+                    && (lease.state != "unknown" || input.expected_revision != lease.revision)
+                {
+                    return Err(Fault::new(
+                        "E_STALE_REVISION",
+                        "RAM re-export requires the current unknown lease",
+                    ));
+                }
+                (
+                    ReexportKey::Lease(input.lease_id),
+                    lease.resource_id.clone(),
+                    lease.operation_id.clone(),
+                    Some(lease),
+                    attached,
+                )
+            };
         if fds.is_empty() || fds.len() != request.fd_table.len() {
             return Err(Fault::invalid("RAM re-export requires a matching FD table"));
         }
-        let identities = catalog.backing_identities(&lease.resource_id)?;
+        let identities = catalog.backing_identities(&resource_id)?;
         let mut incoming = BTreeMap::new();
         for (item, fd) in request.fd_table.iter().zip(fds) {
             let wanted = identities
@@ -668,60 +716,86 @@ impl Escrow {
                 return Err(Fault::invalid("duplicate RAM re-export backing"));
             }
         }
-        if lease.state == "attached"
-            && input.expected_revision.checked_add(1) == Some(lease.revision)
-            && self.generations.contains_key(&lease.resource_id)
-        {
-            return Ok(
-                json!({"lease":lease, "received":identities.len(), "total":identities.len()}),
-            );
+        let total = identities.len();
+        if already_attached {
+            self.reexports.remove(&key);
+            return Ok(Self::reexport_receipt(&key, lease.as_ref(), total, total));
         }
-        if lease.state != "unknown" || input.expected_revision != lease.revision {
-            return Err(Fault::new(
-                "E_STALE_REVISION",
-                "RAM re-export requires the current unknown lease",
-            ));
-        }
-        let parked = self.parked_descriptors();
-        let transfer = self
-            .reexports
-            .entry(input.lease_id.clone())
-            .or_insert_with(|| Reexport {
-                incarnation_id: execution.incarnation_id.clone(),
-                backings: BTreeMap::new(),
-            });
+        let already_parked = self.reexports.get(&key).map(|transfer| &transfer.backings);
         let additional = incoming
             .keys()
-            .filter(|id| !transfer.backings.contains_key(*id))
+            .filter(|id| already_parked.is_none_or(|backings| !backings.contains_key(*id)))
             .count();
+        let parked = self.parked_descriptors();
         if parked + additional > MAX_ESCROW_FDS {
             return Err(Fault::new(
                 "E_RESOURCE_LIMIT",
                 "worker escrow descriptor budget exhausted",
             ));
         }
-        transfer.backings.extend(incoming);
-        let received = transfer.backings.len();
-        let total = identities.len();
-        if received != total {
-            return Ok(json!({"lease":lease, "received":received, "total":total}));
-        }
-        let attached = catalog.commit_reexport(&lease, total)?;
         let transfer = self
             .reexports
-            .remove(&input.lease_id)
-            .expect("validated re-export");
-        self.generations
-            .entry(lease.resource_id)
-            .or_insert(Generation {
-                bundle_digest: execution.bundle_digest.clone(),
-                backings: transfer.backings,
+            .entry(key.clone())
+            .or_insert_with(|| Reexport {
+                incarnation_id: execution.incarnation_id.clone(),
+                resource_id: resource_id.clone(),
+                operation_id,
+                backings: BTreeMap::new(),
             });
-        Ok(json!({"lease":attached, "received":received, "total":total}))
+        transfer.backings.extend(incoming);
+        let received = transfer.backings.len();
+        if received != total {
+            return Ok(Self::reexport_receipt(
+                &key,
+                lease.as_ref(),
+                received,
+                total,
+            ));
+        }
+        catalog.commit_reexport(&resource_id, lease.as_ref(), total)?;
+        let transfer = self.reexports.remove(&key).expect("validated re-export");
+        self.generations.entry(resource_id).or_insert(Generation {
+            bundle_digest: execution.bundle_digest.clone(),
+            backings: transfer.backings,
+        });
+        let attached = lease
+            .map(|prior| catalog.lease(&prior.lease_id))
+            .transpose()?;
+        Ok(Self::reexport_receipt(
+            &key,
+            attached.as_ref(),
+            received,
+            total,
+        ))
+    }
+
+    fn reexport_receipt(
+        key: &ReexportKey,
+        lease: Option<&LeaseRecord>,
+        received: usize,
+        total: usize,
+    ) -> Value {
+        match key {
+            ReexportKey::Lease(_) => json!({"lease":lease, "received":received, "total":total}),
+            ReexportKey::Transfer(id) => json!({
+                "transfer_id":id, "received":received, "total":total,
+                "state":if received == total {"committed"} else {"missing"},
+            }),
+        }
+    }
+
+    pub fn forget_provider(&mut self, operation_id: &str, resource_id: &str) {
+        self.reexports.retain(|key, transfer| {
+            !matches!(key, ReexportKey::Transfer(_))
+                || transfer.operation_id != operation_id
+                || transfer.resource_id != resource_id
+        });
     }
 
     pub fn collect(&mut self, id: &str) {
         self.generations.remove(id);
+        self.reexports
+            .retain(|_, transfer| transfer.resource_id != id);
     }
 
     pub fn forget_execution(&mut self, incarnation_id: &str) {

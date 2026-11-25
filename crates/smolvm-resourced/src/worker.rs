@@ -479,14 +479,20 @@ impl Worker {
             }
             "AddOwnerRef" | "DropOwnerRef" => {
                 let data: RootRef = request.payload()?;
-                self.catalog.set_ref(
+                let add = request.method == "AddOwnerRef";
+                let result = self.catalog.set_ref(
                     request,
                     &data.owner_kind,
                     &data.owner_id,
                     &data.resource_id,
                     data.expected_revision,
-                    request.method == "AddOwnerRef",
-                )
+                    add,
+                )?;
+                if !add && data.owner_kind == "operation" {
+                    self.escrow
+                        .forget_provider(&data.owner_id, &data.resource_id);
+                }
+                Ok(result)
             }
             "QueryOwnerClosure" => {
                 let data: Owner = request.payload()?;
