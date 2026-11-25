@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 
 #[derive(Deserialize)]
@@ -81,6 +81,9 @@ fn integrity(error: io::Error) -> Fault {
 }
 
 impl StatePoints {
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
     pub fn new(directory: PathBuf) -> Self {
         Self {
             directory,

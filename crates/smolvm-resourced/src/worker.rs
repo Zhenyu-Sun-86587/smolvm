@@ -43,6 +43,18 @@ enum Command {
         #[arg(long)]
         socket: PathBuf,
     },
+    RecoverBackupClosure {
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long)]
+        manifest_digest: String,
+        #[arg(long)]
+        bundle_digest: String,
+        #[arg(long)]
+        state_reader_id: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -507,6 +519,20 @@ impl Worker {
             ));
         }
         let result = match request.method.as_str() {
+            "PrepareBackupClosure" | "ReadBackupMember" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new("E_PERMISSION_DENIED", "native backups require the Worker administrator"));
+                }
+                let prepare = request.method == "PrepareBackupClosure";
+                let (result,file) = if prepare {
+                    crate::backup_closure::prepare(&mut self.catalog, self.statepoints.directory(), &self.objects, request)?
+                } else {
+                    crate::backup_closure::read(&self.catalog, self.statepoints.directory(), &self.objects, request)?
+                };
+                let id = result["backup_id"].as_str().ok_or_else(|| Fault::invalid("missing backup transfer ID"))?;
+                return Ok(Reply { result: result.clone(), table: vec![ipc::FdEntry {index:0, resource_id:id.into(),
+                    role: if prepare {"backup_manifest".into()} else {"backup_member".into()} }], descriptors:vec![file.into()], delivered:None });
+            }
             "AcquireStatePointRestore" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 let restore =
@@ -911,6 +937,7 @@ impl Worker {
                 self.network.activity(&self.catalog,&source)
             }
             "QueryWorkerBudget" => crate::admission::status(&self.catalog.db),
+            "ReleaseBackupClosure" => crate::backup_closure::release(&mut self.catalog, request),
             "QueryProductVolume" => crate::product_volumes::query(&self.catalog, request),
             "ApplyProductVolume" => {
                 crate::product_volumes::mutate(&mut self.catalog, &self.objects, request)
@@ -2432,6 +2459,11 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             socket_gid,
             admin_uid,
         } => serve(&state_dir, &socket, socket_gid, admin_uid),
+        Command::RecoverBackupClosure {archive,manifest_digest,bundle_digest,state_reader_id,output} => {
+            let receipt = crate::backup_closure::restore(&archive, &manifest_digest, &bundle_digest, &state_reader_id, output.as_deref())?;
+            println!("{}",receipt);
+            Ok(())
+        }
         Command::Call { socket } => {
             let mut bytes = Vec::new();
             io::stdin()

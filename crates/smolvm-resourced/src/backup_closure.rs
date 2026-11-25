@@ -1,0 +1,535 @@
+//! Pin and transfer immutable backup members through the Worker administrator socket.
+
+use crate::blocks::{self, BlockSpec};
+use crate::catalog::Catalog;
+use crate::ipc::{Fault, Request, Result, valid_digest, valid_id};
+use crate::statepoint_store::{self, Point};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Component, Path};
+
+const MAX_MANIFEST: usize = 16 << 20;
+const MAX_CLOSURE: usize = 1024;
+const SCHEMA: &str = "NativeBackupClosure/1";
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Selection {
+    backup_id: String,
+    state_reader_id: String,
+    capture_ids: Vec<String>,
+    generation_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Locate {
+    backup_id: String,
+    #[serde(default)]
+    member: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Capture {
+    point: Point,
+    commit_id: String,
+    manifest_digest: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    schema: String,
+    backup_id: String,
+    bundle_digest: String,
+    state_reader_id: String,
+    captures: Vec<Capture>,
+    generations: Vec<String>,
+    blocks: BTreeMap<String, BlockSpec>,
+    members: BTreeMap<String, u64>,
+}
+
+fn invalid(message: &str) -> Fault {
+    Fault::new("E_BACKUP_CLOSURE_INVALID", message)
+}
+
+fn corrupt(error: impl ToString) -> Fault {
+    Fault::new("E_BACKUP_CLOSURE_INVALID", error.to_string())
+}
+
+fn digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn bundle<'a>(catalog: &Catalog, request: &'a Request) -> Result<&'a str> {
+    let id = request
+        .bundle_digest
+        .as_deref()
+        .filter(|id| valid_digest(id))
+        .ok_or_else(|| invalid("backup requires a registered runtime bundle"))?;
+    if request.route_id.as_deref() != Some("deep") {
+        return Err(invalid("backup requires the deep runtime route"));
+    }
+    catalog.bundle(id)?;
+    Ok(id)
+}
+
+fn open_member(root: &File, path: &str) -> io::Result<File> {
+    let parts: Vec<_> = Path::new(path).components().collect();
+    if parts.is_empty()
+        || parts.len() > 8
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || parts
+            .iter()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(io::Error::other("unsafe backup member"));
+    }
+    let mut directory = root.try_clone()?;
+    for part in &parts[..parts.len() - 1] {
+        let name = part
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| io::Error::other("invalid backup member"))?;
+        directory = crate::worker::openat(&directory, name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    }
+    let name = parts
+        .last()
+        .and_then(|part| part.as_os_str().to_str())
+        .ok_or_else(|| io::Error::other("invalid backup member"))?;
+    let file = crate::worker::openat(&directory, name, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("backup member is not a regular file"));
+    }
+    Ok(file)
+}
+
+fn enumerate(base: &Path, sub: &Path, depth: usize, result: &mut Manifest) -> io::Result<()> {
+    if depth > 6 {
+        return Err(io::Error::other(
+            "StatePoint representation is too deeply nested",
+        ));
+    }
+    for entry in fs::read_dir(base.join(sub))? {
+        let entry = entry?;
+        let name = sub.join(entry.file_name());
+        let mode = entry.file_type()?;
+        if mode.is_dir() {
+            enumerate(base, &name, depth + 1, result)?;
+        } else if mode.is_file() {
+            let name = name
+                .to_str()
+                .ok_or_else(|| io::Error::other("non-UTF8 StatePoint member"))?;
+            result
+                .members
+                .insert(format!("statepoints/{name}"), entry.metadata()?.len());
+        } else {
+            return Err(io::Error::other(
+                "unexpected type in StatePoint representation",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn pinned_manifest(catalog: &Catalog, backup: &str, bundle: &str) -> Result<String> {
+    if !valid_id(backup) {
+        return Err(invalid("invalid backup ID"));
+    }
+    catalog.db.query_row("SELECT manifest_json FROM native_backup_exports WHERE backup_id=? AND bundle_digest=? AND phase='pinned'",
+        params![backup,bundle], |row| row.get(0)).optional()?.ok_or_else(|| Fault::new("E_NOT_FOUND", "native backup is not pinned"))
+}
+
+fn manifest_file(raw: &str) -> Result<File> {
+    let mut temp = tempfile::NamedTempFile::new().map_err(corrupt)?;
+    temp.write_all(raw.as_bytes()).map_err(corrupt)?;
+    File::open(temp.path()).map_err(corrupt)
+}
+
+pub(crate) fn prepare(
+    catalog: &mut Catalog,
+    points: &Path,
+    objects: &File,
+    request: &Request,
+) -> Result<(Value, File)> {
+    catalog.ready()?;
+    let bundle = bundle(catalog, request)?;
+    let selection: Selection = request.payload()?;
+    let requested = selection.capture_ids.len() + selection.generation_ids.len();
+    if !valid_id(&selection.backup_id)
+        || !valid_id(&selection.state_reader_id)
+        || requested > MAX_CLOSURE
+        || requested == 0
+        || selection
+            .capture_ids
+            .iter()
+            .chain(&selection.generation_ids)
+            .any(|id| !valid_id(id))
+    {
+        return Err(invalid("invalid native backup selection"));
+    }
+    let input = serde_json::to_string(&selection).map_err(corrupt)?;
+    if let Some((old_bundle, old_input, raw, phase)) = catalog.db.query_row(
+        "SELECT bundle_digest,selection_json,manifest_json,phase FROM native_backup_exports WHERE backup_id=?",
+        [&selection.backup_id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))
+        .optional()? {
+        if old_bundle != bundle || old_input != input || phase != "pinned" {
+            return Err(Fault::new("E_IDEMPOTENCY_CONFLICT", "backup scope changed or its roots were released"));
+        }
+        return Ok((json!({"backup_id":selection.backup_id,"manifest_digest":digest(raw.as_bytes())}), manifest_file(&raw)?));
+    }
+
+    let mut manifest = Manifest {
+        schema: SCHEMA.into(),
+        backup_id: selection.backup_id.clone(),
+        bundle_digest: bundle.into(),
+        state_reader_id: selection.state_reader_id,
+        captures: Vec::new(),
+        generations: selection.generation_ids.clone(),
+        blocks: BTreeMap::new(),
+        members: BTreeMap::new(),
+    };
+    let mut roots: BTreeSet<String> = selection.generation_ids.into_iter().collect();
+    let mut pins = BTreeSet::new();
+    for id in selection.capture_ids {
+        let (record, operation) =
+            crate::managed_state_restore::source(catalog, "deep", bundle, &id)?;
+        let state = statepoint_store::read(points, &record.point, bundle, &record.operation_id)
+            .map_err(corrupt)?;
+        let actual = state.digest().map_err(corrupt)?;
+        if record.manifest_digest.as_deref() != Some(actual.as_str()) {
+            return Err(invalid("StatePoint digest differs from the catalog"));
+        }
+        pins.insert(record.point.representation_id.clone());
+        roots.extend(record.point.disk_generations.iter().cloned());
+        enumerate(
+            points,
+            Path::new(&record.point.representation_id),
+            0,
+            &mut manifest,
+        )
+        .map_err(corrupt)?;
+        manifest.captures.push(Capture {
+            point: record.point,
+            commit_id: operation.operation_id,
+            manifest_digest: actual,
+        });
+    }
+    for root in roots {
+        for layer in catalog.block_closure(&root)? {
+            let id = &layer.spec.resource_id;
+            if manifest.blocks.contains_key(id) {
+                continue;
+            }
+            let resource = catalog.resource(id)?;
+            if layer.spec.mutable()
+                || resource["immutable"] != true
+                || resource["durability"] != "durable"
+                || resource["state"] != "available"
+            {
+                return Err(invalid(
+                    "backup closure contains a live or unavailable block object",
+                ));
+            }
+            let file = blocks::open_object(objects, &layer, false)?;
+            manifest.members.insert(
+                format!("blocks/{id}/data"),
+                file.metadata().map_err(corrupt)?.len(),
+            );
+            pins.insert(id.clone());
+            manifest.blocks.insert(id.clone(), layer.spec);
+        }
+    }
+    let raw = serde_json::to_string(&manifest).map_err(corrupt)?;
+    if raw.len() > MAX_MANIFEST {
+        return Err(Fault::new(
+            "E_RESOURCE_LIMIT",
+            "backup closure manifest exceeds its supported size",
+        ));
+    }
+    let file = manifest_file(&raw)?;
+    let tx = catalog
+        .db
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for id in pins {
+        if tx.execute("INSERT INTO root_refs SELECT 'backup',?,resource_id,'active',1,created_by_operation FROM resources
+            WHERE resource_id=? AND state='available' AND durability='durable' AND immutable=1",params![selection.backup_id,id])? != 1 {
+            return Err(invalid("backup closure lost a resource before pin publication"));
+        }
+    }
+    tx.execute(
+        "INSERT INTO native_backup_exports VALUES(?,?,?,?,'pinned')",
+        params![selection.backup_id, bundle, input, raw],
+    )?;
+    tx.commit()?;
+    Ok((
+        json!({"backup_id":selection.backup_id,"manifest_digest":digest(raw.as_bytes())}),
+        file,
+    ))
+}
+
+pub(crate) fn read(
+    catalog: &Catalog,
+    points: &Path,
+    objects: &File,
+    request: &Request,
+) -> Result<(Value, File)> {
+    let bundle = bundle(catalog, request)?;
+    let selection: Locate = request.payload()?;
+    let raw = pinned_manifest(catalog, &selection.backup_id, bundle)?;
+    let manifest: Manifest = serde_json::from_str(&raw).map_err(corrupt)?;
+    let member = selection
+        .member
+        .ok_or_else(|| invalid("backup member is missing"))?;
+    let bytes = manifest
+        .members
+        .get(&member)
+        .ok_or_else(|| invalid("member is outside the pinned backup closure"))?;
+    let file = if let Some(path) = member.strip_prefix("statepoints/") {
+        open_member(&File::open(points).map_err(corrupt)?, path).map_err(corrupt)?
+    } else {
+        let id = member
+            .strip_prefix("blocks/")
+            .and_then(|v| v.strip_suffix("/data"))
+            .ok_or_else(|| invalid("unknown backup member"))?;
+        let layer = catalog
+            .block_closure(id)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| invalid("backup block object disappeared"))?;
+        if layer.spec.mutable() || manifest.blocks.get(id) != Some(&layer.spec) {
+            return Err(invalid("pinned block resource changed"));
+        }
+        blocks::open_object(objects, &layer, false)?
+    };
+    if file.metadata().map_err(corrupt)?.len() != *bytes {
+        return Err(invalid("pinned backup member length changed"));
+    }
+    Ok((
+        json!({"backup_id":selection.backup_id,"member":member,"bytes":bytes}),
+        file,
+    ))
+}
+
+pub(crate) fn release(catalog: &mut Catalog, request: &Request) -> Result<Value> {
+    let bundle = bundle(catalog, request)?;
+    let selection: Locate = request.payload()?;
+    if !valid_id(&selection.backup_id) || selection.member.is_some() {
+        return Err(invalid("invalid native backup release"));
+    }
+    let tx = catalog
+        .db
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let owned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM native_backup_exports WHERE backup_id=? AND bundle_digest=?)",
+        params![selection.backup_id, bundle],
+        |row| row.get(0),
+    )?;
+    if !owned {
+        return Err(Fault::new(
+            "E_NOT_FOUND",
+            "native backup does not belong to this bundle",
+        ));
+    }
+    tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='backup' AND owner_id=? AND state='active'",[&selection.backup_id])?;
+    tx.execute(
+        "UPDATE native_backup_exports SET phase='released' WHERE backup_id=?",
+        [&selection.backup_id],
+    )?;
+    tx.commit()?;
+    Ok(json!({"backup_id":selection.backup_id,"phase":"released"}))
+}
+
+fn load(
+    archive: &File,
+    expected: &str,
+    bundle: &str,
+    reader: &str,
+) -> io::Result<(Manifest, Vec<u8>)> {
+    let mut raw = Vec::new();
+    open_member(archive, "closure.json")?
+        .take(MAX_MANIFEST as u64 + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() > MAX_MANIFEST || digest(&raw) != expected {
+        return Err(io::Error::other("backup closure digest mismatch"));
+    }
+    let manifest: Manifest = serde_json::from_slice(&raw)?;
+    if manifest.schema != SCHEMA
+        || manifest.bundle_digest != bundle
+        || manifest.state_reader_id != reader
+        || !valid_digest(bundle)
+        || !valid_id(&manifest.backup_id)
+        || !valid_id(reader)
+    {
+        return Err(io::Error::other(
+            "backup closure requires the original reader and bundle",
+        ));
+    }
+    Ok((manifest, raw))
+}
+
+fn disk_set(
+    root: &File,
+    blocks: &BTreeMap<String, BlockSpec>,
+    generations: &[String],
+) -> io::Result<BTreeMap<String, File>> {
+    let mut result = BTreeMap::new();
+    for id in generations {
+        let mut seen = BTreeSet::new();
+        let mut next = Some(id);
+        while let Some(id) = next {
+            if !valid_id(id) || !seen.insert(id) || seen.len() > 64 {
+                return Err(io::Error::other("invalid backup block graph"));
+            }
+            let spec = blocks
+                .get(id)
+                .ok_or_else(|| io::Error::other("backup closure omits a block ancestor"))?;
+            if &spec.resource_id != id || spec.mutable() {
+                return Err(io::Error::other(
+                    "backup closure substitutes a different block",
+                ));
+            }
+            if !result.contains_key(id) {
+                result.insert(id.clone(), open_member(root, &format!("blocks/{id}/data"))?);
+            }
+            next = spec.backing_id.as_ref();
+        }
+    }
+    Ok(result)
+}
+
+/// Revalidate all captured RAM, checkpoint, and disk digests with the same
+/// reader used by a normal StatePoint restore. Optionally publish an isolated
+/// immutable recovery directory using an atomic non-replacing rename.
+pub(crate) fn restore(
+    archive: &Path,
+    expected: &str,
+    bundle: &str,
+    reader: &str,
+    output: Option<&Path>,
+) -> io::Result<Value> {
+    let original = File::open(archive)?;
+    let (manifest, raw) = load(&original, expected, bundle, reader)?;
+    let stage = output
+        .map(|path| {
+            let parent = path
+                .parent()
+                .filter(|value| !value.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            tempfile::Builder::new()
+                .prefix(".native-recovery-")
+                .tempdir_in(parent)
+        })
+        .transpose()?;
+    for (name, bytes) in &manifest.members {
+        let mut file = open_member(&original, name)?;
+        if file.metadata()?.len() != *bytes {
+            return Err(io::Error::other("backup member length changed"));
+        }
+        if let Some(stage) = &stage {
+            let target = stage.path().join(name);
+            fs::create_dir_all(
+                target
+                    .parent()
+                    .ok_or_else(|| io::Error::other("invalid member path"))?,
+            )?;
+            let mut copy = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o400)
+                .open(target)?;
+            if io::copy(&mut file, &mut copy)? != *bytes {
+                return Err(io::Error::other("backup member changed during import"));
+            }
+            copy.sync_all()?;
+        }
+    }
+    let path = stage.as_ref().map(|dir| dir.path()).unwrap_or(archive);
+    let root = File::open(path)?;
+    let mut all = disk_set(&root, &manifest.blocks, &manifest.generations)?;
+    for capture in &manifest.captures {
+        let disks = disk_set(&root, &manifest.blocks, &capture.point.disk_generations)?;
+        all.extend(
+            disks
+                .iter()
+                .map(|(id, file)| Ok((id.clone(), file.try_clone()?)))
+                .collect::<io::Result<BTreeMap<_, _>>>()?,
+        );
+        let points = path.join("statepoints");
+        let point = statepoint_store::read(&points, &capture.point, bundle, &capture.commit_id)?;
+        if point.digest()? != capture.manifest_digest {
+            return Err(io::Error::other(
+                "backup no longer has the original StatePoint manifest digest",
+            ));
+        }
+        let _ = statepoint_store::materialize_in(&points, &point, disks, &std::env::temp_dir())?;
+    }
+    if all.len() != manifest.blocks.len() {
+        return Err(io::Error::other(
+            "backup block catalog has members outside the selected closure",
+        ));
+    }
+    for (id, mut file) in all {
+        if let Some(expected) = &manifest.blocks[&id].content_sha256 {
+            let mut sha = Sha256::new();
+            file.rewind()?;
+            io::copy(&mut file, &mut sha)?;
+            if format!("sha256:{:x}", sha.finalize()) != *expected {
+                return Err(io::Error::other("immutable block digest changed"));
+            }
+        }
+    }
+    if let (Some(stage), Some(output)) = (stage, output) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(stage.path().join("closure.json"))?;
+        file.write_all(&raw)?;
+        file.sync_all()?;
+        sync_directories(stage.path())?;
+        let from = CString::new(stage.path().as_os_str().as_encoded_bytes())?;
+        let to = CString::new(output.as_os_str().as_encoded_bytes())?;
+        let status = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let parent = output
+            .parent()
+            .filter(|value| !value.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(
+        json!({"schema":SCHEMA,"backup_id":manifest.backup_id,"manifest_digest":expected,
+        "captures":manifest.captures.len(),"block_generations":manifest.blocks.len(),"bundle_digest":bundle,"state_reader_id":reader}),
+    )
+}
+
+fn sync_directories(path: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sync_directories(&entry.path())?;
+        }
+    }
+    File::open(path)?.sync_all()
+}
