@@ -152,6 +152,7 @@ struct Worker {
     objects: File,
     boot: String,
     admin_uid: u32,
+    native_signal: std::sync::mpsc::SyncSender<()>,
     permits: HashMap<String, Permit>,
     executions: HashMap<String, OwnedFd>,
     reserved: HashMap<String, Vec<File>>,
@@ -211,7 +212,7 @@ fn token() -> Result<String> {
     Ok(hex::encode(bytes))
 }
 
-fn pid_start(pid: i32) -> io::Result<i64> {
+pub(crate) fn pid_start(pid: i32) -> io::Result<i64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     stat.rsplit_once(") ")
         .and_then(|(_, fields)| fields.split_whitespace().nth(19))
@@ -220,7 +221,7 @@ fn pid_start(pid: i32) -> io::Result<i64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))
 }
 
-fn pid_exited(pidfd: &OwnedFd) -> io::Result<bool> {
+pub(crate) fn pid_exited(pidfd: &OwnedFd) -> io::Result<bool> {
     let mut entry = libc::pollfd {
         fd: pidfd.as_raw_fd(),
         events: libc::POLLIN,
@@ -236,7 +237,7 @@ fn pid_exited(pidfd: &OwnedFd) -> io::Result<bool> {
     }
 }
 
-fn observe_pid(pid: i32) -> Result<(i64, OwnedFd)> {
+pub(crate) fn observe_pid(pid: i32) -> Result<(i64, OwnedFd)> {
     if pid <= 0 {
         return Err(Fault::invalid("pid must be positive"));
     }
@@ -253,7 +254,12 @@ fn observe_pid(pid: i32) -> Result<(i64, OwnedFd)> {
     Ok((before, pidfd))
 }
 
-fn verify_executable(pid: i32, start: i64, pidfd: &OwnedFd, wanted: &str) -> Result<()> {
+pub(crate) fn verify_executable(
+    pid: i32,
+    start: i64,
+    pidfd: &OwnedFd,
+    wanted: &str,
+) -> Result<(u64, u64)> {
     let path = format!("/proc/{pid}/exe");
     let mut file = File::open(&path).map_err(broker_error)?;
     let original = file.metadata().map_err(broker_error)?;
@@ -273,7 +279,7 @@ fn verify_executable(pid: i32, start: i64, pidfd: &OwnedFd, wanted: &str) -> Res
             "peer executable does not match registered bundle",
         ));
     }
-    Ok(())
+    Ok((original.dev(), original.ino()))
 }
 
 pub(crate) fn openat(parent: &File, name: &str, flags: i32) -> io::Result<File> {
@@ -317,6 +323,33 @@ pub(crate) fn ofd_lock(file: &File) -> Result<()> {
 }
 
 impl Worker {
+    fn reconnect_native_endpoints(&mut self) -> Result<()> {
+        let ids = {
+            let mut q = self.catalog.db.prepare(
+                "SELECT e.incarnation_id FROM executions e
+                JOIN native_endpoints n USING(incarnation_id)
+                WHERE e.phase='unknown' AND e.host_boot_id=?",
+            )?;
+            let ids = q
+                .query_map([&self.boot], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids
+        };
+        for id in ids {
+            let attempt =
+                crate::native_control::Endpoint::recovery_peer(&self.catalog.db, &id, &self.boot)
+                    .and_then(|peer| {
+                        self.confirm_execution_identity(self.catalog.execution(&id)?, peer)
+                    });
+            if let Err(fault) = attempt {
+                eprintln!(
+                    "native execution {id} awaits reconciliation: {}",
+                    fault.message
+                );
+            }
+        }
+        Ok(())
+    }
     fn packet(
         &mut self,
         request: &Request,
@@ -554,6 +587,46 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            "QueryInstanceBinding" => self.catalog.query_binding(request),
+            "BindNativeControl" => {
+                let binding: crate::native_control::Binding = request.payload()?;
+                let execution = self.scoped_execution(request)?;
+                let inventory = crate::native_control::Endpoint::bind(
+                    &self.catalog,
+                    &execution,
+                    &binding.control_socket,
+                    &self.boot,
+                )?;
+                Ok(json!({"execution":execution,"inventory":inventory}))
+            }
+            "QueryNativeInventory" => {
+                let execution = self.scoped_execution(request)?;
+                let ep = crate::native_control::Endpoint::load(
+                    &self.catalog.db,
+                    &execution.incarnation_id,
+                    &self.boot,
+                )?;
+                Ok(json!({"execution":execution,"inventory":ep.inventory()?}))
+            }
+            "SubmitNativeOperation" => {
+                let op = crate::native_operations::submit(
+                    &mut self.catalog,
+                    &self.boot,
+                    request,
+                    request.payload()?,
+                )?;
+                let _ = self.native_signal.try_send(());
+                Ok(json!(op))
+            }
+            "CancelNativeOperation" => {
+                let op = crate::native_operations::cancel(
+                    &mut self.catalog,
+                    request,
+                    request.payload()?,
+                )?;
+                let _ = self.native_signal.try_send(());
+                Ok(json!(op))
+            }
             "RegisterPrivateNetwork" => {
                 self.catalog.register_private_network(&request.payload()?)?;
                 Ok(json!({"registered": true}))
@@ -941,6 +1014,7 @@ impl Worker {
             pidfd,
             &self.catalog.bundle(&execution.bundle_digest)?,
         )
+        .map(|_| ())
     }
 
     fn reconcile_execution(&mut self, r: &Request, peer: libc::ucred) -> Result<Value> {
@@ -1378,6 +1452,7 @@ fn serve(
     let session = token()?;
     let mut worker = Worker {
         catalog: Catalog::open(&state.join("catalog.sqlite"), &boot, &session)?,
+        native_signal: crate::native_operations::start(&state.join("catalog.sqlite"), &boot)?,
         objects: File::open(objects)?,
         boot,
         admin_uid: admin_uid.unwrap_or_else(|| unsafe { libc::geteuid() }),
@@ -1388,6 +1463,9 @@ fn serve(
         network: crate::network_runtime::NetworkRuntime::default(),
         activation: ActivationRuntime::default(),
     };
+    worker
+        .reconnect_native_endpoints()
+        .map_err(|f| io::Error::other(f.message))?;
 
     let socket = ipc::new_socket()?;
     // Restrict the initial filesystem socket before applying an optional group.

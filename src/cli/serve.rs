@@ -768,7 +768,9 @@ impl ServeStartCmd {
             ListenTarget::Unix(path) => {
                 #[cfg(target_os = "linux")]
                 let app = match &self.worker_resource_socket {
-                    Some(socket) => app.merge(smolvm::api::worker_operations_router(socket.clone())),
+                    Some(socket) => {
+                        app.merge(smolvm::api::worker_operations_router(socket.clone()))
+                    }
                     None => app,
                 };
                 self.serve_unix(path, app, shutdown_rx.clone(), grace).await

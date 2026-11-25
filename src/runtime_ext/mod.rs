@@ -53,12 +53,25 @@ pub(crate) async fn capabilities() -> Result<Json<&'static Handshake>, ApiError>
 
 /// Read durable receipts from the operator-selected Worker on the private Serve socket.
 pub fn worker_operations_router(socket: std::path::PathBuf) -> axum::Router {
-    axum::Router::new()
+    let router = axum::Router::new().route(
+        "/api/v1/runtime-ext/v1/operations/{id}",
+        axum::routing::get(operation),
+    );
+    #[cfg(feature = "deep-runtime")]
+    let router = router
         .route(
-            "/api/v1/runtime-ext/v1/operations/{id}",
-            axum::routing::get(operation),
+            "/api/v1/runtime-ext/v1/operations",
+            axum::routing::post(submit),
         )
-        .with_state(socket)
+        .route(
+            "/api/v1/runtime-ext/v1/operations/{id}/cancel",
+            axum::routing::post(cancel),
+        )
+        .route(
+            "/api/v1/runtime-ext/v1/instances/{id}/inventory",
+            axum::routing::get(inventory),
+        );
+    router.with_state(socket)
 }
 
 async fn operation(
@@ -91,4 +104,76 @@ async fn operation(
         }
         Err(err) => ApiError::internal(err).into_response(),
     }
+}
+
+#[cfg(feature = "deep-runtime")]
+async fn native<T: serde::Serialize + Send + 'static>(
+    socket: std::path::PathBuf,
+    action: impl FnOnce(
+            &smolvm_resourced::native_client::Client,
+        ) -> Result<T, smolvm_resourced::client::QueryError>
+        + Send
+        + 'static,
+) -> axum::response::Response {
+    use axum::{http::StatusCode, response::IntoResponse};
+    let handshake = match capabilities().await {
+        Ok(Json(h)) => h,
+        Err(e) => return e.into_response(),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        action(&smolvm_resourced::native_client::Client {
+            socket: &socket,
+            bundle: &handshake.bundle_digest,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(err)) => {
+            let status = match err.code.as_str() {
+                "E_INVALID_REQUEST" => StatusCode::BAD_REQUEST,
+                "E_NOT_FOUND" => StatusCode::NOT_FOUND,
+                "E_PERMISSION_DENIED" => StatusCode::FORBIDDEN,
+                "E_CAPABILITY_UNSUPPORTED" | "E_NATIVE_UNBOUND" => StatusCode::UNPROCESSABLE_ENTITY,
+                "E_IDEMPOTENCY_CONFLICT"
+                | "E_STALE_EXECUTION"
+                | "E_OPERATION_IN_PROGRESS"
+                | "E_STATE_CONFLICT"
+                | "E_ALREADY_COMMITTED"
+                | "E_STALE_REVISION" => StatusCode::CONFLICT,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (
+                status,
+                Json(serde_json::json!({"code":err.code,"error":err.message})),
+            )
+                .into_response()
+        }
+        Err(error) => ApiError::internal(error).into_response(),
+    }
+}
+#[cfg(feature = "deep-runtime")]
+async fn submit(
+    axum::extract::State(socket): axum::extract::State<std::path::PathBuf>,
+    Json(input): Json<smolvm_resourced::native_client::Submission>,
+) -> axum::response::Response {
+    native(socket, move |client| client.submit(&input)).await
+}
+#[cfg(feature = "deep-runtime")]
+async fn cancel(
+    axum::extract::State(socket): axum::extract::State<std::path::PathBuf>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(input): Json<smolvm_resourced::native_client::Cancellation>,
+) -> axum::response::Response {
+    native(socket, move |client| client.cancel(&id, &input)).await
+}
+#[cfg(feature = "deep-runtime")]
+async fn inventory(
+    axum::extract::State(socket): axum::extract::State<std::path::PathBuf>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    native(socket, move |client| {
+        client.inventory(&client.binding(&id)?.expected())
+    })
+    .await
 }
