@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import select
 import shutil
 import socket
 import subprocess
@@ -177,6 +178,26 @@ def frame_for(receipt, network):
                   addr(old["gateway_ipv4"]) + addr(new["gateway_ipv4"]) + addr(network["dns_ipv4"]) +
                   network["uplink_name"].encode()).ljust(64, b"\0"))
     return frame, machine.hex().encode()
+
+
+def service_dial(worker, operation, lease, *, error=None):
+    data = {"attachment_id": lease["attachment"]["attachment_id"], "lease_id": lease["lease_id"],
+            "expected_revision": lease["revision"], "guest_port": 34567}
+    if error:
+        rpc(worker, "DialNetworkAttachment", {**data, "transport": "tcp"}, error=error, **operation)
+        return
+    for transport in ("tcp", "udp"):
+        returned, fds = rpc(worker, "DialNetworkAttachment", {**data, "transport": transport},
+                            roles=[f"network_{transport}"], **operation)
+        assert returned == lease, returned
+        with socket.socket(fileno=fds[0]) as service:
+            assert select.select([], [service], [], 3)[1], "connection did not become writable"
+            assert service.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0
+            assert service.getpeername() == (lease["attachment"]["private_ipv4"], 34567)
+            service.settimeout(3)
+            message = ("worker-" + transport).encode()
+            service.sendall(message)
+            assert service.recv(256) == message
 
 
 def run(args):
@@ -359,6 +380,8 @@ def run(args):
                                                                "expected_revision": tap["revision"]},
                 error="E_INVALID_REQUEST", **child)
             assert not ping(router_ns, tap["attachment"]["private_ipv4"])
+            if args.test_service_dial:
+                service_dial(worker, child, tap, error="E_FENCE_UNPROVEN")
         if args.restart_before_commit:
             worker_process.kill()
             worker_process.wait(timeout=5)
@@ -394,6 +417,9 @@ def run(args):
             probe.until(lambda: ping(router_ns, att["private_ipv4"]), 12)
             network_line = f"UPLINK {att['guest_ipv4']} {bytes(att['mac']).hex(':')} nameserver {router_ip}".encode()
             assert network_line in (directory / "child.log").read_bytes()
+            if args.test_service_dial:
+                service_dial(worker, child, tap)
+                service_dial(worker, src, tap, error="E_STALE_EXECUTION")
         assert source_rows() == parked
         rpc(worker, "FinishOperation", {"abort": False, "expected_revision": 1}, **child)
         if args.network:
@@ -434,6 +460,7 @@ if __name__ == "__main__":
     parser.add_argument("--network", action="store_true")
     parser.add_argument("--fixed-internal", action="store_true")
     parser.add_argument("--restart-before-commit", action="store_true")
+    parser.add_argument("--test-service-dial", action="store_true", help="use guest-service-counter on both boot fixtures")
     args = parser.parse_args()
     if args.fixed_internal:
         args.network = True
