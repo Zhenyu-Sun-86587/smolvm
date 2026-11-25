@@ -379,15 +379,23 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
             assert http(endpoint,EXT+"/operations",call)==finished
             source_ticks=[line.split() for line in guest_log().splitlines() if line.startswith("PARKED_BLOCK_TICK")]
             boundary=None
+            machine_ids={source_ticks[0][4]}
             for child in finished["fork"]["children"]:
                 file=logs/(child["incarnation_id"]+".log")
-                until(lambda:file.exists() and "PARKED_BLOCK_TICK" in file.read_text(errors="replace"),15)
-                first=next(line for line in file.read_text(errors="replace").splitlines() if line.startswith("PARKED_BLOCK_TICK")).split()
+                def child_ticks():
+                    if file.exists():
+                        ticks=[line.split() for line in file.read_text(errors="replace").splitlines() if line.startswith("PARKED_BLOCK_TICK ")]
+                        if len(ticks)>=2 and len(ticks[1])==7:return ticks[:2]
+                first,fresh=until(child_ticks,20)
                 marker=int(first[1])-1
                 assert (int(first[5]),int(first[6]))==(marker,marker^0xbeef12349876),first
                 boundary=boundary or first[1]
                 assert first[1]==boundary,first
-                assert first[2]==source_ticks[0][2] and first[3]==child["name"] and first[4]!=source_ticks[0][4],first
+                # The held process can already have read its identity for the first tick.
+                # The second iteration samples it again after the target gate opened.
+                assert first[2]==fresh[2]==source_ticks[0][2] and int(fresh[1])==int(first[1])+1,(first,fresh)
+                assert fresh[3]==child["name"] and fresh[4] not in machine_ids,fresh
+                machine_ids.add(fresh[4])
             def fence_machine(vm_name):
                 active=http(endpoint,f"{EXT}/machines/{vm_name}/execution")
                 identity=http(endpoint,f"{EXT}/instances/{active['instance_id']}/inventory")["execution"]
