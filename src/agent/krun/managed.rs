@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::ffi::{c_char, CString};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::ptr;
 
 #[repr(C)]
@@ -136,6 +136,28 @@ impl KrunFunctions {
         }
         env.push(ptr::null());
         let execution = &plan.launch.execution;
+        let guest_relay = std::env::var_os("SMOLVM_GUEST_RELAY_DIR")
+            .map(|dir| {
+                let dir = PathBuf::from(dir);
+                if !dir.is_absolute()
+                    || dir
+                        .components()
+                        .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+                {
+                    return Err("invalid Guest relay directory".to_owned());
+                }
+                let incarnation = execution
+                    .incarnation_id
+                    .as_deref()
+                    .ok_or("missing Guest relay incarnation")?;
+                let path = dir.join(format!("{incarnation}.sock"));
+                let bytes = path.as_os_str().as_bytes();
+                if bytes.len() >= 108 {
+                    return Err("Guest relay path exceeds the Unix socket address".to_owned());
+                }
+                CString::new(bytes).map_err(|e| e.to_string())
+            })
+            .transpose()?;
         let pivot=serde_json::to_vec(&serde_json::json!({"socket":worker,"worker_uid":0,"bundle_digest":bundle,
             "instance_id":execution.instance_id,"incarnation_id":execution.incarnation_id,"execution_epoch":execution.execution_epoch})).map_err(|e|e.to_string())?;
         // The Library owns every function symbol and stays resident through start_enter.
@@ -183,14 +205,22 @@ impl KrunFunctions {
                     root_flags.as_ptr(),
                 ),
             )?;
+            if system || guest_relay.is_some() {
+                check("managed vsock", (self.add_vsock)(ctx, 0))?;
+            }
             if system {
                 let path = control.with_file_name("agent.sock");
                 let guest_socket =
                     CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-                check("System vsock", (self.add_vsock)(ctx, 0))?;
                 check(
                     "System Guest Agent",
                     (self.add_vsock_port2)(ctx, 6000, guest_socket.as_ptr(), true),
+                )?;
+            }
+            if let Some(path) = guest_relay.as_ref() {
+                check(
+                    "Guest management relay",
+                    (self.add_vsock_port2)(ctx, 6001, path.as_ptr(), false),
                 )?;
             }
             check("workdir", (self.set_workdir)(ctx, c"/".as_ptr()))?;
