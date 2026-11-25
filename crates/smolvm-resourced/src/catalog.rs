@@ -745,6 +745,9 @@ impl Catalog {
             tx.execute("INSERT INTO root_refs VALUES(?,?,?,?,?,?) ON CONFLICT(owner_kind,owner_id,resource_id)
                 DO UPDATE SET state=excluded.state,revision=excluded.revision,created_by_operation=excluded.created_by_operation",
                 params![kind,owner,resource,state,new_revision,op.operation_id])?;
+            if !add && kind == "operation" {
+                crate::escrow_catalog::lose_missing_without_provider(&tx)?;
+            }
             new_revision
         };
         tx.commit()?;

@@ -51,11 +51,32 @@ pub fn recover(db: &Connection, rebooted: bool) -> Result<()> {
     }
     db.execute("UPDATE resources SET state='lost',revision=revision+1 WHERE state IN ('available','deleting')
         AND resource_id IN (SELECT resource_id FROM fd_transfers WHERE state='committed')", [])?;
-    db.execute("UPDATE fd_transfers SET state=CASE WHEN state='committed' AND EXISTS
-        (SELECT 1 FROM fd_leases l WHERE l.resource_id=fd_transfers.resource_id AND l.state='unknown')
-        THEN 'missing' ELSE 'lost' END WHERE state IN ('staging','committed')", [])?;
-    db.execute("UPDATE fd_transfers SET state='lost' WHERE state='missing' AND NOT EXISTS
-        (SELECT 1 FROM fd_leases l WHERE l.resource_id=fd_transfers.resource_id AND l.state='unknown')", [])?;
+    db.execute(
+        "UPDATE fd_transfers SET state='missing' WHERE state='committed'",
+        [],
+    )?;
+    db.execute(
+        "UPDATE fd_transfers SET state='lost' WHERE state='staging'",
+        [],
+    )?;
+    lose_missing_without_provider(db)?;
+    Ok(())
+}
+
+pub fn lose_missing_without_provider(db: &Connection) -> Result<()> {
+    db.execute(
+        "UPDATE fd_transfers SET state='lost' WHERE state='missing'
+        AND NOT EXISTS (
+          SELECT 1 FROM fd_leases l WHERE l.resource_id=fd_transfers.resource_id AND l.state='unknown'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM executions e JOIN worker_state w ON w.host_boot_id=e.host_boot_id
+          JOIN root_refs r ON r.resource_id=fd_transfers.resource_id
+            AND r.owner_kind='operation' AND r.owner_id=fd_transfers.operation_id AND r.state='active'
+          WHERE e.incarnation_id=fd_transfers.incarnation_id AND e.phase!='exited'
+        )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -71,8 +92,7 @@ pub fn release_execution(db: &Connection, incarnation_id: &str) -> Result<()> {
         WHERE incarnation_id=? AND state!='released'",
         [incarnation_id],
     )?;
-    db.execute("UPDATE fd_transfers SET state='lost' WHERE state='missing' AND NOT EXISTS
-        (SELECT 1 FROM fd_leases l WHERE l.resource_id=fd_transfers.resource_id AND l.state='unknown')", [])?;
+    lose_missing_without_provider(db)?;
     Ok(())
 }
 
@@ -261,23 +281,33 @@ impl Catalog {
         Ok(identities)
     }
 
+    pub fn provider_pinned(&self, resource: &str, operation: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM root_refs
+            WHERE owner_kind='operation' AND owner_id=? AND resource_id=? AND state='active')",
+            [operation, resource],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn commit_reexport(
         &mut self,
-        lease: &LeaseRecord,
+        resource: &str,
+        lease: Option<&LeaseRecord>,
         delivered: usize,
-    ) -> Result<LeaseRecord> {
+    ) -> Result<()> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let restored = tx.execute(
             "UPDATE fd_transfers SET state='committed' WHERE resource_id=? AND state='missing'",
-            [&lease.resource_id],
+            [resource],
         )?;
         if restored != 0 {
             let changed = tx.execute(
                 "UPDATE resources SET state='available',revision=revision+1
                 WHERE resource_id=? AND state='lost'",
-                [&lease.resource_id],
+                [resource],
             )?;
             if changed != 1 {
                 return Err(Fault::new(
@@ -286,19 +316,21 @@ impl Catalog {
                 ));
             }
         }
-        let attached = tx.execute(
-            "UPDATE fd_leases SET state='attached',revision=revision+1,delivered=?
-            WHERE lease_id=? AND state='unknown' AND revision=?",
-            params![delivered as i64, lease.lease_id, lease.revision],
-        )?;
-        if attached != 1 {
-            return Err(Fault::new(
-                "E_STALE_REVISION",
-                "descriptor lease changed during recovery",
-            ));
+        if let Some(lease) = lease {
+            let attached = tx.execute(
+                "UPDATE fd_leases SET state='attached',revision=revision+1,delivered=?
+                WHERE lease_id=? AND state='unknown' AND revision=?",
+                params![delivered as i64, lease.lease_id, lease.revision],
+            )?;
+            if attached != 1 {
+                return Err(Fault::new(
+                    "E_STALE_REVISION",
+                    "descriptor lease changed during recovery",
+                ));
+            }
         }
         tx.commit()?;
-        self.lease(&lease.lease_id)
+        Ok(())
     }
 
     pub fn update_lease(
@@ -332,9 +364,7 @@ impl Catalog {
         if finish {
             tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='fd_lease' AND owner_id=?",
                 [&existing.lease_id])?;
-            tx.execute("UPDATE fd_transfers SET state='lost' WHERE resource_id=? AND state='missing' AND NOT EXISTS
-                (SELECT 1 FROM fd_leases l WHERE l.resource_id=fd_transfers.resource_id AND l.state='unknown')",
-                [&existing.resource_id])?;
+            lose_missing_without_provider(&tx)?;
         }
         tx.commit()?;
         self.lease(&existing.lease_id)
