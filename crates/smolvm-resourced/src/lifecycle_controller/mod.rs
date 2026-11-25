@@ -1,7 +1,7 @@
 //! Single Worker owner for automatic lifecycle decisions and access protection.
 mod policy;
 mod pressure;
-mod protections;
+pub(crate) mod protections;
 mod scheduler;
 use crate::catalog::Catalog;
 use crate::ipc::{valid_id, Expected, Fault, Request, Result};
@@ -29,7 +29,7 @@ fn clock_ms(clock: libc::clockid_t) -> Result<i64> {
         .saturating_mul(1000)
         .saturating_add(ts.tv_nsec / 1_000_000))
 }
-fn monotonic() -> Result<i64> {
+pub(crate) fn monotonic() -> Result<i64> {
     clock_ms(libc::CLOCK_BOOTTIME)
 }
 fn wall() -> Result<i64> {
@@ -74,7 +74,7 @@ pub(crate) fn confirm_native(db: &Connection, operation: &str, disposition: &str
     Ok(())
 }
 
-fn row_policy(db: &Connection, id: &str) -> Result<(i64, Policy)> {
+pub(crate) fn row_policy(db: &Connection, id: &str) -> Result<(i64, Policy)> {
     let (rev, raw): (i64, String) = db
         .query_row(
             "SELECT revision,policy_json FROM lifecycle_policies WHERE instance_id=?",
@@ -86,7 +86,7 @@ fn row_policy(db: &Connection, id: &str) -> Result<(i64, Policy)> {
     Ok((rev, serde_json::from_str(&raw).map_err(invalid)?))
 }
 
-fn binding(c: &Catalog, r: &Request) -> Result<(Expected, Option<String>)> {
+pub(crate) fn binding(c: &Catalog, r: &Request) -> Result<(Expected, Option<String>)> {
     let (route, _, expected) = r.scope()?;
     if route != "deep" {
         return Err(invalid("lifecycle owner requires the deep route"));

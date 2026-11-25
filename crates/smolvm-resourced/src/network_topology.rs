@@ -1,6 +1,7 @@
 //! Linux router and port namespaces for IPv4 Worker attachments.
 
 use super::{enter_private_namespace, prepare_tap_port, PreparedTapPort, TAP_PORT_NAME};
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -49,10 +50,26 @@ pub struct QuarantinedPort {
 struct RouterLink {
     router: PrivateRouter,
     name: String,
+    address: Ipv4Addr,
     attached: bool,
+    routed: Cell<bool>,
 }
 
 impl RouterLink {
+    fn publish_route(&self) -> io::Result<()> {
+        ip(self.router.namespace(), &format!("route replace {}/32 dev {} scope link\n",self.address,self.name))?;
+        self.routed.set(true);
+        Ok(())
+    }
+
+    fn withdraw_route(&self) -> io::Result<()> {
+        if self.routed.get() {
+            ip(self.router.namespace(), &format!("route del {}/32 dev {}\n",self.address,self.name))?;
+            self.routed.set(false);
+        }
+        Ok(())
+    }
+
     fn fence(&mut self) -> io::Result<()> {
         if self.attached {
             ip(
@@ -95,9 +112,13 @@ impl PrivateRouter {
             mask,
             dns: None,
         };
+        let subnet = Ipv4Addr::from(u32::from(gateway) & mask);
+        // Until an attachment is published, retransmission can wait for wake without an ICMP rejection.
         ip(
             router.namespace(),
-            &format!("link set lo up\naddr add {gateway}/32 dev lo\n"),
+            &format!(
+                "link set lo up\naddr add {gateway}/32 dev lo\nroute add blackhole {subnet}/{prefix}\n"
+            ),
         )?;
         // Register conntrack hooks for forwarded traffic and locally dialed services.
         nft(router.namespace(), "table ip sm_activity {\n\
@@ -192,15 +213,13 @@ impl PrivateRouter {
         let router_link = RouterLink {
             router: self.clone(),
             name: link.clone(),
+            address: policy.private_ipv4,
             attached: true,
+            routed: Cell::new(false),
         };
         ip(
             self.namespace(),
-            &format!(
-                "link set {link} up\n\
-             route add {}/32 dev {link} scope link\n",
-                policy.private_ipv4
-            ),
+            &format!("link set {link} up\n"),
         )?;
         match policy.mode {
             AttachmentMode::Native => {
@@ -265,6 +284,21 @@ impl PrivateRouter {
 }
 
 impl QuarantinedPort {
+    pub(crate) fn observe_ingress(&self) -> io::Result<OwnedFd> {
+        let router = self.router_link.router.clone();
+        let interface = std::ffi::CString::new(self.router_link.name.as_str())?;
+        thread::Builder::new()
+            .name("observe-private-packet-wake".into())
+            .spawn(move || {
+                if unsafe { libc::setns(router.namespace().as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                crate::packet_wake::open_ingress(&interface)
+            })?
+            .join()
+            .map_err(|_| io::Error::other("private packet observer panicked"))?
+    }
+
     pub(crate) fn activity(&self,address:Ipv4Addr)->io::Result<(u64,u64)> {
         let router=self.router_link.router.clone();
         thread::Builder::new().name("observe-network-connections".into()).spawn(move||{
@@ -308,14 +342,17 @@ impl QuarantinedPort {
 
     /// Publish the link only after the private Guest authority reported release.
     pub(crate) fn publish_identity(&self) -> io::Result<()> {
-        ip(self.namespace(), &format!("link set {TAP_PORT_NAME} up\n"))
+        ip(self.namespace(), &format!("link set {TAP_PORT_NAME} up\n"))?;
+        self.router_link.publish_route()
     }
 
     pub(crate) fn close_identity(&self) -> io::Result<()> {
-        ip(
+        let down = ip(
             self.namespace(),
             &format!("link set {TAP_PORT_NAME} down\n"),
-        )
+        );
+        let route = self.router_link.withdraw_route();
+        down.and(route)
     }
 
     /// Disconnect the host route before a released address can be reused.
