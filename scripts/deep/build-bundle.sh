@@ -237,17 +237,19 @@ with open(sys.argv[1], encoding="utf-8") as handle:
     packages = {package["name"]: package for package in json.load(handle)["packages"]}
 if "deep-runtime" not in packages.get("smolvm", {}).get("features", {}):
     sys.exit("deep build: pinned smolvm checkout does not define the deep-runtime Cargo feature")
-if not {"smolvm-agent", "smolvm-resourced"} <= packages.keys():
-    sys.exit("deep build: pinned smolvm checkout must contain Agent and resourced packages")
+if not {"smolvm-agent", "smolvm-resourced", "smolvm-identity-helper"} <= packages.keys():
+    sys.exit("deep build: pinned smolvm checkout must contain the Agent, identity helper and resourced packages")
 PY
 
     ( cd "$SOURCES"; cargo build --locked --jobs "$JOBS" --profile release-small \
-        --target x86_64-unknown-linux-musl -p smolvm-agent )
+        --target x86_64-unknown-linux-musl -p smolvm-agent -p smolvm-identity-helper )
     install -m 0755 -- "$SOURCES/target/x86_64-unknown-linux-musl/release-small/smolvm-agent" "$CANDIDATE/guest/agent"
+    install -m 0755 -- "$SOURCES/target/x86_64-unknown-linux-musl/release-small/smolvm-identity-helper" "$CANDIDATE/guest/identity-helper"
     install -m 0644 -- "$ROOTFS_SEED" "$WORK/oci-seed.tar.gz"
     python3 "$SOURCES/scripts/deep/assemble-oci-rootfs.py" --source-root "$SOURCES" \
         --toolchain-lock "$TOOLCHAIN_LOCK" --input-lock "$ROOTFS_INPUT_LOCK" --seed "$WORK/oci-seed.tar.gz" \
-        --agent "$CANDIDATE/guest/agent" --output "$CANDIDATE/guest/oci-rootfs.tar.gz" --metadata "$CANDIDATE/metadata" \
+        --agent "$CANDIDATE/guest/agent" --identity-helper "$CANDIDATE/guest/identity-helper" \
+        --output "$CANDIDATE/guest/oci-rootfs.tar.gz" --metadata "$CANDIDATE/metadata" \
         --timestamp "$SOURCE_DATE_EPOCH"
 
     ( cd "$SOURCES"; cargo build --locked --jobs "$JOBS" --release -p smolvm --features deep-runtime;
@@ -292,5 +294,5 @@ mv -T --no-clobber -- "$CANDIDATE" "$OUTPUT"
 [[ ! -d "$CANDIDATE" ]] || fail "output was created during the build: $OUTPUT"
 printf 'deep build: verified %s stage at %s\n' "$STAGE" "$OUTPUT"
 if [[ "$STAGE" == runtime ]]; then
-    printf 'deep build: RuntimeBundle packaging also requires the production identity helper and profile inputs\n'
+    printf 'deep build: RuntimeBundle packaging also requires verified profile and license inputs\n'
 fi

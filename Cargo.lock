@@ -4498,6 +4498,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "smolvm-identity-helper"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "zeroize",
+]
+
+[[package]]
 name = "smolvm-network"
 version = "1.37.2"
 dependencies = [
