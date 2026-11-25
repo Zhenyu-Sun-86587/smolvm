@@ -4604,6 +4604,7 @@ dependencies = [
  "clap",
  "getrandom 0.3.4",
  "hex",
+ "imago",
  "libc",
  "rusqlite",
  "serde",
@@ -4611,6 +4612,7 @@ dependencies = [
  "sha2 0.10.9",
  "socket2",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

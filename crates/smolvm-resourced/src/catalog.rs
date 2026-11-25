@@ -211,12 +211,16 @@ impl Catalog {
                     [boot_id, session_id],
                 )?;
                 tx.execute_batch(include_str!("schema_escrow.sql"))?;
-                tx.execute_batch("PRAGMA user_version=2")?;
+                tx.execute_batch(include_str!("schema_blocks.sql"))?;
+                tx.execute_batch("PRAGMA user_version=3")?;
             }
-            1 | 2 => {
+            1 | 2 | 3 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=2")?;
+                }
+                if version < 3 {
+                    tx.execute_batch(include_str!("schema_blocks.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=3")?;
                 }
                 let old_boot: String =
                     tx.query_row("SELECT host_boot_id FROM worker_state", [], |r| r.get(0))?;
@@ -236,6 +240,11 @@ impl Catalog {
                     )?;
                 }
                 crate::escrow_catalog::recover(&tx, old_boot != boot_id)?;
+                tx.execute(
+                    "UPDATE writer_grants SET state='unknown',revision=revision+1
+                    WHERE state IN ('offered','attached')",
+                    [],
+                )?;
             }
             _ => {
                 return Err(conflict(
@@ -256,7 +265,8 @@ impl Catalog {
         )?;
         Ok(json!({"state":if recovering {"recovering"} else {"ready"},
             "host_boot_id":boot, "broker_session_id":session,
-            "writer_authority_supported":false, "fd_transfer_supported":true, "fd_transfer_mode":"sealed_memfd"}))
+            "writer_authority_supported":true, "writer_authority_mode":"managed_block_full_sync",
+            "fd_transfer_supported":true, "fd_transfer_mode":"sealed_memfd"}))
     }
 
     pub fn ready(&self) -> Result<()> {
@@ -279,7 +289,8 @@ impl Catalog {
         let outstanding: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM executions WHERE phase='unknown')
                 OR EXISTS (SELECT 1 FROM operations WHERE phase='NEW')
-                OR EXISTS (SELECT 1 FROM writer_reservations)
+                OR EXISTS (SELECT 1 FROM writer_reservations r LEFT JOIN writer_grants g USING(operation_id)
+                    WHERE g.grant_id IS NULL OR g.state!='attached')
                 OR EXISTS (SELECT 1 FROM fd_leases WHERE state='unknown')",
             [],
             |r| r.get(0),
@@ -455,12 +466,13 @@ impl Catalog {
             }
         }
         let occupied: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM writer_reservations WHERE operation_id=?)
+            "SELECT EXISTS (SELECT 1 FROM writer_reservations r LEFT JOIN writer_grants g USING(operation_id)
+                WHERE r.operation_id=? AND (? OR g.grant_id IS NULL OR g.state!='attached'))
              OR (? AND EXISTS (SELECT 1 FROM executions WHERE last_operation_id=?))
              OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='operation' AND owner_id=? AND state='active')
              OR EXISTS (SELECT 1 FROM fd_transfers WHERE operation_id=? AND state='staging')
              OR EXISTS (SELECT 1 FROM fd_leases WHERE operation_id=? AND state='pending')",
-            params![id, abort, id, id, id, id], |r| r.get(0))?;
+            params![id, abort, abort, id, id, id, id], |r| r.get(0))?;
         if occupied {
             return Err(conflict(
                 "E_OPERATION_HAS_EFFECTS",
@@ -933,6 +945,14 @@ impl Catalog {
     }
 
     pub fn release_reservation(&mut self, id: &str, revision: i64) -> Result<()> {
+        if self
+            .grant_for_operation(id)?
+            .is_some_and(|grant| grant.state != "released")
+        {
+            return Err(crate::grants::fence_unproven(
+                "a writer set was issued to a VMM and requires an execution fence",
+            ));
+        }
         let existing = self
             .writer_set(id)?
             .ok_or_else(|| not_found("writer reservation"))?;

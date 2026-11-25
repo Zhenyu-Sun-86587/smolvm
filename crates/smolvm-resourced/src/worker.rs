@@ -1,12 +1,13 @@
 use crate::catalog::{Catalog, Execution, NewExecution, VolumeHead};
 use crate::escrow::Escrow;
+use crate::grants::{fence_unproven, prove_live_ofd, GrantRequest};
 use crate::ipc::{self, valid_digest, valid_id, Expected, Fault, Request, Result, PROTOCOL};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use socket2::{SockAddr, Socket};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read};
@@ -272,7 +273,7 @@ fn verify_executable(pid: i32, start: i64, pidfd: &OwnedFd, wanted: &str) -> Res
     Ok(())
 }
 
-fn openat(parent: &File, name: &str, flags: i32) -> io::Result<File> {
+pub(crate) fn openat(parent: &File, name: &str, flags: i32) -> io::Result<File> {
     let name = CString::new(name)?;
     let fd = unsafe {
         libc::openat(
@@ -322,7 +323,10 @@ impl Worker {
         request.check()?;
         if !matches!(
             request.method.as_str(),
-            "RegisterGenerationBatch" | "ReconcileExecutionExports"
+            "RegisterGenerationBatch"
+                | "ReconcileExecutionExports"
+                | "ImportImmutableBlock"
+                | "ReconcileWriterSet"
         ) && (!descriptors.is_empty() || !request.fd_table.is_empty())
         {
             return Err(Fault::new(
@@ -331,6 +335,39 @@ impl Worker {
             ));
         }
         let result = match request.method.as_str() {
+            "AcquireWriterSet" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                return self.acquire_writer_set(request, &execution);
+            }
+            "AckWriterSetAttached" | "ReconcileWriterSet" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                self.attach_writer_set(request, &execution, descriptors)
+            }
+            "ImportImmutableBlock" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new(
+                        "E_PERMISSION_DENIED",
+                        "block import requires the Worker administrator",
+                    ));
+                }
+                if descriptors.len() != 1
+                    || request.fd_table.len() != 1
+                    || request.fd_table[0].role != "block_import"
+                    || request.payload.get("resource_id").and_then(Value::as_str)
+                        != Some(&request.fd_table[0].resource_id)
+                {
+                    return Err(Fault::invalid(
+                        "block import requires one matching descriptor",
+                    ));
+                }
+                crate::blocks::create(
+                    &mut self.catalog,
+                    &self.objects,
+                    request,
+                    descriptors.into_iter().next(),
+                    true,
+                )
+            }
             "RegisterGenerationBegin"
             | "RegisterGenerationBatch"
             | "RegisterGenerationCommit"
@@ -514,6 +551,13 @@ impl Worker {
                 let head: VolumeHead = request.payload()?;
                 let (_, identity) = self.open_backing(&head.head_resource_id)?;
                 self.catalog.register_volume(request, &head, &identity)
+            }
+            "CreateVolumeHead" => {
+                crate::blocks::create(&mut self.catalog, &self.objects, request, None, false)
+            }
+            "QueryBlockClosure" => {
+                let data: ResourceId = request.payload()?;
+                Ok(json!({"layers":self.catalog.block_closure(&data.resource_id)?}))
             }
             "ReserveWriterSet" => self.reserve(request),
             "QueryWriterSet" => self.writer_status(required_operation_id(request)?),
@@ -743,6 +787,26 @@ impl Worker {
                 return Err(unsafe_fence());
             }
         }
+        for grant in self.catalog.grants_for_execution(&execution)? {
+            let set = self
+                .catalog
+                .writer_set(&grant.operation_id)?
+                .ok_or_else(|| fence_unproven("recorded writer reservation is missing"))?;
+            // Closing any broker copy first lets a fresh description test for a
+            // surviving external holder, including a forked child of the VMM.
+            self.catalog.forget_offered_writer(&grant)?;
+            self.reserved.remove(&grant.operation_id);
+            let mut proof = Vec::new();
+            for head in set.heads {
+                let closure = self.catalog.block_closure(&head.head_resource_id)?;
+                let file = crate::blocks::open_object(&self.objects, &closure[0], true)?;
+                ofd_lock(&file)
+                    .map_err(|_| fence_unproven("a writer OFD still locks the recorded backing"))?;
+                file.sync_all().map_err(broker_error)?;
+                proof.push(file);
+            }
+            self.catalog.release_confirmed_grant(&grant)?;
+        }
         let result = self.catalog.finalize_execution(&execution)?;
         self.executions.remove(&execution.incarnation_id);
         self.escrow.forget_execution(&execution.incarnation_id);
@@ -821,12 +885,153 @@ impl Worker {
         self.writer_status(&op.operation_id)
     }
 
+    fn acquire_writer_set(&mut self, request: &Request, execution: &Execution) -> Result<Reply> {
+        let operation = self.catalog.active_operation(request)?;
+        let input: GrantRequest = request.payload()?;
+        let set = self
+            .catalog
+            .writer_set(&operation.operation_id)?
+            .ok_or_else(|| Fault::new("E_NOT_FOUND", "writer reservation does not exist"))?;
+        let parked = self.reserved.get(&operation.operation_id).ok_or_else(|| {
+            fence_unproven("worker no longer holds the original reservation descriptors")
+        })?;
+        if parked.len() != set.heads.len() {
+            return Err(fence_unproven(
+                "worker reservation descriptor set is incomplete",
+            ));
+        }
+        let mut descriptors = Vec::new();
+        let mut table = Vec::new();
+        let mut provided = HashSet::new();
+        let mut layouts = Vec::new();
+        for (head, lock) in set.heads.iter().zip(parked) {
+            let layers = self
+                .catalog
+                .block_closure(&head.head_resource_id)
+                .map_err(|error| {
+                    if error.code == "E_NOT_FOUND" {
+                        Fault::new(
+                            "E_CAPABILITY_UNSUPPORTED",
+                            "writer grants require broker-created managed heads",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+            if layers[0].spec.volume_id.as_ref() != Some(&head.volume_id)
+                || crate::blocks::backing_identity(lock).map_err(broker_error)?
+                    != layers[0].backing_identity
+            {
+                return Err(fence_unproven(
+                    "writer reservation does not match the managed head",
+                ));
+            }
+            for (index, layer) in layers.iter().enumerate() {
+                if !provided.insert(layer.spec.resource_id.clone()) {
+                    if index == 0 {
+                        return Err(fence_unproven("writer grant repeats a writable head"));
+                    }
+                    continue;
+                }
+                if descriptors.len() == ipc::MAX_FDS {
+                    return Err(Fault::new(
+                        "E_RESOURCE_LIMIT",
+                        "complete block closure exceeds one descriptor packet",
+                    ));
+                }
+                let fd = if index == 0 {
+                    lock.try_clone().map_err(broker_error)?
+                } else {
+                    crate::blocks::open_object(&self.objects, layer, false)?
+                };
+                table.push(ipc::FdEntry {
+                    index: descriptors.len(),
+                    resource_id: layer.spec.resource_id.clone(),
+                    role: if index == 0 {
+                        "block_writer"
+                    } else {
+                        "block_ancestor"
+                    }
+                    .into(),
+                });
+                descriptors.push(OwnedFd::from(fd));
+            }
+            layouts.push(json!({"head":head, "layers":layers}));
+        }
+        let grant = self
+            .catalog
+            .offer_writer_grant(&operation.operation_id, &input, execution)?;
+        Ok(Reply {
+            result: json!({"grant":grant,"block_sets":layouts}),
+            table,
+            descriptors,
+            delivered: None,
+        })
+    }
+
+    fn attach_writer_set(
+        &mut self,
+        request: &Request,
+        execution: &Execution,
+        descriptors: Vec<OwnedFd>,
+    ) -> Result<Value> {
+        let operation = self.catalog.matching_operation(request)?;
+        let input: GrantRequest = request.payload()?;
+        let grant = self
+            .catalog
+            .writer_grant(&input.grant_id)?
+            .ok_or_else(|| Fault::new("E_NOT_FOUND", "writer grant does not exist"))?;
+        if !grant.belongs_to(&operation.operation_id, execution) {
+            return Err(Fault::new(
+                "E_PERMISSION_DENIED",
+                "writer grant belongs to another execution",
+            ));
+        }
+        let reconcile = request.method == "ReconcileWriterSet";
+        if reconcile {
+            let set = self
+                .catalog
+                .writer_set(&grant.operation_id)?
+                .ok_or_else(|| fence_unproven("recorded writer reservation is missing"))?;
+            if descriptors.len() != set.heads.len() || descriptors.len() != request.fd_table.len() {
+                return Err(fence_unproven(
+                    "writer re-export requires every writable head",
+                ));
+            }
+            for ((head, entry), fd) in set.heads.iter().zip(&request.fd_table).zip(descriptors) {
+                if entry.role != "block_writer" || entry.resource_id != head.head_resource_id {
+                    return Err(fence_unproven(
+                        "writer re-export descriptor order or identity changed",
+                    ));
+                }
+                let closure = self.catalog.block_closure(&head.head_resource_id)?;
+                let expected = crate::blocks::open_object(&self.objects, &closure[0], true)?;
+                prove_live_ofd(&expected, &File::from(fd))?;
+            }
+        } else if grant.state == "offered" && !self.reserved.contains_key(&grant.operation_id) {
+            return Err(fence_unproven(
+                "offered writer set must be reconciled after broker restart",
+            ));
+        }
+        let attached =
+            self.catalog
+                .attach_writer_grant(&grant, input.expected_revision, reconcile)?;
+        self.reserved.remove(&grant.operation_id);
+        Ok(json!(attached))
+    }
+
     fn writer_status(&self, id: &str) -> Result<Value> {
         let Some(set) = self.catalog.writer_set(id)? else {
             return Ok(
                 json!({"operation_id":id,"heads":[],"state":"absent","revision":0,"writer_authority":false}),
             );
         };
+        if let Some(grant) = self.catalog.grant_for_operation(id)? {
+            return Ok(json!({
+                "operation_id":id,"heads":set.heads,"state":grant.state,"revision":grant.revision,
+                "writer_authority":grant.state=="attached","grant":grant
+            }));
+        }
         let state = if set.state == "reserved" && !self.reserved.contains_key(id) {
             "unknown"
         } else {

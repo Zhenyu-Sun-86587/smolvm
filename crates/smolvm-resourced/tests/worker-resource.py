@@ -224,7 +224,8 @@ class WorkerResource(unittest.TestCase):
         self.call("ReserveWriterSet", {"heads": [heads[0]]}, error="E_VOLUME_WRITER_CONFLICT", **second)
         self.call("ReserveWriterSet", {"heads": [heads[2], heads[1]]}, error="E_VOLUME_WRITER_CONFLICT", **second)
         self.assertEqual(self.call("QueryWriterSet", operation_id="reserve-b")["state"], "absent")
-        self.call("AcquireWriterSet", {"heads": [heads[1]]}, error="E_CAPABILITY_UNSUPPORTED", **second)
+        self.call("AcquireWriterSet", {"grant_id": "unauthorized", "expected_revision": 1},
+                  error="E_PERMISSION_DENIED", **second)
 
         self.stop(self.process)
         self.start()

@@ -34,7 +34,7 @@ The request envelope uses `protocol`, `method`, `request_id`, and `payload`. Sco
 | `ReconcileExecution` | An existing process reestablishes its recorded process identity after a broker restart. |
 | `CompleteRecovery` | Transitions to ready using the current `broker_session_id` after resolving unknown executions and leases, pending intents and held reservations. |
 
-Reservations report `writer_authority=false`. Actual writer grants, StatePoint publication and VMM activation return `E_CAPABILITY_UNSUPPORTED`. Recovery retains unknown reservations and blocks new admissions and GC. The catalog uses WAL, foreign keys and FULL synchronous writes.
+Reservations report `writer_authority=false`. Managed block writer grants use the explicit FD protocol below. StatePoint publication and activation need the corresponding capture and identity protocols. Recovery retains unknown reservations and blocks new admissions and GC. The catalog uses WAL, foreign keys and FULL synchronous writes.
 
 Local Linux control code can call `smolvm_resourced::client::query_operation(socket_path, bundle_digest, operation_id)`. It returns a typed operation receipt in the deep route and preserves the worker's error code.
 
@@ -71,3 +71,26 @@ LD_LIBRARY_PATH="$FIRMWARE_DIR" python3 -B crates/smolvm-resourced/tests/kvm-gen
 The probe snapshots a two-vCPU, 512 MiB guest and sends the sealed RAM directly from the VMM process. It restarts the broker and recovers the backing from the original VMM while the operation pin is held. It then kills the source and deletes its original capture directory. The child restores from the small checkpoint and the broker's read-only memfd lease. It advances the inherited guest counter, reads the saved sentinel and uses private mappings of the original backing. The probe restarts the broker again while the child keeps executing and confirms recovery from the child's retained lease. A grandchild resumes after its own parent exits using a generation that shares the original backings and adds private deltas.
 
 On the project KVM worker with Linux guest kernel 6.18.60, the source captured at tick 3 using three sealed backings. The child first ran at tick 4, read the sentinel at tick 9, and advanced to tick 11 through broker restart. The grandchild first ran at tick 12 using six sealed backings. The child and grandchild mapped those backings privately. The separate WorkerResource integration tests cover the two-bundle OFD writer-reservation conflict and restart fence. The diskless probe covers RAM and VMM continuation. Full writable block attachment, process isolation policy, guest identity, and product activation remain separate acceptance gates.
+
+## Managed blocks and writer grants
+
+Import a raw base with `ImportImmutableBlock` under an active catalog operation. Supply `resource_id`, `capacity_bytes`, and the expected `content_sha256`, plus an `O_RDONLY` descriptor with the `block_import` role. The broker copies and verifies the bytes in a private object directory, publishes a durable immutable generation, then allows the staging file to be removed.
+
+Call `CreateVolumeHead` with a unique `resource_id`, `volume_id` and `capacity_bytes`. Pass `backing_id` to create a thin qcow2 head over the exact immutable generation. A head without a backing is sparse raw. The committed closure is available through `QueryBlockClosure`. Qcow2 headers store backing resource IDs. The VMM matches those IDs and formats to supplied ancestor FDs.
+
+1. The control process reserves a complete set of heads with `ReserveWriterSet`.
+2. The registered VMM calls `AcquireWriterSet` under that operation with a new `grant_id` and the reservation's `expected_revision`. The broker records the offer before delivering the entire set. The `block_writer` entries carry the locked `O_RDWR` descriptions. The `block_ancestor` entries carry read-only immutable descriptions.
+3. The VMM installs the full device set with `krun_attach_block_set_v1` and calls `AckWriterSetAttached` with the grant revision. This drops the broker's writer duplicates and allows the control operation to finish while the actual grant remains live. The supplied libkrun path uses the original open file descriptions and full synchronous block I/O.
+4. A surviving VMM reestablishes its process identity after restart and calls `ReconcileWriterSet` with the unknown grant revision and every exact writable descriptor. The broker verifies the inode and existing exclusive OFD for each head. A failed or partial proof preserves the grant.
+5. Finalizing a dead execution requires fresh exclusive OFD locks on all issued heads and a successful sync. An OFD inherited by another process prevents release even after the registered VMM exits.
+
+The x86-64 KVM block probe boots two distinct registered executions. The first reads the shared immutable base from two qcow2 heads and writes and flushes distinct markers. Broker restart recovers the live writer, and a deliberately inherited duplicate prevents death fencing. Once that holder exits, the second execution acquires both heads and reads both persisted markers. The immutable base stays byte-for-byte identical.
+
+```sh
+cc -O2 -Wall -Wextra -Werror -static \
+  crates/smolvm-resourced/tests/kvm-block-guest.c -o "$GUEST_TEST_BIN"
+LD_LIBRARY_PATH="$FIRMWARE_DIR" python3 -B crates/smolvm-resourced/tests/kvm-block.py \
+  target/debug/smolvm-resourced "$LIBKRUN_SO" "$GUEST_TEST_BIN"
+```
+
+The current ABI attaches managed disk sets at cold boot. Captured multi-disk pivots, live detach, online expansion and exact-generation restore require the held capture and activation path.
