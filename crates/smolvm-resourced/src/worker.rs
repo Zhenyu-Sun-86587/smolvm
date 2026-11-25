@@ -934,7 +934,7 @@ impl Worker {
             "ApplyPrivatePacketWakeRule" | "QueryPrivatePacketWakeRule" | "QueryPrivatePacketWakeEndpoint" =>
                 self.network.packet_rule(&mut self.catalog, request),
             "QueryLifecycleEvents"|"ApplyLifecyclePolicy"|"GetLifecycleStatus"|"ReportActivity"|"AcquireActivityHold"|"ReleaseActivityHold"|"AcquireRunningLease"|"RenewRunningLease"|
-            "ReleaseRunningLease"|"RequestWake"|"AuthorizeWakeActivation"|"CancelWakeDemand"|"QueryProtection" =>
+            "ReleaseRunningLease"|"RequestWake"|"AuthorizeWakeActivation"|"CancelWakeDemand"|"CloseAccessProtection"|"QueryProtection" =>
                 crate::lifecycle_controller::handle(&mut self.catalog,request),
             "QueryHostActivity" => {
                 let source=self.scoped_execution(request)?;

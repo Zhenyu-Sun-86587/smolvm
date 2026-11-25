@@ -94,6 +94,28 @@ pub(crate) fn mutate(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> 
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional()?;
     let (_, policy) = row_policy(tx, machine)?;
     match r.method.as_str() {
+        "CloseAccessProtection" => {
+            // A platform connection owns one random ID for its full lifetime,
+            // including a demand promoted to a hold on a new execution.
+            if !id.starts_with("access-") {
+                return Err(invalid("expected a platform access ID"));
+            }
+            if let Some((kind, _, state, owner, ..)) = prior {
+                if owner != input.principal || kind == "lease" {
+                    return Err(Fault::new("E_PERMISSION_DENIED", "access owner differs"));
+                }
+                if state != "released" {
+                    release(tx, machine, id, "connection closed")?;
+                    bump(tx, machine, true)?;
+                }
+            } else {
+                // A close can overtake a delayed first RPC. Recording it in
+                // the same transaction prevents that RPC from creating a hold.
+                tx.execute("INSERT INTO lifecycle_protections(instance_id,id,kind,principal,incarnation_id,epoch,revision,state,reason)
+                    VALUES(?,?,'hold',?,?,?,1,'released','connection closed before admission')",
+                    params![machine,id,input.principal,expected.incarnation_id,expected.execution_epoch])?;
+            }
+        }
         "AcquireActivityHold" | "AcquireRunningLease" | "RequestWake" => {
             if prior.is_some() || input.expected_revision.unwrap_or(0) != 0 {
                 return Err(changed("protection ID was already allocated"));

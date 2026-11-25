@@ -194,10 +194,10 @@ fn report(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> Result<Valu
         _ => &["inbound", "outbound"],
     };
     if required.iter().any(|k| !input.counts.contains_key(*k))
-        || input
-            .counts
-            .keys()
-            .any(|key| !required.contains(&key.as_str()) && !(input.collector=="platform" && key=="legacy_lease"))
+        || input.counts.keys().any(|key| {
+            !required.contains(&key.as_str())
+                && !(input.collector == "platform" && key == "legacy_lease")
+        })
     {
         return Err(invalid(
             "activity report must describe the complete collector scope",
@@ -319,7 +319,12 @@ pub(crate) fn handle(c: &mut Catalog, r: &Request) -> Result<Value> {
         }
         return serde_json::from_str(&answer).map_err(invalid);
     }
-    if actual != *expected && r.method != "ApplyLifecyclePolicy" {
+    if actual != *expected
+        && !matches!(
+            r.method.as_str(),
+            "ApplyLifecyclePolicy" | "CloseAccessProtection"
+        )
+    {
         return Err(Fault::new(
             "E_STALE_EXECUTION",
             "lifecycle request refers to a different execution",
