@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 int main(void)
@@ -37,6 +38,24 @@ int main(void)
     }
     puts(observer ? "BLOCK_OBSERVED_BOTH" : "BLOCK_FLUSHED_BOTH");
     fflush(stdout);
+    if (getenv("WORKER_BLOCK_PIVOT") != NULL) {
+        unsigned int tick = 0;
+        int writers[] = {open(paths[0], O_RDWR), open(paths[1], O_RDWR)};
+        if (writers[0] < 0 || writers[1] < 0)
+            return 5;
+        for (;;) {
+            ++tick;
+            for (size_t index = 0; index < 2; ++index) {
+                memset(sector, (int)(tick + index), sizeof(sector));
+                if (pwrite(writers[index], sector, sizeof(sector), 8192) != sizeof(sector)
+                    || fsync(writers[index]) != 0)
+                    return 6;
+            }
+            printf("BLOCK_RUNNING tick=%u\n", tick);
+            fflush(stdout);
+            nanosleep(&(struct timespec){.tv_nsec = 150000000}, NULL);
+        }
+    }
     for (;;)
         pause();
 }

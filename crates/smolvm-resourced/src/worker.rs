@@ -337,6 +337,12 @@ impl Worker {
             ));
         }
         let result = match request.method.as_str() {
+            "QueryWriterPivot"
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } =>
+            {
+                let execution = self.authenticated_execution(request, peer)?;
+                crate::pivots::query_execution(&self.catalog, request, &execution)
+            }
             "PrepareWriterPivot" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 let offer = crate::pivots::prepare(
