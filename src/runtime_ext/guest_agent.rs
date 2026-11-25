@@ -158,9 +158,13 @@ async fn upload(
         if data.len() > MAX_PAYLOAD {
             return Err(invalid("Guest file exceeds the private API payload limit"));
         }
-        agent
-            .write_file(&input.path, &data, input.mode)
-            .map_err(unavailable)?;
+        if !agent.supports_capability(smolvm_protocol::SYSTEM_FILE_WRITE_CAPABILITY).map_err(unavailable)? {
+            return Err(QueryError {
+                code: "E_CAPABILITY_UNSUPPORTED".into(),
+                message: "the guest does not advertise System file writes".into(),
+            });
+        }
+        agent.write_system_file(&input.path, &data, input.mode).map_err(unavailable)?;
         Ok(json!({"bytes_written": data.len()}))
     })
     .await

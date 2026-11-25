@@ -2563,7 +2563,10 @@ fn handle_connection(
             let response = match request {
                 AgentRequest::Ping => AgentResponse::Pong {
                     version: PROTOCOL_VERSION,
-                    capabilities: vec!["system-service-v1".to_owned()],
+                    capabilities: vec![
+                        "system-service-v1".to_owned(),
+                        smolvm_protocol::SYSTEM_FILE_WRITE_CAPABILITY.to_owned(),
+                    ],
                 },
                 request @ AgentRequest::VmExec {
                     background: false,
@@ -2573,6 +2576,17 @@ fn handle_connection(
                 } => {
                     let _permit = WORK_SLOTS.acquire();
                     handle_request(request, Some(stream.as_raw_fd()))
+                }
+                AgentRequest::FileWrite {
+                    path,
+                    data,
+                    mode,
+                    uid,
+                    gid,
+                    target: Some(WorkloadTarget::Vm),
+                } if data.len() <= smolvm_protocol::FILE_WRITE_SINGLE_SHOT_MAX => {
+                    let _permit = WORK_SLOTS.acquire();
+                    handle_file_write(&path, &data, mode, uid, gid, Some(&WorkloadTarget::Vm))
                 }
                 _ => AgentResponse::error(
                     "request is unavailable in the system Agent service",

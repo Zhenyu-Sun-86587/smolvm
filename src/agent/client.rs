@@ -3576,6 +3576,17 @@ impl AgentClient {
         self.write_file_with_progress(path, data, FileWriteMeta::mode_only(mode), |_| {})
     }
 
+    #[cfg(feature = "deep-runtime")]
+    pub(crate) fn write_system_file(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<()> {
+        if data.len() > FILE_WRITE_SINGLE_SHOT_MAX {
+            return Err(Error::agent("write System file", "payload exceeds single-frame limit"));
+        }
+        let previous = self.file_target.replace(WorkloadTarget::Vm);
+        let result = self.write_file(path, data, mode);
+        self.file_target = previous;
+        result
+    }
+
     /// Write a file into the VM with a progress callback.
     ///
     /// `on_progress` is called after each chunk is acked by the

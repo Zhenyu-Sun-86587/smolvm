@@ -105,6 +105,9 @@ pub mod base64_bytes {
 /// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The System Agent accepts bounded writes to its own VM filesystem.
+pub const SYSTEM_FILE_WRITE_CAPABILITY: &str = "system-file-write-v1";
+
 /// The agent can freeze internal filesystems before acknowledging shutdown.
 pub const QUIESCED_SHUTDOWN_CAPABILITY: &str = "quiesced-shutdown-v1";
 /// Guest supports preparing file access without executing a command from the image.
