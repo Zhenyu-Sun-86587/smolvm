@@ -35,8 +35,6 @@ jobs:
   runtime:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    container:
-      image: ${{ inputs.builder_image }}
     defaults:
       run:
         shell: bash
@@ -77,7 +75,7 @@ jobs:
           [[ "$(git -C platform rev-parse HEAD)" == "$PLATFORM_COMMIT" ]]
           locks="$(realpath -e -- "platform/$LOCK_DIRECTORY")"
           [[ "$locks" == "$GITHUB_WORKSPACE/platform/"* ]]
-          mkdir stage
+          mkdir -p stage/home
           for input in kernel seed; do
             if [[ "$input" == kernel ]]; then
               url="$KERNEL_ARCHIVE_URL"
@@ -87,13 +85,20 @@ jobs:
             curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
               --retry 3 --output "stage/$input" -- "$url"
           done
-          options=(--source-lock "$locks/build-lock.json" --toolchain-lock "$locks/toolchain-lock.json"
-                   --kernel-archive "$GITHUB_WORKSPACE/stage/kernel" --builder-image "$BUILDER_IMAGE"
-                   --bundle-tool "$GITHUB_WORKSPACE/platform/packaging/deep/bundle.py" --jobs 2)
-          smolvm/scripts/deep/build-bundle.sh "${options[@]}" --stage libraries --output stage/libraries
-          smolvm/scripts/deep/build-bundle.sh "${options[@]}" --stage runtime --output stage/runtime \
-            --libraries stage/libraries --rootfs-seed stage/seed \
-            --rootfs-input-lock scripts/deep/locks/oci-x86_64.json
+          docker run --rm --pull always --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" --env HOME=/stage/home \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/smolvm,dst=/smolvm,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/platform,dst=/platform,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/stage,dst=/stage" \
+            --entrypoint /bin/bash "$BUILDER_IMAGE" -euo pipefail -c '
+              options=(--source-lock "$1/build-lock.json" --toolchain-lock "$1/toolchain-lock.json"
+                       --kernel-archive /stage/kernel --builder-image "$2"
+                       --bundle-tool /platform/packaging/deep/bundle.py --jobs 2)
+              /smolvm/scripts/deep/build-bundle.sh "${options[@]}" --stage libraries --output /stage/libraries
+              /smolvm/scripts/deep/build-bundle.sh "${options[@]}" --stage runtime --output /stage/runtime \
+                --libraries /stage/libraries --rootfs-seed /stage/seed \
+                --rootfs-input-lock scripts/deep/locks/oci-x86_64.json
+            ' bash "/platform/${locks#"$GITHUB_WORKSPACE/platform/"}" "$BUILDER_IMAGE"
           tar -C stage/runtime -czf stage/runtime-x86_64.tar.gz .
 
       - uses: actions/upload-artifact@v4
