@@ -284,6 +284,20 @@ impl PrivateRouter {
 }
 
 impl QuarantinedPort {
+    pub(crate) fn forward_wake_datagram(&self, datagram: crate::packet_wake::Datagram) -> io::Result<()> {
+        let router = self.router_link.router.clone();
+        thread::Builder::new()
+            .name("forward-wake-datagram".into())
+            .spawn(move || {
+                if unsafe { libc::setns(router.namespace().as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                datagram.forward()
+            })?
+            .join()
+            .map_err(|_| io::Error::other("private datagram sender panicked"))?
+    }
+
     pub(crate) fn observe_ingress(&self) -> io::Result<OwnedFd> {
         let router = self.router_link.router.clone();
         let interface = std::ffi::CString::new(self.router_link.name.as_str())?;
