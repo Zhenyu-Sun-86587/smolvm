@@ -196,10 +196,14 @@ def run(args):
 
     worker = str(directory / "worker.sock")
     processes = []
-    with (directory / "worker.log").open("wb") as log:
-        worker_process = subprocess.Popen([args.worker, "serve", "--socket", worker, "--state-dir", directory / "state"],
-                                          stdin=subprocess.DEVNULL, stdout=log, stderr=log)
-    processes.append(worker_process)
+    def start_worker():
+        with (directory / "worker.log").open("ab") as log:
+            process = subprocess.Popen([args.worker, "serve", "--socket", worker, "--state-dir", directory / "state"],
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+        processes.append(process)
+        return process
+
+    worker_process = start_worker()
 
     try:
         probe.until(lambda: rpc(worker, "Health"))
@@ -276,6 +280,8 @@ def run(args):
             tap = probe.until(attached)
             source_ip = tap["attachment"]["private_ipv4"]
             assert tap["gate"] == "closed" and not ping(router_ns, source_ip), tap
+            rpc(worker, "FinishOperation", {"abort": False, "expected_revision": 1},
+                error="E_FENCE_UNPROVEN", **src)
             publish = {"attachment_id": "source-tap", "lease_id": tap["lease_id"],
                        "expected_revision": tap["revision"]}
             rpc(worker, "PublishInitialNetworkAttachment", {**publish, "expected_revision": tap["revision"] - 1},
@@ -314,6 +320,7 @@ def run(args):
 
         acquired = directory / "child-acquired"
         child, child_ctl, child_command, child_rows = launch("child", {"restore": str(point), "acquired": str(acquired)})
+        child_process = processes[-1]
         probe.until(lambda: (acquired.exists(), child_rows())[0], 15)
         plan = {"capture_resource_id": "source-ram", "capture_anchor": anchor, "profile_digest": digest(b"profile"),
                 "helper_digest": "sha256:" + helper}
@@ -352,6 +359,24 @@ def run(args):
                                                                "expected_revision": tap["revision"]},
                 error="E_INVALID_REQUEST", **child)
             assert not ping(router_ns, tap["attachment"]["private_ipv4"])
+        if args.restart_before_commit:
+            worker_process.kill()
+            worker_process.wait(timeout=5)
+            start_worker()
+            probe.until(lambda: rpc(worker, "Health")["state"] == "recovering")
+            recovered = rpc(worker, "QueryTargetActivation", **child)
+            assert recovered["phase"] == "unknown" and recovered["decision"] == "none", recovered
+            rpc(worker, "CommitActivation", {"expected_revision": identity_ready["revision"]},
+                error="E_STALE_EXECUTION", **child)
+            assert probe.wire(child_ctl, "RESUME").startswith("ERR EBUSY")
+            assert not child_rows() and source_rows() == parked
+            if args.network:
+                tap = rpc(worker, "QueryNetworkAttachment", {"attachment_id": "child-tap"}, **child)
+                assert tap["gate"] == "unknown" and tap["state"] == "unknown", tap
+                rpc(worker, "ReleaseNetworkReservation", {"attachment_id": "child-tap", "expected_revision": 1},
+                    error="E_FENCE_UNPROVEN", **scope(bundle, "child", "child-op"))
+            print("Worker loss before the decision retained the parked Guest and fenced the reservation")
+            return
         rpc(worker, "CommitActivation", {"expected_revision": identity_ready["revision"] - 1},
             error="E_STALE_REVISION", **child)
         choose = {"expected_revision": identity_ready["revision"]}
@@ -377,6 +402,13 @@ def run(args):
             probe.until(lambda: len(source_rows()) >= len(parked) + 2)
             assert source_rows()[-1][1:] == parked[-1][1:]
             assert ping(router_ns, source_ip) and ping(router_ns, att["private_ipv4"])
+            child_process.terminate()
+            child_process.wait(timeout=5)
+            dead = rpc(worker, "FinalizeExecutionExit", **child)
+            assert dead["phase"] == "exited", dead
+            rpc(worker, "QueryNetworkAttachment", {"attachment_id": "child-tap"},
+                error="E_NOT_FOUND", **child)
+            assert not ping(router_ns, att["private_ipv4"]) and ping(router_ns, source_ip)
         print(f"Worker pidfd + sealed RAM + KVM target authority passed; network={args.network}; "
               f"source and child retain PID {parked[-1][1].decode()}; journal revision {released['revision']}")
     finally:
@@ -401,6 +433,7 @@ if __name__ == "__main__":
     parser.add_argument("--boot", type=Path)
     parser.add_argument("--network", action="store_true")
     parser.add_argument("--fixed-internal", action="store_true")
+    parser.add_argument("--restart-before-commit", action="store_true")
     args = parser.parse_args()
     if args.fixed_internal:
         args.network = True
