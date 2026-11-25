@@ -19,7 +19,7 @@ struct Input {
     authorized: Option<bool>,
 }
 
-pub(super) fn revision(expected: &Expected) -> Result<i64> {
+pub(crate) fn revision(expected: &Expected) -> Result<i64> {
     expected
         .execution_epoch
         .checked_mul(2)
@@ -63,7 +63,7 @@ pub(super) fn receipt(db: &Connection, instance: &str, id: &str) -> Result<Value
             "endpoint_revision":r.get::<_,Option<i64>>(9)?})))?)
 }
 
-pub(super) fn mutate(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> Result<Value> {
+pub(crate) fn mutate(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> Result<Value> {
     let input: Input = r.payload()?;
     let machine = &expected.instance_id;
     let id = &input.protection_id;

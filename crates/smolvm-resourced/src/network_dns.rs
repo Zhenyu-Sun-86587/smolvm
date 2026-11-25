@@ -68,7 +68,7 @@ impl Resolver {
                 while active.load(Ordering::Relaxed) {
                     match socket.recv_from(&mut query) {
                         Ok((n, peer)) => {
-                            if let Some(reply) = answer(&db, &network_id, &query[..n]) {
+                            if let Some(reply) = answer(&db, &network_id, peer.ip(), &query[..n]) {
                                 let _ = socket.send_to(&reply, peer);
                             }
                         }
@@ -102,12 +102,15 @@ impl Drop for Resolver {
     }
 }
 
-fn answer(db: &Connection, network: &str, packet: &[u8]) -> Option<Vec<u8>> {
+fn answer(db: &Connection, network: &str, peer: IpAddr, packet: &[u8]) -> Option<Vec<u8>> {
     if !dns::is_plain_query(packet) {
         return None;
     }
     let name = dns::normalize_hostname(&dns::question_name(packet)?)?;
-    let address = lookup(db, network, &name);
+    let address = lookup(db, network, &name).and_then(|entry| match (entry, peer) {
+        (None, IpAddr::V4(peer)) => crate::packet_wake::sleeping_address(db, network, &name, peer),
+        _ => Ok(entry),
+    });
     let mut reply = match address {
         Ok(Some(address)) => dns::addresses_response(packet, &[IpAddr::V4(address)], RESPONSE_TTL),
         Ok(None) => dns::error_response(packet, dns::DNS_RCODE_NXDOMAIN),

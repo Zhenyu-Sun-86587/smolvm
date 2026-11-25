@@ -13,6 +13,7 @@ use std::os::fd::OwnedFd;
 pub(crate) struct NetworkRuntime {
     routers: HashMap<String, PrivateRouter>,
     ports: HashMap<String, QuarantinedPort>,
+    packet_wake: crate::packet_wake::Observer,
 }
 
 #[derive(Deserialize)]
@@ -55,6 +56,14 @@ enum Transport {
 }
 
 impl NetworkRuntime {
+    pub(crate) fn packet_rule(&mut self, catalog: &mut Catalog, request: &Request) -> Result<serde_json::Value> {
+        self.packet_wake.rule(catalog, request, &self.ports)
+    }
+
+    pub(crate) fn poll_packet_wake(&mut self, catalog: &mut Catalog) -> Result<()> {
+        self.packet_wake.poll(catalog, &self.ports)
+    }
+
     pub(crate) fn activity(&self,catalog:&Catalog,execution:&Execution)->Result<serde_json::Value> {
         let op=catalog.operation(&execution.last_operation_id)?;
         let plan=crate::managed::plan(catalog,&op)?.ok_or_else(||Fault::new("E_RESOURCE_UNAVAILABLE","no authoritative network inventory"))?;
@@ -425,6 +434,7 @@ impl NetworkRuntime {
         port.fence().map_err(host_error)?;
         catalog.retire_fenced_tap(lease)?;
         self.ports.remove(attachment_id);
+        self.packet_wake.fence(attachment_id);
         let domain = &lease.attachment.route_domain_id;
         if self.routers.get(domain).is_some_and(PrivateRouter::idle) {
             self.routers.remove(domain);

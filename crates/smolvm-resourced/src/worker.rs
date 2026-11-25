@@ -928,6 +928,8 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            "ApplyPrivatePacketWakeRule" | "QueryPrivatePacketWakeRule" | "QueryPrivatePacketWakeEndpoint" =>
+                self.network.packet_rule(&mut self.catalog, request),
             "QueryLifecycleEvents"|"ApplyLifecyclePolicy"|"GetLifecycleStatus"|"ReportActivity"|"AcquireActivityHold"|"ReleaseActivityHold"|"AcquireRunningLease"|"RenewRunningLease"|
             "ReleaseRunningLease"|"RequestWake"|"AuthorizeWakeActivation"|"CancelWakeDemand"|"QueryProtection" =>
                 crate::lifecycle_controller::handle(&mut self.catalog,request),
@@ -2361,6 +2363,9 @@ fn serve(
     let mut next_stop_check = Instant::now() + Duration::from_secs(1);
     loop {
         if Instant::now() >= next_stop_check {
+            if let Err(error) = worker.network.poll_packet_wake(&mut worker.catalog) {
+                eprintln!("resourced private packet wake: {error}");
+            }
             if let Err(e)=worker.lifecycle.tick(&mut worker.catalog,&worker.boot) {
                 eprintln!("resourced lifecycle controller: {} {}",e.code,e.message);
             }
