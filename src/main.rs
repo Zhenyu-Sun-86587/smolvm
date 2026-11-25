@@ -49,6 +49,11 @@ enum Commands {
     #[command(subcommand)]
     Serve(cli::serve::ServeCmd),
 
+    /// Inspect a local deep runtime
+    #[cfg(target_os = "linux")]
+    #[command(subcommand)]
+    Runtime(cli::runtime::RuntimeCmd),
+
     /// Package and run self-contained VM executables
     #[command(subcommand)]
     Pack(Box<cli::pack::PackCmd>),
@@ -292,6 +297,8 @@ fn run_cli() {
     let result = match cli.command {
         Commands::Machine(cmd) => (*cmd).run(),
         Commands::Serve(cmd) => cmd.run(),
+        #[cfg(target_os = "linux")]
+        Commands::Runtime(cmd) => cmd.run(),
         Commands::Pack(cmd) => (*cmd).run(),
         Commands::Config(cmd) => cmd.run(),
         #[cfg(unix)]

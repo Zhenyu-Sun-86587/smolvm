@@ -190,3 +190,6 @@ pub const ENGINE_BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("SMO
 
 /// On-demand standard SSH access to local machine environments.
 pub mod ssh;
+
+#[cfg(target_os = "linux")]
+mod runtime_ext;

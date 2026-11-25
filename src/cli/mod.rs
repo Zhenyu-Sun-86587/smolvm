@@ -20,6 +20,8 @@ pub mod pack_run;
 pub mod parsers;
 pub mod port_listen;
 pub mod proxy_opts;
+#[cfg(target_os = "linux")]
+pub mod runtime;
 pub mod serve;
 pub mod serve_tls;
 pub mod smolfile;
