@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use zeroize::{Zeroize, Zeroizing};
 
-const NAME: &CStr = c"machine-id";
+mod network;
 const FRAME: usize = 192;
 const ACK: usize = 80;
 const HOSTNAME: u32 = 1;
@@ -43,8 +43,7 @@ impl<'a> Identity<'a> {
         // acknowledgement against its own active context.
         let epoch = u64::from_le_bytes(frame[24..32].try_into().unwrap());
         let name_len = frame[112] as usize;
-        if &frame[..4] != b"SGI1"
-            || frame[4..8] != [1, 0, 0, 0]
+        if !matches!(&frame[..8], b"SGI1\x01\0\0\0" | b"SGI2\x02\0\0\0")
             || epoch == 0
             || frame[8..24].iter().all(|&v| v == 0)
             || frame[32..64].iter().all(|&v| v == 0)
@@ -82,11 +81,11 @@ impl<'a> Identity<'a> {
 
 // Use an unnamed file and a challenge-derived temporary link within the pinned
 // Guest directory. A partial write cannot truncate the installed machine ID.
-fn install_machine_id(dir: &File, desired: &[u8; 33], nonce: &[u8]) -> io::Result<()> {
+fn install_file(dir: &File, destination: &CStr, desired: &[u8], nonce: &[u8]) -> io::Result<()> {
     let raw = unsafe {
         libc::openat(
             dir.as_raw_fd(),
-            NAME.as_ptr(),
+            destination.as_ptr(),
             libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         )
     };
@@ -95,7 +94,7 @@ fn install_machine_id(dir: &File, desired: &[u8; 33], nonce: &[u8]) -> io::Resul
         if !old.metadata()?.is_file() {
             return Err(invalid());
         }
-        let mut bytes = [0u8; 34];
+        let mut bytes = vec![0; desired.len() + 1];
         let mut count = 0;
         while count < bytes.len() {
             match old.read(&mut bytes[count..])? {
@@ -144,7 +143,7 @@ fn install_machine_id(dir: &File, desired: &[u8; 33], nonce: &[u8]) -> io::Resul
             dir.as_raw_fd(),
             name.as_ptr(),
             dir.as_raw_fd(),
-            NAME.as_ptr(),
+            destination.as_ptr(),
         )
     }) {
         unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
@@ -153,9 +152,15 @@ fn install_machine_id(dir: &File, desired: &[u8; 33], nonce: &[u8]) -> io::Resul
     dir.sync_all()
 }
 
-fn apply(frame: &[u8; FRAME], dir: &File, rng: &mut File, completed: &mut u32) -> io::Result<()> {
+fn apply(
+    frame: &[u8; FRAME],
+    extension: Option<&[u8; 64]>,
+    dir: &File,
+    rng: &mut File,
+    completed: &mut u32,
+) -> io::Result<()> {
     let identity = Identity::decode(frame)?;
-    install_machine_id(dir, &identity.machine_id, &frame[8..24])?;
+    install_file(dir, c"machine-id", &identity.machine_id, &frame[8..24])?;
     *completed |= MACHINE_ID;
     errno(unsafe {
         libc::sethostname(identity.hostname.as_ptr().cast(), identity.hostname.len())
@@ -165,6 +170,12 @@ fn apply(frame: &[u8; FRAME], dir: &File, rng: &mut File, completed: &mut u32) -
     // RNDRESEEDCRNG mixes the fresh host material before userspace is released.
     errno(unsafe { libc::ioctl(rng.as_raw_fd(), 0x5207) })?;
     *completed |= ENTROPY;
+    if let Some(net) = extension {
+        let dns = network::apply(net, completed)?;
+        let contents = format!("nameserver {dns}\n");
+        install_file(dir, c"resolv.conf", contents.as_bytes(), &frame[8..24])?;
+        *completed |= 32;
+    }
     Ok(())
 }
 
@@ -222,7 +233,14 @@ pub fn run() -> io::Result<()> {
     control.write_all(&response(READY, &frame, 0, 0))?;
     control.read_exact(&mut *frame)?;
     let mut completed = 0;
-    let result = apply(&frame, &directory, &mut rng, &mut completed);
+    let mut net = [0; 64];
+    let extension = if frame[..8] == *b"SGI2\x02\0\0\0" {
+        control.read_exact(&mut net)?;
+        Some(&net)
+    } else {
+        None
+    };
+    let result = apply(&frame, extension, &directory, &mut rng, &mut completed);
     let ack = match &result {
         Ok(()) => response(COMPLETE, &frame, completed, 0),
         Err(error) => response(
