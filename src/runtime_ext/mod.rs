@@ -46,7 +46,10 @@ pub(crate) async fn capabilities() -> Result<Json<&'static Handshake>, ApiError>
 /// Read durable receipts from the operator-selected Worker on the private Serve socket.
 pub fn worker_operations_router(socket: std::path::PathBuf) -> axum::Router {
     axum::Router::new()
-        .route("/api/v1/runtime-ext/v1/operations/{id}", axum::routing::get(operation))
+        .route(
+            "/api/v1/runtime-ext/v1/operations/{id}",
+            axum::routing::get(operation),
+        )
         .with_state(socket)
 }
 
@@ -72,7 +75,11 @@ async fn operation(
                 "E_PERMISSION_DENIED" => StatusCode::FORBIDDEN,
                 _ => StatusCode::SERVICE_UNAVAILABLE,
             };
-            (status, Json(serde_json::json!({"code": err.code, "error": err.message}))).into_response()
+            (
+                status,
+                Json(serde_json::json!({"code": err.code, "error": err.message})),
+            )
+                .into_response()
         }
         Err(err) => ApiError::internal(err).into_response(),
     }

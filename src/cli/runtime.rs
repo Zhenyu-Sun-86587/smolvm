@@ -35,14 +35,19 @@ impl RuntimeCmd {
             .enable_all()
             .build()?;
         match self {
-            Self::Capabilities { socket } => print_json(runtime.block_on(
-                query::<Handshake>(socket, &["capabilities"]),
-            )?),
+            Self::Capabilities { socket } => {
+                print_json(runtime.block_on(query::<Handshake>(socket, &["capabilities"]))?)
+            }
             Self::Operation(OperationCmd::Inspect { id, socket }) => {
                 if id.is_empty() || id == "." || id == ".." {
-                    return Err(crate::Error::config("inspect operation", "invalid operation ID"));
+                    return Err(crate::Error::config(
+                        "inspect operation",
+                        "invalid operation ID",
+                    ));
                 }
-                print_json(runtime.block_on(query::<OperationReceipt>(socket, &["operations", &id]))?)
+                print_json(
+                    runtime.block_on(query::<OperationReceipt>(socket, &["operations", &id]))?,
+                )
             }
         }
     }
@@ -57,7 +62,8 @@ fn print_json(value: impl Serialize) -> crate::Result<()> {
 
 async fn query<T: DeserializeOwned>(socket: PathBuf, parts: &[&str]) -> crate::Result<T> {
     let failed = |reason: String| crate::Error::command_failed("query runtime", reason);
-    let mut url = reqwest::Url::parse("http://localhost/api/v1/runtime-ext/v1").expect("static URL");
+    let mut url =
+        reqwest::Url::parse("http://localhost/api/v1/runtime-ext/v1").expect("static URL");
     url.path_segments_mut().expect("HTTP URL").extend(parts);
     let client = reqwest::Client::builder()
         .unix_socket(socket)
@@ -85,9 +91,15 @@ async fn query<T: DeserializeOwned>(socket: PathBuf, parts: &[&str]) -> crate::R
     }
     if !status.is_success() {
         #[derive(serde::Deserialize)]
-        struct Detail { code: String, error: String }
+        struct Detail {
+            code: String,
+            error: String,
+        }
         let message = match serde_json::from_slice::<Detail>(&bytes) {
-            Ok(detail) => format!("Serve returned {status} ({}): {}", detail.code, detail.error),
+            Ok(detail) => format!(
+                "Serve returned {status} ({}): {}",
+                detail.code, detail.error
+            ),
             Err(_) => format!("Serve returned {status}"),
         };
         return Err(failed(message));
