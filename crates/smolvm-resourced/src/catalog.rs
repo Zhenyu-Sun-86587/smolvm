@@ -244,9 +244,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_capture_network.sql"))?;
                 tx.execute_batch(include_str!("schema_managed_state_restores.sql"))?;
                 tx.execute_batch(include_str!("schema_lifecycle.sql"))?;
-                tx.execute_batch("PRAGMA user_version=17")?;
+                tx.execute_batch(include_str!("schema_backup_closures.sql"))?;
+                tx.execute_batch("PRAGMA user_version=18")?;
             }
-            1..=17 => {
+            1..=18 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -296,7 +297,10 @@ impl Catalog {
                 }
                 if version < 17 {
                     tx.execute_batch(include_str!("schema_lifecycle.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=17")?;
+                }
+                if version < 18 {
+                    tx.execute_batch(include_str!("schema_backup_closures.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=18")?;
                 }
                 crate::lifecycle_controller::recover(&tx)?;
                 crate::network_lease_catalog::recover(&tx)?;

@@ -4,7 +4,7 @@ use crate::catalog::Execution;
 use crate::statepoint_capture::{Capture, Device, Export, MAX_CHECKPOINT_BYTES};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use smolvm_checkpoint::{format::PackManifest, store, Writer};
+use smolvm_checkpoint::{Writer, format::PackManifest, store};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
@@ -278,13 +278,22 @@ pub(crate) fn materialize(
     manifest: &Manifest,
     disks: BTreeMap<String, File>,
 ) -> io::Result<(File, File)> {
+    materialize_in(directory, manifest, disks, directory)
+}
+
+pub(crate) fn materialize_in(
+    directory: &Path,
+    manifest: &Manifest,
+    disks: BTreeMap<String, File>,
+    scratch_dir: &Path,
+) -> io::Result<(File, File)> {
     if disk_digests(disks, false)? != manifest.disk_assets {
         return Err(invalid("StatePoint disk generation length or hash changed"));
     }
     let artifact = directory.join(&manifest.statepoint.representation_id);
     let scratch = tempfile::Builder::new()
         .prefix(".restore-")
-        .tempdir_in(directory)?;
+        .tempdir_in(scratch_dir)?;
     let output = scratch.path().join("materialized");
     let pack = store::materialize(&artifact, &output)?;
     if pack.digest != manifest.required_bundle {

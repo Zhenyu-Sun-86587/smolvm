@@ -33,6 +33,7 @@ mod managed_fork;
 pub mod managed_state_restore;
 #[cfg(target_os = "linux")]
 mod managed_statepoint;
+mod backup_closure;
 #[cfg(target_os = "linux")]
 pub mod native_client;
 #[cfg(target_os = "linux")]
