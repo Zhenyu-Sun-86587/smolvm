@@ -43,7 +43,7 @@ mod linux {
         pub fn bind(port: u32) -> std::io::Result<Self> {
             unsafe {
                 // Create socket
-                let fd = libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0);
+                let fd = libc::socket(AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
                 if fd < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -88,10 +88,11 @@ mod linux {
                 let mut peer: sockaddr_vm = unsafe { mem::zeroed() };
                 let mut len = mem::size_of::<sockaddr_vm>() as libc::socklen_t;
                 let fd = unsafe {
-                    libc::accept(
+                    libc::accept4(
                         self.fd.as_raw_fd(),
                         &mut peer as *mut sockaddr_vm as *mut libc::sockaddr,
                         &mut len,
+                        libc::SOCK_CLOEXEC,
                     )
                 };
                 if fd < 0 {

@@ -420,6 +420,15 @@ fn main() {
         std::process::exit(0);
     }
 
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("--system-service") {
+        if let Err(error) = run_system_service() {
+            eprintln!("system Agent service: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Earliest possible timing point — CLOCK_BOOTTIME works before /proc exists.
     #[cfg(target_os = "linux")]
     boot_log(
@@ -749,10 +758,44 @@ fn main() {
     memory_trim::spawn();
 
     // Start accepting connections (listener already bound)
-    if let Err(e) = run_server_with_listener(listener) {
+    if let Err(e) = run_server_with_listener(listener, AgentMode::Oci) {
         error!(error = %e, "server error");
         std::process::exit(1);
     }
+}
+
+#[derive(Clone, Copy)]
+enum AgentMode {
+    Oci,
+    #[cfg(target_os = "linux")]
+    SystemService,
+}
+
+impl AgentMode {
+    fn is_system(self) -> bool {
+        match self {
+            Self::Oci => false,
+            #[cfg(target_os = "linux")]
+            Self::SystemService => true,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_system_service() -> Result<(), Box<dyn std::error::Error>> {
+    if std::process::id() == 1 || !std::path::Path::new("/run/systemd/system").is_dir() {
+        return Err("the system Agent must run as a service under the guest's systemd".into());
+    }
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("smolvm_agent=info".parse()?),
+        )
+        .init();
+    let listener = vsock::listen(ports::AGENT_CONTROL)?;
+    ready_doorbell();
+    run_server_with_listener(listener, AgentMode::SystemService)
 }
 
 /// Signal to the host that the agent is fully initialized and ready.
@@ -2288,6 +2331,7 @@ impl Drop for ConnectionPermit {
 /// has a listener ready when the host connects.
 fn run_server_with_listener(
     listener: vsock::VsockListener,
+    mode: AgentMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut first_connection = true;
     let listen_start = uptime_ms();
@@ -2323,7 +2367,7 @@ fn run_server_with_listener(
                 // and make every following exec fail with "not running".
                 std::thread::spawn(move || {
                     let _permit = permit;
-                    if let Err(e) = handle_connection(&mut stream) {
+                    if let Err(e) = handle_connection(&mut stream, mode) {
                         warn!(error = %e, "connection error");
                     }
                 });
@@ -2408,7 +2452,10 @@ fn handle_fsnotify(events: &[FsNotifyEvent]) -> AgentResponse {
     AgentResponse::ok_with_data(serde_json::json!({ "fired": fired, "supported": true }))
 }
 
-fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_connection(
+    stream: &mut impl ReadWrite,
+    mode: AgentMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut wire = WireStream::new(stream);
     let stream = &mut wire;
     let mut buf = vec![0u8; REQUEST_BUFFER_SIZE];
@@ -2511,6 +2558,30 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         let _guard = _span.enter();
 
         debug!(method = %request.log_summary(), "received request");
+
+        if mode.is_system() {
+            let response = match request {
+                AgentRequest::Ping => AgentResponse::Pong {
+                    version: PROTOCOL_VERSION,
+                    capabilities: vec!["system-service-v1".to_owned()],
+                },
+                request @ AgentRequest::VmExec {
+                    background: false,
+                    interactive: false,
+                    tty: false,
+                    ..
+                } => {
+                    let _permit = WORK_SLOTS.acquire();
+                    handle_request(request, Some(stream.as_raw_fd()))
+                }
+                _ => AgentResponse::error(
+                    "request is unavailable in the system Agent service",
+                    error_codes::INVALID_REQUEST,
+                ),
+            };
+            send_response(stream, &response)?;
+            continue;
+        }
 
         // A new operation aborts staged uploads, including requests handled by
         // early streaming branches below. Only upload chunks retain a session.
@@ -9731,7 +9802,7 @@ mod work_slot_tests {
         let (mut host, guest) = UnixStream::pair().unwrap();
         std::thread::spawn(move || {
             let mut guest = guest;
-            let _ = handle_connection(&mut guest);
+            let _ = handle_connection(&mut guest, AgentMode::Oci);
         });
         host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         for request in [
