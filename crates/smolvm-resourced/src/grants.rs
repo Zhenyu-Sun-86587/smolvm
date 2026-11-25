@@ -145,6 +145,17 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reserved: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM writer_pivots WHERE next_grant_id=?)",
+            [&request.grant_id],
+            |row| row.get(0),
+        )?;
+        if reserved {
+            return Err(Fault::new(
+                "E_IDEMPOTENCY_CONFLICT",
+                "writer grant ID is reserved by a pivot",
+            ));
+        }
         let count: i64 = tx.query_row(
             "SELECT count(*) FROM writer_reservations
             WHERE operation_id=? AND incarnation_id=? AND execution_epoch=?",

@@ -7,7 +7,7 @@ use crate::ipc::{valid_digest, valid_id, Fault, FdEntry, Request, Result};
 use imago::file::File as ImageFile;
 use imago::qcow2::Qcow2;
 use imago::{DynStorage, FormatAccess, FormatCreateBuilder};
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -140,7 +140,7 @@ fn publish_directory(root: &File, from: &str, to: &str) -> io::Result<()> {
     root.sync_all()
 }
 
-fn open_final(root: &File, object: &BlockObject, writable: bool) -> io::Result<File> {
+pub(crate) fn open_final(root: &File, object: &BlockObject, writable: bool) -> io::Result<File> {
     let directory = crate::worker::openat(
         root,
         &object.spec.resource_id,
@@ -278,7 +278,7 @@ fn remove_object_dir(root: &File, name: &str) -> Result<()> {
     root.sync_all().map_err(io_fault)
 }
 
-fn read_published(root: &File, spec: &BlockSpec) -> Result<Option<BlockObject>> {
+pub(crate) fn read_published(root: &File, spec: &BlockSpec) -> Result<Option<BlockObject>> {
     let dir =
         match crate::worker::openat(root, &spec.resource_id, libc::O_RDONLY | libc::O_DIRECTORY) {
             Ok(dir) => dir,
@@ -353,11 +353,22 @@ pub fn create(
         catalog.begin_block(&operation.operation_id, &spec)?;
     }
 
-    let object = if let Some(object) = read_published(root, &spec)? {
+    let object = materialize(root, &operation.operation_id, spec, source, parent.as_ref())?;
+    catalog.commit_block(&operation.operation_id, &object)
+}
+
+pub(crate) fn materialize(
+    root: &File,
+    operation_id: &str,
+    spec: BlockSpec,
+    source: Option<OwnedFd>,
+    parent: Option<&BlockObject>,
+) -> Result<BlockObject> {
+    if let Some(object) = read_published(root, &spec)? {
         root.sync_all().map_err(io_fault)?;
-        object
+        return Ok(object);
     } else {
-        let staging = staging_name(&operation.operation_id, &spec.resource_id);
+        let staging = staging_name(operation_id, &spec.resource_id);
         let dir = staged_directory(root, &staging)?;
         let dir_path = fd_path(&dir);
         let data = OpenOptions::new()
@@ -368,7 +379,7 @@ pub fn create(
             .custom_flags(libc::O_NOFOLLOW)
             .open(dir_path.join("data"))
             .map_err(io_fault)?;
-        write_image(&spec, &data, source, parent.as_ref())?;
+        write_image(&spec, &data, source, parent)?;
         let object = BlockObject {
             backing_identity: backing_identity(&data).map_err(io_fault)?,
             format: spec.format().into(),
@@ -388,9 +399,18 @@ pub fn create(
         marker.sync_all().map_err(io_fault)?;
         dir.sync_all().map_err(io_fault)?;
         publish_directory(root, &staging, &object.spec.resource_id).map_err(io_fault)?;
-        object
-    };
-    catalog.commit_block(&operation.operation_id, &object)
+        Ok(object)
+    }
+}
+
+pub(crate) fn discard_staged(root: &File, op: &str, spec: &BlockSpec) -> Result<()> {
+    let staging = staging_name(op, &spec.resource_id);
+    let discarding = format!("{staging}-abort");
+    if read_published(root, spec)?.is_some() {
+        publish_directory(root, &spec.resource_id, &discarding).map_err(io_fault)?;
+    }
+    remove_object_dir(root, &discarding)?;
+    remove_object_dir(root, &staging)
 }
 
 pub fn abort(catalog: &Catalog, root: &File, request: &Request) -> Result<Value> {
@@ -405,13 +425,7 @@ pub fn abort(catalog: &Catalog, root: &File, request: &Request) -> Result<Value>
                 "managed block belongs to another operation or is already committed",
             ));
         }
-        let staging = staging_name(&owner, &input.resource_id);
-        let discarding = format!("{staging}-abort");
-        if read_published(root, &spec)?.is_some() {
-            publish_directory(root, &input.resource_id, &discarding).map_err(io_fault)?;
-        }
-        remove_object_dir(root, &discarding)?;
-        remove_object_dir(root, &staging)?;
+        discard_staged(root, &owner, &spec)?;
         catalog.db.execute(
             "DELETE FROM managed_blocks WHERE resource_id=? AND operation_id=?",
             params![input.resource_id, owner],
@@ -446,6 +460,61 @@ pub fn collect(catalog: &Catalog, root: &File, resource: &str) -> Result<()> {
         Err(error) => return Err(io_fault(error)),
     };
     remove_object_dir(root, resource)
+}
+
+pub(crate) fn fence_head_for_seal(
+    root: &File,
+    object: &BlockObject,
+    recovering: bool,
+) -> Result<(File, File)> {
+    let dir = crate::worker::openat(
+        root,
+        &object.spec.resource_id,
+        libc::O_RDONLY | libc::O_DIRECTORY,
+    )
+    .map_err(io_fault)?;
+    let input =
+        crate::worker::openat(&dir, "data", libc::O_RDONLY | libc::O_NONBLOCK).map_err(io_fault)?;
+    let mode = input.metadata().map_err(io_fault)?.mode() & 0o777;
+    let file = if mode == 0o400 && recovering {
+        let mut frozen = object.clone();
+        frozen.spec.sealed = true;
+        open_object(root, &frozen, false)?
+    } else {
+        let file = open_object(root, object, true)?;
+        crate::worker::ofd_lock(&file).map_err(|_| {
+            crate::grants::fence_unproven("a prior writer still locks one of the heads")
+        })?;
+        file
+    };
+    Ok((dir, file))
+}
+
+pub(crate) fn seal_fenced_head(
+    directory: &File,
+    handle: &File,
+    object: &mut BlockObject,
+) -> Result<()> {
+    handle.sync_all().map_err(io_fault)?;
+    handle
+        .set_permissions(Permissions::from_mode(0o400))
+        .map_err(io_fault)?;
+    handle.sync_all().map_err(io_fault)?;
+    object.spec.sealed = true;
+    let path = fd_path(directory);
+    let staging = path.join(".descriptor-sealing");
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&staging)
+        .map_err(io_fault)?;
+    serde_json::to_writer(&mut marker, &object).map_err(|e| io_fault(e.into()))?;
+    marker.sync_all().map_err(io_fault)?;
+    std::fs::rename(staging, path.join("descriptor.json")).map_err(io_fault)?;
+    directory.sync_all().map_err(io_fault)
 }
 
 pub fn seal_heads(
@@ -506,52 +575,13 @@ pub fn seal_heads(
     }
     let mut handles = Vec::new();
     for object in &objects {
-        let dir = crate::worker::openat(
-            root,
-            &object.spec.resource_id,
-            libc::O_RDONLY | libc::O_DIRECTORY,
-        )
-        .map_err(io_fault)?;
-        let input = crate::worker::openat(&dir, "data", libc::O_RDONLY | libc::O_NONBLOCK)
-            .map_err(io_fault)?;
-        let mode = input.metadata().map_err(io_fault)?.mode() & 0o777;
-        let file = if mode == 0o400 && !prior.is_empty() {
-            let mut frozen = object.clone();
-            frozen.spec.sealed = true;
-            open_object(root, &frozen, false)?
-        } else {
-            let file = open_object(root, object, true)?;
-            crate::worker::ofd_lock(&file).map_err(|_| {
-                crate::grants::fence_unproven("a prior writer still locks one of the heads")
-            })?;
-            file
-        };
-        handles.push((dir, file));
+        handles.push(fence_head_for_seal(root, object, !prior.is_empty())?);
     }
     if prior.is_empty() {
         catalog.begin_block_seal(&op.operation_id, &heads)?;
     }
     for ((directory, handle), object) in handles.iter().zip(&mut objects) {
-        handle.sync_all().map_err(io_fault)?;
-        handle
-            .set_permissions(Permissions::from_mode(0o400))
-            .map_err(io_fault)?;
-        handle.sync_all().map_err(io_fault)?;
-        object.spec.sealed = true;
-        let path = fd_path(directory);
-        let staging = path.join(".descriptor-sealing");
-        let mut marker = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&staging)
-            .map_err(io_fault)?;
-        serde_json::to_writer(&mut marker, &object).map_err(|e| io_fault(e.into()))?;
-        marker.sync_all().map_err(io_fault)?;
-        std::fs::rename(staging, path.join("descriptor.json")).map_err(io_fault)?;
-        directory.sync_all().map_err(io_fault)?;
+        seal_fenced_head(directory, handle, object)?;
     }
     catalog.commit_block_seal(&op.operation_id, &objects)?;
     Ok(json!({"generations":objects}))
@@ -680,7 +710,10 @@ impl Catalog {
             |row| row.get(0),
         )?)
     }
-    fn block_intent(&self, resource: &str) -> Result<Option<(String, BlockSpec, Option<String>)>> {
+    pub(crate) fn block_intent(
+        &self,
+        resource: &str,
+    ) -> Result<Option<(String, BlockSpec, Option<String>)>> {
         let record: Option<(String, String, Option<String>)> = self.db.query_row(
             "SELECT operation_id,spec_json,backing_identity FROM managed_blocks WHERE resource_id=?",
             [resource], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -723,36 +756,13 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let descriptor = json!({"schema":"ManagedBlockObject/1", "object":object}).to_string();
-        let digest = format!("sha256:{:x}", Sha256::digest(descriptor.as_bytes()));
-        let mutable = object.spec.mutable();
-        tx.execute(
-            "INSERT INTO resources VALUES(?,?,'available','durable',?,?,?, ?,1)",
-            params![
-                object.spec.resource_id,
-                if mutable { "block_head" } else { "descriptor" },
-                !mutable,
-                descriptor,
-                digest,
-                op
-            ],
-        )?;
-        if let Some(id) = &object.spec.backing_id {
-            tx.execute(
-                "INSERT INTO resource_edges VALUES(?,?,'block_backing')",
-                params![object.spec.resource_id, id],
-            )?;
-        }
+        publish_block_record(&tx, op, object)?;
         if let Some(volume) = &object.spec.volume_id {
             tx.execute(
                 "INSERT INTO volume_heads VALUES(?,?,?)",
                 params![volume, object.spec.resource_id, object.backing_identity],
             )?;
         }
-        tx.execute(
-            "UPDATE managed_blocks SET backing_identity=? WHERE resource_id=?",
-            params![object.backing_identity, object.spec.resource_id],
-        )?;
         tx.commit()?;
         self.resource(&object.spec.resource_id)
     }
@@ -864,31 +874,77 @@ impl Catalog {
                     "volume head changed during commit",
                 ));
             }
-            let descriptor = json!({"schema":"ManagedBlockObject/1", "object":object}).to_string();
-            let digest = format!("sha256:{:x}", Sha256::digest(descriptor.as_bytes()));
-            tx.execute(
-                "UPDATE resources SET kind='descriptor',immutable=1,descriptor_json=?,descriptor_digest=?,revision=revision+1
-                WHERE resource_id=? AND kind='block_head' AND state='available'",
-                params![descriptor,digest,id],
-            )?;
-            tx.execute(
-                "UPDATE managed_blocks SET spec_json=? WHERE resource_id=?",
-                params![json!(object.spec).to_string(), id],
-            )?;
+            publish_seal_record(&tx, op, object)?;
             tx.execute(
                 "UPDATE root_refs SET state='dropped',revision=revision+1
                 WHERE owner_kind='block_seal' AND owner_id=? AND resource_id=?",
                 params![op, id],
             )?;
-            tx.execute(
-                "INSERT INTO root_refs VALUES('operation',?,?,'active',1,?)
-                ON CONFLICT(owner_kind,owner_id,resource_id) DO UPDATE SET
-                    state='active',revision=root_refs.revision+1
-                WHERE root_refs.state='dropped'",
-                params![op, id, op],
-            )?;
         }
         tx.commit()?;
         Ok(())
     }
+}
+
+pub(crate) fn publish_block_record(
+    tx: &Transaction<'_>,
+    op: &str,
+    object: &BlockObject,
+) -> Result<()> {
+    let descriptor = json!({"schema":"ManagedBlockObject/1", "object":object}).to_string();
+    let digest = format!("sha256:{:x}", Sha256::digest(descriptor.as_bytes()));
+    let mutable = object.spec.mutable();
+    tx.execute(
+        "INSERT INTO resources VALUES(?,?,'available','durable',?,?,?, ?,1)",
+        params![
+            object.spec.resource_id,
+            if mutable { "block_head" } else { "descriptor" },
+            !mutable,
+            descriptor,
+            digest,
+            op
+        ],
+    )?;
+    if let Some(id) = &object.spec.backing_id {
+        tx.execute(
+            "INSERT INTO resource_edges VALUES(?,?,'block_backing')",
+            params![object.spec.resource_id, id],
+        )?;
+    }
+    tx.execute(
+        "UPDATE managed_blocks SET backing_identity=? WHERE resource_id=?",
+        params![object.backing_identity, object.spec.resource_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn publish_seal_record(
+    tx: &Transaction<'_>,
+    op: &str,
+    object: &BlockObject,
+) -> Result<()> {
+    let id = &object.spec.resource_id;
+    let descriptor = json!({"schema":"ManagedBlockObject/1", "object":object}).to_string();
+    let digest = format!("sha256:{:x}", Sha256::digest(descriptor.as_bytes()));
+    let applied = tx.execute(
+        "UPDATE resources SET kind='descriptor',immutable=1,descriptor_json=?,descriptor_digest=?,revision=revision+1
+        WHERE resource_id=? AND kind='block_head' AND state='available'",
+        params![descriptor,digest,id],
+    )?;
+    if applied != 1 {
+        return Err(crate::grants::fence_unproven(
+            "sealed block is not the expected writable catalog object",
+        ));
+    }
+    tx.execute(
+        "UPDATE managed_blocks SET spec_json=? WHERE resource_id=?",
+        params![json!(object.spec).to_string(), id],
+    )?;
+    tx.execute(
+        "INSERT INTO root_refs VALUES('operation',?,?,'active',1,?)
+        ON CONFLICT(owner_kind,owner_id,resource_id) DO UPDATE SET
+            state='active',revision=root_refs.revision+1 WHERE root_refs.state='dropped'",
+        params![op, id, op],
+    )?;
+    Ok(())
 }

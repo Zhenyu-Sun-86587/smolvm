@@ -98,6 +98,16 @@ LD_LIBRARY_PATH="$FIRMWARE_DIR" python3 -B crates/smolvm-resourced/tests/kvm-blo
 ```
 
 The current ABI attaches managed disk sets at cold boot. Captured multi-disk pivots, live detach, online expansion and exact-generation restore require the held capture and activation path.
+
+### Held writer pivot
+
+The `writer_pivot` operation transitions the registered execution's entire current writer set. Begin the operation after the native capture actor enters its held state. Supply its 128-bit hexadecimal `hold_token`, `previous_grant_id`, `previous_grant_revision`, and a fresh `next_grant_id` to `PrepareWriterPivot`. Each `heads` item names `volume_id`, the old `head_resource_id`, and the `next_resource_id` to create over that old head.
+
+- `PrepareWriterPivot` journals the plan and returns all new locked writer FDs and their ancestor handles in one packet. The held execution receives an O_RDONLY FD for each old head strictly for its replacement device backend. The new tips stay outside published volume bindings.
+- `CommitWriterPivot` records the irreversible intent. Echo the same hold token and the `expected_revision` from the prepare receipt. Send every original new writer FD in volume order with role `block_writer`. Keep the VMM held during this transition.
+- Once the VMM has dropped every old writer and rollback handle, call `FinalizeWriterPivot` with the next revision, matching hold token, and exact new writer FDs. The broker proves every old OFD is gone, syncs and seals the old heads, then publishes old generations and the new live writer grant together. Drop the operation's old-generation pins after the StatePoint or another durable reference has been published.
+- Before commit, restore the old device set and close every candidate writer FD. `AbortWriterPivot` uses the same hold token and revision and discards the staged candidates only after their OFDs are gone.
+- On disconnect, query `QueryWriterPivot` under the same operation before retry. The broker retains the decision across restart. Proven execution death aborts uncommitted pivots or finishes the committed transition with the new writer authority released. Committed generations from a dead execution are pinned by `pivot_recovery` for reconciliation.
 ### Private IPv4 reservations
 
 The Worker administrator registers an RFC1918 CIDR and its isolated route
