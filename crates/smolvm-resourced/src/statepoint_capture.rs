@@ -93,7 +93,7 @@ pub(crate) struct Attachment {
     pub(crate) volume_id: String,
     pub(crate) generation_id: String,
     pub(crate) writable_head_id: Option<String>,
-    grant_id: Option<String>,
+    pub(crate) grant_id: Option<String>,
     execution_epoch: i64,
     pub(crate) capacity_bytes: u64,
     layers: Vec<String>,

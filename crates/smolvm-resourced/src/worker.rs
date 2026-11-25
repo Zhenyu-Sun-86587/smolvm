@@ -57,6 +57,10 @@ enum Command {
         state_reader_id: String,
         #[arg(long)]
         output: Option<PathBuf>,
+        #[arg(long, requires = "executable_sha256")]
+        bundle_manifest: Option<PathBuf>,
+        #[arg(long, requires = "bundle_manifest")]
+        executable_sha256: Option<String>,
     },
 }
 
@@ -2470,8 +2474,9 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             socket_gid,
             admin_uid,
         } => serve(&state_dir, &socket, socket_gid, admin_uid),
-        Command::RecoverBackupClosure {archive,manifest_digest,bundle_digest,state_reader_id,output} => {
-            let receipt = crate::backup_closure::restore(&archive, &manifest_digest, &bundle_digest, &state_reader_id, output.as_deref())?;
+        Command::RecoverBackupClosure {archive,manifest_digest,bundle_digest,state_reader_id,output,bundle_manifest,executable_sha256} => {
+            let registered_bundle=bundle_manifest.as_deref().zip(executable_sha256.as_deref());
+            let receipt = crate::backup_closure::restore(&archive, &manifest_digest, &bundle_digest, &state_reader_id, output.as_deref(),registered_bundle)?;
             println!("{}",receipt);
             Ok(())
         }

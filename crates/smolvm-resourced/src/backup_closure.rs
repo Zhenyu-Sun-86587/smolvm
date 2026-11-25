@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path};
 
 const MAX_MANIFEST: usize = 16 << 20;
@@ -26,6 +26,7 @@ struct Selection {
     state_reader_id: String,
     capture_ids: Vec<String>,
     generation_ids: Vec<String>,
+    bundle_manifest: Value,
 }
 
 #[derive(Deserialize)]
@@ -38,22 +39,26 @@ struct Locate {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Capture {
-    point: Point,
-    commit_id: String,
-    manifest_digest: String,
+pub(crate) struct Capture {
+    pub point: Point,
+    pub commit_id: String,
+    pub manifest_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::backup_import::Origin>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Manifest {
+pub(crate) struct Manifest {
     schema: String,
-    backup_id: String,
-    bundle_digest: String,
-    state_reader_id: String,
-    captures: Vec<Capture>,
-    generations: Vec<String>,
-    blocks: BTreeMap<String, BlockSpec>,
+    pub backup_id: String,
+    pub bundle_digest: String,
+    pub state_reader_id: String,
+    pub captures: Vec<Capture>,
+    pub generations: Vec<String>,
+    pub blocks: BTreeMap<String, BlockSpec>,
+    #[serde(default)]
+    block_digests: BTreeMap<String, String>,
     members: BTreeMap<String, u64>,
 }
 
@@ -165,6 +170,18 @@ pub(crate) fn prepare(
     catalog.ready()?;
     let bundle = bundle(catalog, request)?;
     let selection: Selection = request.payload()?;
+    let enrolled = catalog.bundle(bundle)?;
+    let executable = enrolled
+        .strip_prefix("sha256:")
+        .ok_or_else(|| invalid("invalid registered executable digest"))?;
+    let handshake =
+        smolvm_runtime_protocol::handshake(selection.bundle_manifest.clone(), executable)
+            .map_err(corrupt)?;
+    if handshake.bundle_digest != bundle || handshake.state_reader_id != selection.state_reader_id {
+        return Err(invalid(
+            "backup requires the reader from the registered RuntimeBundle",
+        ));
+    }
     let requested = selection.capture_ids.len() + selection.generation_ids.len();
     if !valid_id(&selection.backup_id)
         || !valid_id(&selection.state_reader_id)
@@ -197,10 +214,12 @@ pub(crate) fn prepare(
         captures: Vec::new(),
         generations: selection.generation_ids.clone(),
         blocks: BTreeMap::new(),
+        block_digests: BTreeMap::new(),
         members: BTreeMap::new(),
     };
     let mut roots: BTreeSet<String> = selection.generation_ids.into_iter().collect();
     let mut pins = BTreeSet::new();
+    let mut hashes = BTreeMap::new();
     for id in selection.capture_ids {
         let (record, operation) =
             crate::managed_state_restore::source(catalog, "deep", bundle, &id)?;
@@ -209,6 +228,14 @@ pub(crate) fn prepare(
         let actual = state.digest().map_err(corrupt)?;
         if record.manifest_digest.as_deref() != Some(actual.as_str()) {
             return Err(invalid("StatePoint digest differs from the catalog"));
+        }
+        for (disk, digest, bytes) in state.disk_hashes() {
+            if hashes
+                .insert(disk.to_owned(), (digest.to_owned(), bytes))
+                .is_some_and(|prior| prior != (digest.to_owned(), bytes))
+            {
+                return Err(invalid("durable captures disagree on a disk digest"));
+            }
         }
         pins.insert(record.point.representation_id.clone());
         roots.extend(record.point.disk_generations.iter().cloned());
@@ -219,10 +246,12 @@ pub(crate) fn prepare(
             &mut manifest,
         )
         .map_err(corrupt)?;
+        let origin = crate::backup_import::describe(catalog, &record, &operation)?;
         manifest.captures.push(Capture {
             point: record.point,
             commit_id: operation.operation_id,
             manifest_digest: actual,
+            origin: Some(origin),
         });
     }
     for root in roots {
@@ -241,11 +270,22 @@ pub(crate) fn prepare(
                     "backup closure contains a live or unavailable block object",
                 ));
             }
-            let file = blocks::open_object(objects, &layer, false)?;
-            manifest.members.insert(
-                format!("blocks/{id}/data"),
-                file.metadata().map_err(corrupt)?.len(),
-            );
+            let mut file = blocks::open_object(objects, &layer, false)?;
+            let bytes = file.metadata().map_err(corrupt)?.len();
+            let hash = if let Some((digest, length)) = hashes.get(id) {
+                if *length != bytes {
+                    return Err(invalid(
+                        "backup ancestor length differs from the original capture",
+                    ));
+                }
+                digest.clone()
+            } else if let Some(digest) = &layer.spec.content_sha256 {
+                digest.clone()
+            } else {
+                hash_file(&mut file).map_err(corrupt)?
+            };
+            manifest.members.insert(format!("blocks/{id}/data"), bytes);
+            manifest.block_digests.insert(id.clone(), hash);
             pins.insert(id.clone());
             manifest.blocks.insert(id.clone(), layer.spec);
         }
@@ -375,6 +415,16 @@ fn load(
             "backup closure requires the original reader and bundle",
         ));
     }
+    for capture in &manifest.captures {
+        if !valid_id(&capture.point.capture_id)
+            || !valid_id(&capture.point.representation_id)
+            || !valid_id(&capture.point.incarnation_id)
+            || !valid_id(&capture.commit_id)
+            || !valid_digest(&capture.manifest_digest)
+        {
+            return Err(io::Error::other("invalid archived StatePoint identity"));
+        }
+    }
     Ok((manifest, raw))
 }
 
@@ -408,6 +458,13 @@ fn disk_set(
     Ok(result)
 }
 
+fn hash_file(file: &mut File) -> io::Result<String> {
+    let mut sha = Sha256::new();
+    file.rewind()?;
+    io::copy(file, &mut sha)?;
+    Ok(format!("sha256:{:x}", sha.finalize()))
+}
+
 /// Revalidate all captured RAM, checkpoint, and disk digests with the same
 /// reader used by a normal StatePoint restore. Optionally publish an isolated
 /// immutable recovery directory using an atomic non-replacing rename.
@@ -417,18 +474,26 @@ pub(crate) fn restore(
     bundle: &str,
     reader: &str,
     output: Option<&Path>,
+    registered_bundle: Option<(&Path, &str)>,
 ) -> io::Result<Value> {
     let original = File::open(archive)?;
     let (manifest, raw) = load(&original, expected, bundle, reader)?;
+    if registered_bundle.is_some() && output.is_none() {
+        return Err(io::Error::other(
+            "Worker catalog import requires an independent output directory",
+        ));
+    }
     let stage = output
         .map(|path| {
             let parent = path
                 .parent()
                 .filter(|value| !value.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
-            tempfile::Builder::new()
+            let directory = tempfile::Builder::new()
                 .prefix(".native-recovery-")
-                .tempdir_in(parent)
+                .tempdir_in(parent)?;
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+            Ok::<_, io::Error>(directory)
         })
         .transpose()?;
     for (name, bytes) in &manifest.members {
@@ -480,11 +545,19 @@ pub(crate) fn restore(
         ));
     }
     for (id, mut file) in all {
-        if let Some(expected) = &manifest.blocks[&id].content_sha256 {
-            let mut sha = Sha256::new();
-            file.rewind()?;
-            io::copy(&mut file, &mut sha)?;
-            if format!("sha256:{:x}", sha.finalize()) != *expected {
+        let expected = manifest
+            .block_digests
+            .get(&id)
+            .or(manifest.blocks[&id].content_sha256.as_ref());
+        if expected.is_some_and(|value| !valid_digest(value))
+            || (expected.is_none() && manifest.captures.is_empty())
+        {
+            return Err(io::Error::other(
+                "backup lacks an immutable generation digest",
+            ));
+        }
+        if let Some(expected) = expected {
+            if hash_file(&mut file)? != *expected {
                 return Err(io::Error::other("immutable block digest changed"));
             }
         }
@@ -497,6 +570,15 @@ pub(crate) fn restore(
             .open(stage.path().join("closure.json"))?;
         file.write_all(&raw)?;
         file.sync_all()?;
+        if let Some((bundle_manifest, executable_hash)) = registered_bundle {
+            crate::backup_import::catalog(
+                stage.path(),
+                &manifest,
+                bundle_manifest,
+                executable_hash,
+            )
+            .map_err(io::Error::other)?;
+        }
         sync_directories(stage.path())?;
         let from = CString::new(stage.path().as_os_str().as_encoded_bytes())?;
         let to = CString::new(output.as_os_str().as_encoded_bytes())?;

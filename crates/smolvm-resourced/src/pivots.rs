@@ -7,6 +7,7 @@ use crate::ipc::{valid_id, Fault, FdEntry, Request, Result, MAX_FDS};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::fd::OwnedFd;
@@ -518,6 +519,62 @@ pub struct ForkOrigin {
     hold_token: String,
     grant_id: String,
     execution_epoch: i64,
+}
+
+pub(crate) fn validate_archived_origin(
+    catalog: &Catalog,
+    capture: &str,
+    origin: &ForkOrigin,
+    target: &Execution,
+    source_heads: &HashMap<String, String>,
+    target_volumes: &HashMap<String, String>,
+) -> Result<()> {
+    let record = catalog.require_statepoint(capture)?;
+    let source = catalog.operation(&record.operation_id)?;
+    let token: String = catalog.db.query_row(
+        "SELECT hold_token_digest FROM native_backup_imports WHERE capture_id=?",
+        [capture],
+        |row| row.get(0),
+    )?;
+    if record.operation_id != origin.pivot_id
+        || source.route_id != target.route_id
+        || source.bundle_digest != target.bundle_digest
+        || source.instance_id == target.instance_id
+        || target.execution_epoch != 1
+        || record.point.incarnation_id == target.incarnation_id
+        || record.point.execution_epoch != origin.execution_epoch
+        || token != format!("sha256:{:x}", Sha256::digest(origin.hold_token.as_bytes()))
+    {
+        return Err(fence_unproven(
+            "restore differs from its authorized archived source",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for disk in record
+        .point
+        .devices
+        .iter()
+        .filter_map(|device| device.block())
+    {
+        let Some(head) = &disk.writable_head_id else {
+            continue;
+        };
+        if disk.grant_id.as_deref() != Some(origin.grant_id.as_str())
+            || source_heads.get(&disk.volume_id) != Some(head)
+            || target_volumes.contains_key(&disk.volume_id)
+            || !seen.insert(&disk.volume_id)
+        {
+            return Err(fence_unproven(
+                "restore must clone every archived writable volume from its sealed generation",
+            ));
+        }
+    }
+    if seen.len() != source_heads.len() {
+        return Err(fence_unproven(
+            "restore contains writers outside the archived capture",
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_fork_origin(
