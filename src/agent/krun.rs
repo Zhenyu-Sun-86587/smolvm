@@ -774,3 +774,6 @@ mod linux_gpu_tests {
         assert!(!error.contains("Install virglrenderer"));
     }
 }
+
+#[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+mod managed;

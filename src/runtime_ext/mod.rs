@@ -11,6 +11,8 @@ use std::{
 static CAPABILITIES: tokio::sync::OnceCell<Handshake> = tokio::sync::OnceCell::const_new();
 #[cfg(feature = "deep-runtime")]
 pub(crate) mod launch;
+#[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+pub(crate) mod managed;
 
 fn installed_profile() -> Result<(Handshake, serde_json::Value, String), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -34,6 +36,20 @@ fn installed_profile() -> Result<(Handshake, serde_json::Value, String), String>
         .map_err(str::to_owned)?;
     #[cfg(feature = "deep-runtime")]
     let handshake = Handshake {
+        capabilities: handshake
+            .capabilities
+            .into_iter()
+            .map(|(name, mut value)| {
+                if name == "boot.system" && value.supported && !launch::worker_configured() {
+                    value.supported = false;
+                    value.status = "unavailable".into();
+                    value.reason_code = "WORKER_NOT_CONFIGURED".into();
+                    value.contract_version = None;
+                    value.verified_profile = None;
+                }
+                (name, value)
+            })
+            .collect(),
         runtime_instance_id: Some(
             crate::deep_state::instance_id().ok_or("missing deep Serve state identity")?,
         ),
@@ -81,6 +97,14 @@ pub fn worker_operations_router(socket: std::path::PathBuf) -> axum::Router {
             "/api/v1/runtime-ext/v1/machines/{name}/execution",
             axum::routing::get(machine_execution),
         );
+    #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+    let router = {
+        managed::dispatch(socket.clone());
+        router.route(
+            "/api/v1/runtime-ext/v1/machines/{name}/binding",
+            axum::routing::get(machine_binding),
+        )
+    };
     router.with_state(socket)
 }
 #[cfg(feature = "deep-runtime")]
@@ -128,7 +152,9 @@ async fn operation(
     match response {
         Ok(Ok(receipt)) => {
             #[cfg(feature = "deep-runtime")]
-            if receipt.native.is_some() && launch::require_own(&receipt.instance_id).is_err() {
+            if (receipt.native.is_some() || receipt.instance_id.starts_with("i-"))
+                && launch::require_own(&receipt.instance_id).is_err()
+            {
                 return (StatusCode::NOT_FOUND, Json(serde_json::json!({"code":"E_NOT_FOUND","error":"unknown operation in this Serve"}))).into_response();
             }
             Json(receipt).into_response()
@@ -203,6 +229,10 @@ async fn submit(
 ) -> axum::response::Response {
     native(socket, move |client| {
         launch::require_own(&input.expected.instance_id)?;
+        if input.kind == "launch" {
+            launch::ensure_binding(client, &input.expected.instance_id)?;
+            return client.managed_submit(&input);
+        }
         client.submit(&input)
     })
     .await
@@ -227,6 +257,22 @@ async fn inventory(
     native(socket, move |client| {
         launch::require_own(&id)?;
         client.inventory(&client.binding(&id)?.expected())
+    })
+    .await
+}
+
+#[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+async fn machine_binding(
+    axum::extract::State(socket): axum::extract::State<std::path::PathBuf>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> axum::response::Response {
+    native(socket, move |client| {
+        let id = launch::instance_id(&name)?;
+        let current = launch::ensure_binding(client, &id)?;
+        if current.incarnation_id.is_some() && client.fence_exit(&current.expected()).is_ok() {
+            return client.binding(&id);
+        }
+        Ok(current)
     })
     .await
 }

@@ -1252,3 +1252,6 @@ mod parent_death_tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }
+
+#[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+pub use crate::runtime_ext::managed::boot as run_managed;

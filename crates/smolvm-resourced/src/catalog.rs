@@ -26,6 +26,8 @@ pub struct Operation {
     pub expected_incarnation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<crate::native_operations::Progress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<Expected>,
     pub phase: String,
     pub decision: String,
     pub revision: i64,
@@ -42,6 +44,7 @@ fn operation_row(row: &Row<'_>) -> rusqlite::Result<Operation> {
         expected_execution_epoch: row.get(6)?,
         expected_incarnation_id: row.get(7)?,
         native: None,
+        execution: None,
         phase: row.get(8)?,
         decision: row.get(9)?,
         revision: row.get(10)?,
@@ -228,9 +231,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_native_operations.sql"))?;
                 crate::network_lease_catalog::install_initial_activations(&tx)?;
                 tx.execute_batch(include_str!("schema_statepoints.sql"))?;
-                tx.execute_batch("PRAGMA user_version=10")?;
+                tx.execute_batch(include_str!("schema_managed_launch.sql"))?;
+                tx.execute_batch("PRAGMA user_version=11")?;
             }
-            1..=10 => {
+            1..=11 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -258,6 +262,10 @@ impl Catalog {
                 if version < 10 {
                     tx.execute_batch(include_str!("schema_statepoints.sql"))?;
                     tx.execute_batch("PRAGMA user_version=10")?;
+                }
+                if version < 11 {
+                    tx.execute_batch(include_str!("schema_managed_launch.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=11")?;
                 }
                 crate::network_lease_catalog::recover(&tx)?;
                 crate::activation_catalog::recover(&tx)?;
@@ -387,6 +395,11 @@ impl Catalog {
     pub fn operation(&self, id: &str) -> Result<Operation> {
         let mut operation = op(&self.db, id)?.ok_or_else(|| not_found("operation"))?;
         operation.native = crate::native_operations::progress(&self.db, id)?;
+        if operation.kind == "launch" && operation.phase == "COMPLETED" {
+            operation.execution = self.db.query_row(
+                "SELECT e.instance_id,e.incarnation_id,e.execution_epoch FROM managed_launches m JOIN executions e USING(incarnation_id) WHERE m.operation_id=? AND e.last_operation_id=m.operation_id",
+                [id], |row| Ok(Expected {instance_id:row.get(0)?, incarnation_id:row.get(1)?, execution_epoch:row.get(2)?})).optional()?;
+        }
         Ok(operation)
     }
 
@@ -412,7 +425,7 @@ impl Catalog {
                 && prior.expected_execution_epoch == expected.execution_epoch
                 && prior.expected_incarnation_id == expected.incarnation_id
             {
-                return Ok(prior);
+                return self.operation(id);
             }
             return Err(conflict(
                 "E_IDEMPOTENCY_CONFLICT",
@@ -556,10 +569,37 @@ impl Catalog {
                 ));
             }
         }
+        if let Some((incarnation, attached)) = tx
+            .query_row(
+                "SELECT incarnation_id,disks_attached FROM managed_launches WHERE operation_id=?",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()?
+        {
+            tx.execute("UPDATE managed_budget_holds SET state=?,incarnation_id=? WHERE operation_id=? AND instance_id=? AND state='reserved'", params![if abort {"released"} else {"running"},incarnation,id,operation.instance_id])?;
+            if !abort {
+                let bound = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM native_endpoints WHERE incarnation_id=?)",
+                    [&incarnation],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !attached || !bound {
+                    return Err(conflict(
+                        "E_FENCE_UNPROVEN",
+                        "managed VMM has no confirmed endpoint and disk set",
+                    ));
+                }
+                tx.execute("INSERT OR IGNORE INTO root_refs(owner_kind,owner_id,resource_id,state,revision,created_by_operation)
+                    SELECT 'managed_execution',?,resource_id,'active',1,? FROM root_refs WHERE owner_kind='operation' AND owner_id=? AND state='active'",
+                    params![incarnation,id,id])?;
+            }
+            tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='operation' AND owner_id=? AND state='active'",[id])?;
+        }
         let occupied: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM writer_reservations r LEFT JOIN writer_grants g USING(operation_id)
                 WHERE r.operation_id=? AND (? OR g.grant_id IS NULL OR g.state!='attached'))
-             OR (? AND EXISTS (SELECT 1 FROM executions WHERE last_operation_id=? AND (? OR phase<>'exited')))
+             OR (? AND EXISTS (SELECT 1 FROM executions WHERE last_operation_id=? AND ((? AND NOT EXISTS(SELECT 1 FROM managed_launches m WHERE m.operation_id=executions.last_operation_id)) OR phase<>'exited')))
              OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='operation' AND owner_id=? AND state='active')
              OR EXISTS (SELECT 1 FROM fd_transfers WHERE operation_id=? AND state='staging')
              OR EXISTS (SELECT 1 FROM fd_leases WHERE operation_id=? AND state='pending')
@@ -738,7 +778,9 @@ impl Catalog {
             "UPDATE instance_bindings SET incarnation_id=NULL WHERE incarnation_id=?",
             [id],
         )?;
+        tx.execute("UPDATE managed_budget_holds SET state='released' WHERE incarnation_id=? AND state='running'",[id])?;
         crate::escrow_catalog::release_execution(&tx, id)?;
+        tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='managed_execution' AND owner_id=? AND state='active'",[id])?;
         crate::activation_catalog::record_exit(&tx, id)?;
         tx.commit()?;
         self.execution(id)

@@ -331,6 +331,85 @@ pub(crate) fn ofd_lock(file: &File) -> Result<()> {
 }
 
 impl Worker {
+    fn managed_devices(&mut self, r: &Request, execution: &Execution) -> Result<Reply> {
+        let op = self.catalog.active_operation(r)?;
+        let plan = crate::managed::plan(&self.catalog, &op)?
+            .ok_or_else(|| Fault::invalid("missing managed launch"))?;
+        if !execution.matches(&op.route_id, &op.bundle_digest, &plan.launch.execution) {
+            return Err(stale_execution());
+        }
+        let mut layouts = Vec::new();
+        for device in &plan.devices {
+            let id = if let Some(id) = &device.head_id {
+                let spec = plan
+                    .head_spec(id)
+                    .ok_or_else(|| Fault::invalid("unknown managed head"))?;
+                if device.reattach {
+                    let head = VolumeHead {
+                        volume_id: device.volume_id.clone(),
+                        head_resource_id: id.clone(),
+                    };
+                    self.catalog.volume_identity(&head)?;
+                    self.catalog.require_unsealed_head(id)?;
+                } else {
+                    crate::blocks::create(
+                        &mut self.catalog,
+                        &self.objects,
+                        &r.derived("CreateVolumeHead", json!(spec)),
+                        None,
+                        false,
+                    )?;
+                }
+                id
+            } else {
+                &device.disk.generation_id
+            };
+            let layers = self.catalog.block_closure(id)?;
+            layouts.push(crate::managed::DiskSet {
+                device: device.clone(),
+                layers,
+            });
+        }
+        let heads = plan.heads();
+        let mut packet = if heads.is_empty() {
+            Reply {
+                result: Value::Null,
+                descriptors: Vec::new(),
+                table: Vec::new(),
+                delivered: None,
+            }
+        } else {
+            self.reserve(&r.derived("ReserveWriterSet", json!({"heads":heads})))?;
+            self.acquire_writer_set(
+                &r.derived(
+                    "AcquireWriterSet",
+                    json!({"grant_id":plan.grant_id,"expected_revision":1}),
+                ),
+                execution,
+            )?
+        };
+        let mut provided: HashSet<String> =
+            packet.table.iter().map(|e| e.resource_id.clone()).collect();
+        for set in &layouts {
+            if !set.device.disk.read_only {
+                continue;
+            }
+            for layer in &set.layers {
+                if provided.insert(layer.spec.resource_id.clone()) {
+                    packet.table.push(ipc::FdEntry {
+                        index: packet.descriptors.len(),
+                        resource_id: layer.spec.resource_id.clone(),
+                        role: "block_ancestor".into(),
+                    });
+                    packet
+                        .descriptors
+                        .push(crate::blocks::open_object(&self.objects, layer, false)?.into());
+                }
+            }
+        }
+        packet.result = json!({"devices":layouts,"grant":packet.result.get("grant"),"incarnation_id":execution.incarnation_id,"execution_epoch":execution.execution_epoch});
+        Ok(packet)
+    }
     fn reconnect_native_endpoints(&mut self) -> Result<()> {
         let ids = {
             let mut q = self.catalog.db.prepare(
@@ -415,6 +494,36 @@ impl Worker {
                     .update_lease(&lease, input.expected_revision, false)?;
                 self.statepoints.finish_restore(&self.catalog, &lease)?;
                 Ok(json!(lease))
+            }
+            "AcquireManagedLaunchDisks" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                return self.managed_devices(request, &execution);
+            }
+            "AckManagedLaunchDisks" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                let op = self.catalog.active_operation(request)?;
+                let plan = crate::managed::plan(&self.catalog, &op)?
+                    .ok_or_else(|| Fault::invalid("missing managed launch"))?;
+                if !execution.matches(&op.route_id, &op.bundle_digest, &plan.launch.execution) {
+                    return Err(stale_execution());
+                }
+                if !plan.heads().is_empty() {
+                    self.attach_writer_set(
+                        &request.derived(
+                            "AckWriterSetAttached",
+                            json!({"grant_id":plan.grant_id,"expected_revision":1}),
+                        ),
+                        &execution,
+                        Vec::new(),
+                    )?;
+                }
+                self.catalog.db.execute(
+                    "UPDATE managed_launches SET disks_attached=1 WHERE operation_id=?",
+                    [&op.operation_id],
+                )?;
+                Ok(
+                    json!({"disks_attached":true,"incarnation_id":execution.incarnation_id,"execution_epoch":execution.execution_epoch}),
+                )
             }
             "ValidateRestoreWriterSet" => {
                 let execution = self.authenticated_execution(request, peer)?;
@@ -693,6 +802,7 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            "QueryWorkerBudget" => crate::admission::status(&self.catalog.db),
             "BeginStatePointExport" => {
                 let execution = self.scoped_execution(request)?;
                 Ok(json!(self.statepoints.begin(
@@ -724,10 +834,38 @@ impl Worker {
             }
             "StopCommit" => self.stop_statepoint(request),
             "AbortStatePoint" => self.abort_statepoint(request),
+            "SubmitManagedLaunch" => Ok(json!(crate::managed::submit(
+                &mut self.catalog,
+                request,
+                request.payload()?
+            )?)),
+            "PendingManagedLaunches" => {
+                let namespace = request
+                    .payload
+                    .get("serve_instance")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Fault::invalid("missing Serve identity"))?;
+                let bundle = request
+                    .bundle_digest
+                    .as_deref()
+                    .ok_or_else(|| Fault::invalid("missing bundle"))?;
+                Ok(json!(crate::managed::pending(
+                    &self.catalog,
+                    namespace,
+                    bundle
+                )?))
+            }
             "QueryInstanceBinding" => self.catalog.query_binding(request),
             "BindNativeControl" => {
                 let binding: crate::native_control::Binding = request.payload()?;
-                let execution = self.scoped_execution(request)?;
+                let mut execution = self.scoped_execution(request)?;
+                if execution.phase == "unknown" {
+                    let probe = std::os::unix::net::UnixStream::connect(&binding.control_socket)
+                        .map_err(broker_error)?;
+                    let socket = socket2::Socket::from(probe);
+                    let peer = ipc::peer(&socket).map_err(broker_error)?;
+                    execution = self.confirm_execution_identity(execution, peer)?;
+                }
                 let inventory = crate::native_control::Endpoint::bind(
                     &self.catalog,
                     &execution,
@@ -1043,6 +1181,13 @@ impl Worker {
         }
         let (start, pidfd) = observe_pid(target.pid)?;
         verify_executable(target.pid, start, &pidfd, &self.catalog.bundle(bundle)?)?;
+        crate::managed::claim(
+            &self.catalog,
+            &op.operation_id,
+            &self.boot,
+            target.pid,
+            start,
+        )?;
         let credential = token()?;
         self.permits.insert(
             credential.clone(),
@@ -1491,18 +1636,24 @@ impl Worker {
 
     fn reserve(&mut self, r: &Request) -> Result<Value> {
         let op = self.catalog.active_operation(r)?;
-        if !matches!(op.kind.as_str(), "writer_reservation" | "restore_target") {
+        let Heads { mut heads } = r.payload()?;
+        heads.sort();
+        if !matches!(op.kind.as_str(), "writer_reservation" | "restore_target")
+            && !crate::managed::plan(&self.catalog, &op)?.is_some_and(|p| {
+                let mut approved = p.heads();
+                approved.sort();
+                approved == heads
+            })
+        {
             return Err(Fault::invalid(
                 "writer reservation requires a writer_reservation operation",
             ));
         }
-        let Heads { mut heads } = r.payload()?;
         if heads.is_empty() || heads.len() > 64 {
             return Err(Fault::invalid(
                 "writer reservation must contain 1 to 64 heads",
             ));
         }
-        heads.sort();
         if heads
             .windows(2)
             .any(|pair| pair[0].volume_id == pair[1].volume_id)

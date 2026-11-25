@@ -88,6 +88,10 @@ enum Commands {
         token: String,
     },
 
+    #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+    #[command(name = "_boot-managed", hide = true)]
+    BootManaged,
+
     /// Internal: run the shared CUDA daemon (not for direct use)
     #[command(name = "_cuda-daemon", hide = true)]
     CudaDaemon {
@@ -263,6 +267,7 @@ fn run_cli() {
             .and_then(|s| s.to_str()),
         Some("_boot-vm")
             | Some("_boot-vm-owned")
+            | Some("_boot-managed")
             | Some("_cuda-daemon")
             | Some("_cuda-clone-worker")
             | Some("_cuda-mps-supervisor")
@@ -351,6 +356,8 @@ fn run_command(cli: Cli) -> smolvm::Result<()> {
             let mut cmd = cli::completion::without_hidden(&Cli::command());
             cli::completion::print(shell, &mut cmd).map_err(smolvm::Error::Io)
         }
+        #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+        Commands::BootManaged => smolvm::internal_boot::run_managed(),
         Commands::BootVm { config } => smolvm::internal_boot::run(config),
         Commands::BootVmOwned { config, token } => smolvm::internal_boot::run_owned(config, token),
         #[cfg(unix)]

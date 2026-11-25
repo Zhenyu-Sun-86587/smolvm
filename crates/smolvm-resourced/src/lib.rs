@@ -7,6 +7,8 @@ mod activation_catalog;
 #[cfg(target_os = "linux")]
 mod activation_runtime;
 #[cfg(target_os = "linux")]
+mod admission;
+#[cfg(target_os = "linux")]
 mod blocks;
 #[cfg(target_os = "linux")]
 mod catalog;
@@ -22,6 +24,8 @@ mod grants;
 mod guest_transport;
 #[cfg(target_os = "linux")]
 mod ipc;
+#[cfg(target_os = "linux")]
+pub mod managed;
 #[cfg(target_os = "linux")]
 pub mod native_client;
 #[cfg(target_os = "linux")]

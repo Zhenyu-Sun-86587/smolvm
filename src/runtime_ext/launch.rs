@@ -32,8 +32,7 @@ pub(super) fn instance_id(name: &str) -> std::result::Result<String, QueryError>
         code: "E_RESOURCED_UNAVAILABLE".into(),
         message: err.to_string(),
     })?;
-    let machine = Sha256::digest(name.as_bytes());
-    Ok(format!("i-{}-{}", instance, hex::encode(machine)))
+    Ok(smolvm_resourced::managed::machine_id(&instance, name))
 }
 pub(super) fn require_own(instance_id: &str) -> std::result::Result<(), QueryError> {
     if crate::deep_state::instance_id().is_some_and(|ns| {
@@ -89,6 +88,42 @@ fn profile() -> Result<&'static Profile> {
         executable: format!("sha256:{hash}"),
         helper,
     }))
+}
+
+pub(super) fn worker_configured() -> bool {
+    WORKER.get().is_some()
+}
+
+pub(super) fn verified_client(socket: &Path) -> std::result::Result<Client<'_>, QueryError> {
+    let profile = profile().map_err(|e| QueryError {
+        code: "E_BUNDLE_UNAVAILABLE".into(),
+        message: e.to_string(),
+    })?;
+    Ok(Client {
+        socket,
+        bundle: &profile.bundle,
+    })
+}
+pub(super) fn ensure_binding(
+    client: &Client<'_>,
+    instance: &str,
+) -> std::result::Result<smolvm_resourced::native_client::Binding, QueryError> {
+    match client.binding(instance) {
+        Err(e) if e.code == "E_BUNDLE_UNAVAILABLE" => {
+            let profile = profile().map_err(|e| QueryError {
+                code: "E_BUNDLE_UNAVAILABLE".into(),
+                message: e.to_string(),
+            })?;
+            client.register_bundle(&profile.executable)?;
+            client.binding(instance)
+        }
+        other => other,
+    }
+}
+pub(super) fn measured_helper() -> Result<[u8; 32]> {
+    profile()?
+        .helper
+        .ok_or_else(|| failed("managed boot requires an installed identity helper"))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -163,15 +198,7 @@ impl Enrollment {
         self.inherited.take();
         let instance = instance_id(&self.name).map_err(failed)?;
         let client = self.client();
-        let mut binding = match client.binding(&instance) {
-            Err(e) if e.code == "E_BUNDLE_UNAVAILABLE" => {
-                client
-                    .register_bundle(&self.profile.executable)
-                    .map_err(failed)?;
-                client.binding(&instance).map_err(failed)?
-            }
-            other => other.map_err(failed)?,
-        };
+        let mut binding = ensure_binding(&client, &instance).map_err(failed)?;
         if binding.incarnation_id.is_some() {
             client.fence_exit(&binding.expected()).map_err(failed)?;
             binding = client.binding(&instance).map_err(failed)?;
