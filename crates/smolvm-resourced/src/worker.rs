@@ -327,6 +327,8 @@ impl Worker {
                 | "ReconcileExecutionExports"
                 | "ImportImmutableBlock"
                 | "ReconcileWriterSet"
+                | "CommitWriterPivot"
+                | "FinalizeWriterPivot"
         ) && (!descriptors.is_empty() || !request.fd_table.is_empty())
         {
             return Err(Fault::new(
@@ -335,6 +337,33 @@ impl Worker {
             ));
         }
         let result = match request.method.as_str() {
+            "PrepareWriterPivot" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                let offer = crate::pivots::prepare(
+                    &mut self.catalog,
+                    &self.objects,
+                    &mut self.reserved,
+                    request,
+                    &execution,
+                )?;
+                return Ok(Reply {
+                    result: offer.result,
+                    table: offer.table,
+                    descriptors: offer.descriptors,
+                    delivered: None,
+                });
+            }
+            "CommitWriterPivot" | "FinalizeWriterPivot" | "AbortWriterPivot" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                crate::pivots::update(
+                    &mut self.catalog,
+                    &self.objects,
+                    &mut self.reserved,
+                    request,
+                    &execution,
+                    descriptors,
+                )
+            }
             "AcquireWriterSet" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 return self.acquire_writer_set(request, &execution);
@@ -503,6 +532,7 @@ impl Worker {
                         | "generation"
                         | "resource_lease"
                         | "network_reservation"
+                        | "writer_pivot"
                 ) {
                     return Err(Fault::new(
                         "E_CAPABILITY_UNSUPPORTED",
@@ -620,6 +650,7 @@ impl Worker {
             }
             "ReserveWriterSet" => self.reserve(request),
             "QueryWriterSet" => self.writer_status(required_operation_id(request)?),
+            "QueryWriterPivot" => crate::pivots::query(&self.catalog, request),
             "ReleaseWriterReservation" => {
                 let operation = self.catalog.matching_operation(request)?;
                 let (_, _, expected) = request.scope()?;
@@ -846,6 +877,12 @@ impl Worker {
                 return Err(unsafe_fence());
             }
         }
+        crate::pivots::reconcile_dead(
+            &mut self.catalog,
+            &self.objects,
+            &mut self.reserved,
+            &execution,
+        )?;
         for grant in self.catalog.grants_for_execution(&execution)? {
             let set = self
                 .catalog

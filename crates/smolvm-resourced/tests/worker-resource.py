@@ -504,6 +504,108 @@ class WorkerResource(unittest.TestCase):
         self.assertFalse((self.state / "objects/base").exists())
         self.assertEqual(self.call("CollectResource", collect)["state"], "deleted")
 
+    def test_writer_pivot_replays_after_restart_and_fences_every_old_head(self):
+        data = b"r" * 512
+        heads = [{"volume_id": f"volume-{suffix}", "head_resource_id": f"head-{suffix}"}
+                 for suffix in ("a", "b")]
+        setup = operation(self.bundle_a, "setup-pivot", fence("setup"))
+        self.call("BeginOperation", {"kind": "catalog"}, **setup)
+        for head in heads:
+            self.call("CreateVolumeHead", {"resource_id": head["head_resource_id"],
+                "volume_id": head["volume_id"], "capacity_bytes": len(data)}, **setup)
+        self.finish(setup)
+
+        launch = operation(self.bundle_a, "launch-pivot", fence("pivot"))
+        self.call("BeginOperation", {"kind": "launch"}, **launch)
+        launch["expected"] = fence("pivot", 1)
+        permit = self.call("IssueLaunchPermit", {"pid": os.getpid(), "uid": os.getuid()}, **launch)
+        self.call("RegisterExecution", {"launch_permit": permit["launch_permit"]}, **launch)
+        self.finish(launch)
+        writer = operation(self.bundle_a, "writer-for-pivot", fence("pivot", 1))
+        self.call("BeginOperation", {"kind": "writer_reservation"}, **writer)
+        self.call("ReserveWriterSet", {"heads": heads}, **writer)
+        reply, fds, _ = receive_lease(self.path, request(
+            "AcquireWriterSet", {"grant_id": "old-grant", "expected_revision": 1}, **writer))
+        self.assertEqual(reply["result"]["grant"]["state"], "offered")
+        old = [os.fdopen(fd, "r+b") for fd in fds]
+        for n, fd in enumerate(old):
+            self.addCleanup(fd.close)
+            self.assertEqual(os.pwrite(fd.fileno(), bytes([n + 1]) * len(data), 0), len(data))
+            os.fsync(fd.fileno())
+        self.call("AckWriterSetAttached", {"grant_id": "old-grant", "expected_revision": 1}, **writer)
+        self.finish(writer)
+
+        hold = "ac" * 16
+
+        def offer(tag):
+            scope = operation(self.bundle_a, "pivot-" + tag, fence("pivot", 1))
+            self.call("BeginOperation", {"kind": "writer_pivot"}, **scope)
+            plan = {"previous_grant_id": "old-grant", "previous_grant_revision": 2,
+                    "next_grant_id": f"grant-{tag}", "hold_token": hold,
+                    "heads": [dict(head, next_resource_id=head["head_resource_id"] + "-" + tag)
+                              for head in heads]}
+            self.call("PrepareWriterPivot", dict(plan, heads=plan["heads"][:1]),
+                      error="E_FENCE_UNPROVEN", **scope)
+            response, received, flags = receive_lease(self.path, request("PrepareWriterPivot", plan, **scope))
+            self.assertEqual(response["result"]["pivot"]["state"], "offered")
+            self.assertFalse(flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC))
+            files = []
+            proof = []
+            table = []
+            for entry, fd in zip(response["fd_table"], received, strict=True):
+                writable = entry["role"] == "block_writer"
+                handle = os.fdopen(fd, "r+b" if writable else "rb")
+                self.addCleanup(handle.close)
+                files.append(handle)
+                self.assertEqual(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE,
+                                 os.O_RDWR if writable else os.O_RDONLY)
+                if writable:
+                    table.append(dict(entry, index=len(proof)))
+                    proof.append(fd)
+            return scope, files, proof, table
+
+        scope, offered, _, _ = offer("cancelled")
+        version = {"hold_token": hold, "expected_revision": 2}
+        self.call("AbortWriterPivot", version, error="E_FENCE_UNPROVEN", **scope)
+        for handle in offered:
+            handle.close()
+        self.assertEqual(self.call("AbortWriterPivot", version, **scope)["state"], "aborted")
+        self.assertFalse((self.state / "objects/head-a-cancelled").exists())
+        self.finish(scope, abort=True)
+
+        scope, _, proof, table = offer("next")
+        incomplete = request("CommitWriterPivot", version, fd_table=table[:1], **scope)
+        self.assertEqual(rpc(self.path, incomplete, proof[:1])["error"]["code"], "E_FENCE_UNPROVEN")
+        commit = request("CommitWriterPivot", version, fd_table=table, **scope)
+        self.assertEqual(rpc(self.path, commit, proof)["result"]["state"], "commit")
+        self.call("AbortWriterPivot", dict(version, expected_revision=3), error="E_FENCE_UNPROVEN", **scope)
+
+        self.stop(self.process)
+        self.start()
+        self.assertEqual(self.call("QueryWriterPivot", **scope)["state"], "commit")
+        self.call("ReconcileExecution", **launch)
+        finalize = request("FinalizeWriterPivot", dict(version, expected_revision=3), fd_table=table, **scope)
+        self.assertEqual(rpc(self.path, finalize, proof)["error"]["code"], "E_FENCE_UNPROVEN")
+        old[0].close()
+        self.assertEqual(rpc(self.path, finalize, proof)["error"]["code"], "E_FENCE_UNPROVEN")
+        self.assertFalse(self.call("QueryResource", {"resource_id": "head-a"})["immutable"])
+        old[1].close()
+        committed = rpc(self.path, finalize, proof)["result"]
+        self.assertEqual(committed["state"], "complete")
+        self.assertEqual(rpc(self.path, finalize, proof)["result"], committed)
+        for n, head in enumerate(heads):
+            previous = head["head_resource_id"]
+            self.assertTrue(self.call("QueryResource", {"resource_id": previous})["immutable"])
+            closure = self.call("QueryBlockClosure", {"resource_id": previous + "-next"})["layers"]
+            self.assertEqual([layer["resource_id"] for layer in closure], [previous + "-next", previous])
+            self.assertEqual((self.state / f"objects/{previous}/data").read_bytes(), bytes([n + 1]) * len(data))
+            self.call("DropOwnerRef", {"owner_kind": "operation", "owner_id": scope["operation_id"],
+                      "resource_id": previous, "expected_revision": 1}, **scope)
+        self.finish(scope)
+        session = {"broker_session_id": self.call("Health")["broker_session_id"]}
+        self.assertEqual(self.call("CompleteRecovery", session)["state"], "ready")
+        self.assertEqual(self.call("QueryWriterSet", operation_id=scope["operation_id"])["state"], "attached")
+
 
 if __name__ == "__main__":
     unittest.main()
