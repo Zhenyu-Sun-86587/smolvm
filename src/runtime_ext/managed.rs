@@ -3,6 +3,7 @@ use crate::agent::KrunFunctions;
 use crate::{deep_state, process, systemd_scope, Error, Result};
 use smolvm_resourced::managed::Plan;
 use smolvm_resourced::native_client::Client;
+use smolvm_resourced::network_client::WorkerNetworkScope;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -29,6 +30,8 @@ struct Boot {
     uid: u32,
     gid: u32,
     scope: String,
+    #[serde(default)]
+    network: Option<WorkerNetworkScope>,
 }
 static DISPATCH: Once = Once::new();
 pub(super) fn dispatch(socket: PathBuf) {
@@ -144,6 +147,7 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
     if binding.incarnation_id.is_none()
         && binding.execution_epoch == launch.execution.execution_epoch
     {
+        client.fence_managed_network(plan).map_err(failed)?;
         let op = smolvm_resourced::client::query_operation(
             client.socket,
             client.bundle,
@@ -157,6 +161,9 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
     let (control, log, uid, gid) = paths(plan)?;
     let mut child = None;
     if binding.incarnation_id.is_none() {
+        let network = client
+            .prepare_managed_network(&binding.expected(), plan)
+            .map_err(failed)?;
         let file = OpenOptions::new()
             .append(true)
             .create(true)
@@ -200,6 +207,7 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
                 uid,
                 gid,
                 scope: systemd_scope::scope_name(&plan.machine.name),
+                network,
             };
             let mut channel = proc
                 .stdin
@@ -279,6 +287,7 @@ fn confirm(
                 if current.incarnation_id.is_some() {
                     return Err(failed("execution exit not yet fenced"));
                 }
+                client.fence_managed_network(plan).map_err(failed)?;
                 let op = smolvm_resourced::client::query_operation(
                     client.socket,
                     client.bundle,
@@ -354,6 +363,12 @@ pub fn boot() -> Result<()> {
     let ctx = ctx as u32;
     let configured = (|| -> Result<()> {
         let (sets, files) = client.managed_disks(&boot.plan).map_err(failed)?;
+        let network = boot
+            .network
+            .as_ref()
+            .map(|scope| k.attach_prepared_worker_network(ctx, scope))
+            .transpose()
+            .map_err(failed)?;
         k.managed_boot(
             ctx,
             &boot.plan,
@@ -363,12 +378,18 @@ pub fn boot() -> Result<()> {
             &boot.control,
             &boot.worker,
             &boot.bundle,
+            network.as_ref().map(|lease| &lease.attachment),
         )
         .map_err(failed)?;
         client
             .ack_managed_disks(&boot.plan.launch)
             .map_err(failed)?;
         process::install_configured_seccomp_filter(false).map_err(failed)?;
+        // A cold Guest starts with carrier. The restore path opens its TAP
+        // only after the Worker records the Guest identity release.
+        if let Some((scope, lease)) = boot.network.as_ref().zip(network.as_ref()) {
+            scope.publish_initial(lease).map_err(failed)?;
+        }
         Ok(())
     })();
     if let Err(e) = configured {

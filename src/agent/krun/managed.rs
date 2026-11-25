@@ -1,6 +1,7 @@
 //! Configure the deep block ABI with the original Worker file descriptions.
 use super::KrunFunctions;
 use smolvm_resourced::managed::{DiskSet, Plan};
+use smolvm_resourced::network_client::AttachmentDescriptor;
 use std::collections::BTreeMap;
 use std::ffi::{c_char, CString};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -48,6 +49,7 @@ impl KrunFunctions {
         control: &Path,
         worker: &Path,
         bundle: &str,
+        network: Option<&AttachmentDescriptor>,
     ) -> Result<(), String> {
         let mut strings = Vec::new();
         let mut string = |value: &str| -> Result<*const c_char, String> {
@@ -122,6 +124,15 @@ impl KrunFunctions {
         let system = plan.machine.boot_profile == "system-debian-v1";
         if system {
             env.push(c"KRUN_INIT_PID1=1".as_ptr());
+        }
+        if let Some(attached) = network {
+            env.push(string(&format!(
+                "KRUN_STATIC_IPV4={}/{},{},{}",
+                attached.guest_ipv4,
+                attached.guest_prefix,
+                attached.gateway_ipv4,
+                attached.gateway_ipv4
+            ))?);
         }
         env.push(ptr::null());
         let execution = &plan.launch.execution;

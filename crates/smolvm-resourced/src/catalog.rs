@@ -533,7 +533,7 @@ impl Catalog {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !abort && operation.launches_execution() {
             let registered: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM executions WHERE last_operation_id=?)",
+                "SELECT EXISTS(SELECT 1 FROM executions WHERE last_operation_id=? AND phase='registered')",
                 [id],
                 |r| r.get(0),
             )?;
@@ -546,8 +546,11 @@ impl Catalog {
         }
         if !abort && operation.kind == "launch" {
             let unpublished: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM network_attachments a
-                 WHERE a.operation_id=? AND a.state<>'released' AND NOT EXISTS (
+                "SELECT (
+                    EXISTS(SELECT 1 FROM managed_launches WHERE operation_id=?1 AND json_extract(spec_json,'$.network') IS NOT NULL)
+                    AND NOT EXISTS(SELECT 1 FROM network_attachments WHERE operation_id=?1 AND state='reserved')
+                 ) OR EXISTS(SELECT 1 FROM network_attachments a
+                 WHERE a.operation_id=?1 AND a.state<>'released' AND NOT EXISTS (
                     SELECT 1 FROM network_tap_leases l JOIN initial_network_activations i USING(lease_id)
                     WHERE l.attachment_id=a.attachment_id AND l.state='attached' AND i.phase='open'
                  ))",
@@ -606,14 +609,15 @@ impl Catalog {
         let occupied: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM writer_reservations r LEFT JOIN writer_grants g USING(operation_id)
                 WHERE r.operation_id=? AND (? OR g.grant_id IS NULL OR g.state!='attached'))
-             OR (? AND EXISTS (SELECT 1 FROM executions WHERE last_operation_id=? AND ((? AND NOT EXISTS(SELECT 1 FROM managed_launches m WHERE m.operation_id=executions.last_operation_id)) OR phase<>'exited')))
+             OR (? AND EXISTS (SELECT 1 FROM executions WHERE last_operation_id=? AND (? OR phase<>'exited')))
+             OR (? AND EXISTS (SELECT 1 FROM network_tap_leases l JOIN network_attachments a USING(attachment_id) WHERE a.operation_id=? AND l.state<>'retired'))
              OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='operation' AND owner_id=? AND state='active')
              OR EXISTS (SELECT 1 FROM fd_transfers WHERE operation_id=? AND state='staging')
              OR EXISTS (SELECT 1 FROM fd_leases WHERE operation_id=? AND state='pending')
              OR EXISTS (SELECT 1 FROM managed_blocks WHERE operation_id=? AND backing_identity IS NULL)
              OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='block_seal' AND owner_id=? AND state='active')
              OR EXISTS (SELECT 1 FROM writer_pivots WHERE operation_id=? AND state NOT IN ('complete','aborted'))",
-            params![id, abort, abort, id, operation.kind != "restore_target", id, id, id, id, id, id], |r| r.get(0))?;
+            params![id, abort, abort, id, !matches!(operation.kind.as_str(), "launch" | "restore_target"), abort, id, id, id, id, id, id, id], |r| r.get(0))?;
         if occupied {
             return Err(conflict(
                 "E_OPERATION_HAS_EFFECTS",
