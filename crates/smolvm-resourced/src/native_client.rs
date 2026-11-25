@@ -219,6 +219,17 @@ impl Client<'_> {
         }
         let transport = |e| fault("E_RESOURCED_UNAVAILABLE", e);
         let socket = ipc::connect(self.socket).map_err(transport)?;
+        // The broker hashes the complete running executable for enrollment.
+        // This one-shot client can wait for that proof on a busy host without
+        // increasing the server-side timeout for untrusted inbound packets.
+        if matches!(
+            method,
+            "IssueLaunchPermit" | "RegisterExecution" | "BindNativeControl"
+        ) {
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .map_err(transport)?;
+        }
         if ipc::peer(&socket).map_err(transport)?.uid != 0 {
             return Err(fault(
                 "E_PERMISSION_DENIED",
