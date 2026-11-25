@@ -577,6 +577,30 @@ impl Actor {
         Ok(())
     }
 }
+/// A source pivot is one step in a managed operation. The fenced source exit
+/// may release the parent, but only its actor can publish the terminal result.
+pub(crate) fn source_exited(tx:&rusqlite::Transaction<'_>,inc:&str)->Result<()> {
+    let mut q=tx.prepare("SELECT b.operation_id,o.kind,b.checkpoint IS NOT NULL,p.phase FROM managed_fork_batches b JOIN operations o USING(operation_id)
+        LEFT JOIN statepoints p USING(capture_id) WHERE b.source_incarnation=? AND b.source_released=0 AND o.phase='NEW'")?;
+    let jobs=q.query_map([inc],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,Option<String>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(q);
+    for (id,kind,volatile,phase) in jobs {
+        if phase.as_deref()==Some("stop_committed") {continue}
+        let next=match kind.as_str() {
+            "independent_fork"|"fork_batch" if volatile=>"children",
+            "vm_snapshot" if matches!(phase.as_deref(),Some("exporting"|"durable"))=>"checkpoint_export",
+            _=>"aborted"
+        };
+        tx.execute("UPDATE managed_fork_batches SET stage=?,source_released=1,error=? WHERE operation_id=?",params![next,
+            if next=="aborted" {Some("source exited before the managed capture was committed")}else{None},id])?;
+        if next=="aborted" {
+            tx.execute("UPDATE operations SET phase='ABORTED',decision='ABORT',revision=revision+1 WHERE operation_id=?",[&id])?;
+            tx.execute("UPDATE managed_budget_holds SET state='released' WHERE operation_id=? AND state='reserved'",[&id])?;
+        }
+        tx.execute("UPDATE instance_bindings SET active_operation_id=NULL WHERE active_operation_id=?",[&id])?;
+    }
+    Ok(())
+}
 pub(crate) fn finish_abort(c:&mut Catalog,id:&str,error:Option<&str>)->Result<()> {
     let tx=c.db.transaction()?;
     tx.execute("UPDATE managed_fork_batches SET source_released=1,stage='aborted',error=? WHERE operation_id=?",params![error,id])?;
