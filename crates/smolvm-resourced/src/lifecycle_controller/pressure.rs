@@ -52,7 +52,7 @@ fn measure(db: &Connection) -> Result<Sample> {
         .saturating_mul(1024);
     let current = usage("memory.current");
     let max = usage("memory.max");
-    let storage = crate::admission::limits(db)?.storage_bytes;
+    let storage = crate::admission::unreserved_storage(db)?;
     Ok(Sample {
         headroom_bytes: current.zip(max).map_or(available, |(used, limit)| {
             available.min(limit.saturating_sub(used))

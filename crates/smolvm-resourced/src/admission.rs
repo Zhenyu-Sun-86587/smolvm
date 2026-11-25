@@ -76,6 +76,10 @@ fn used(db: &Connection) -> Result<Capacity> {
 pub(crate) fn status(db: &Connection) -> Result<serde_json::Value> {
     Ok(serde_json::json!({"capacity":limits(db)?,"allocated":used(db)?}))
 }
+
+pub(crate) fn unreserved_storage(db: &Connection) -> Result<u64> {
+    Ok(limits(db)?.storage_bytes.saturating_sub(used(db)?.storage_bytes))
+}
 /// The caller owns the immediate admission transaction, including all batch children.
 pub(crate) fn reserve(
     db: &rusqlite::Transaction<'_>,
