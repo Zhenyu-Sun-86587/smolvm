@@ -7,6 +7,9 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::thread;
 
+#[path = "network_topology.rs"]
+pub mod topology;
+
 pub const TAP_PORT_NAME: &str = "port0";
 pub const TAP_MTU: u16 = 1500;
 pub const TAP_VNET_HEADER_SIZE: u16 = 12;
@@ -40,6 +43,12 @@ pub fn prepare_tap_port() -> io::Result<PreparedTapPort> {
 }
 
 fn prepare_in_new_namespace() -> io::Result<PreparedTapPort> {
+    let namespace = enter_private_namespace()?;
+    let tap = prepare_tap()?;
+    Ok(PreparedTapPort { namespace, tap })
+}
+
+fn enter_private_namespace() -> io::Result<File> {
     // SAFETY: the dedicated thread has no namespace-sensitive resources yet.
     errno(unsafe { libc::unshare(libc::CLONE_NEWNET) })?;
     let namespace = File::open("/proc/thread-self/ns/net")?;
@@ -49,8 +58,12 @@ fn prepare_in_new_namespace() -> io::Result<PreparedTapPort> {
             format!("/proc/sys/net/ipv6/conf/{scope}/disable_ipv6"),
             b"1\n",
         )?;
+        fs::write(format!("/proc/sys/net/ipv4/conf/{scope}/rp_filter"), b"0\n")?;
     }
+    Ok(namespace)
+}
 
+fn prepare_tap() -> io::Result<File> {
     let tap = OpenOptions::new()
         .read(true)
         .write(true)
@@ -85,7 +98,7 @@ fn prepare_in_new_namespace() -> io::Result<PreparedTapPort> {
             return Err(io::Error::other("new TAP port is unexpectedly up"));
         }
     }
-    Ok(PreparedTapPort { namespace, tap })
+    Ok(tap)
 }
 
 fn port_request() -> libc::ifreq {
