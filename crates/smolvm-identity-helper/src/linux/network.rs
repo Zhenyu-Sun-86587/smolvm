@@ -29,6 +29,12 @@ struct Address {
 
 impl Address {
     fn check(self) -> bool {
+        if self.prefix == 32 {
+            return self.ip != self.gateway
+                && [self.ip, self.gateway]
+                    .into_iter()
+                    .all(|v| Ipv4Addr::from(v).is_private());
+        }
         if !(1..=30).contains(&self.prefix) {
             return false;
         }
@@ -271,6 +277,7 @@ impl RouteSocket {
             return Err(invalid());
         }
         let mut gateways = Vec::new();
+        let mut gateway_host_route = false;
         self.transact(
             libc::RTM_GETROUTE,
             DUMP,
@@ -279,38 +286,86 @@ impl RouteSocket {
                 if k != libc::RTM_NEWROUTE || d.len() < 12 {
                     return Err(invalid());
                 }
-                if d[0] == libc::AF_INET as u8 && d[1] == 0 && d[4] == MAIN && d[7] == 1 {
-                    let (mut out, mut via, mut multi) = (None, None, false);
-                    attrs(&d[12..], |ty, v| match ty {
-                        libc::RTA_OIF if v.len() == 4 => out = Some(u32at(v, 0)),
-                        libc::RTA_GATEWAY => via = Some(v.to_vec()),
+                if d[0] == libc::AF_INET as u8
+                    && d[4] == MAIN
+                    && d[7] == 1
+                    && matches!(d[1], 0 | 32)
+                {
+                    let (mut out, mut via, mut destination, mut multi) = (None, None, None, false);
+                    attrs(&d[12..], |ty, value| match ty {
+                        libc::RTA_OIF if value.len() == 4 => out = Some(u32at(value, 0)),
+                        libc::RTA_GATEWAY => via = Some(value.to_vec()),
+                        libc::RTA_DST if value.len() == 4 => {
+                            destination = Some(<[u8; 4]>::try_from(value).unwrap())
+                        }
                         libc::RTA_MULTIPATH => multi = true,
                         _ => (),
                     })?;
-                    if multi {
+                    if d[1] == 0 && multi {
                         return Err(invalid());
                     }
                     if out == Some(idx) {
-                        gateways.push(via)
+                        if d[1] == 0 {
+                            gateways.push(via);
+                        } else if d[6] == libc::RT_SCOPE_LINK
+                            && destination == Some(wanted.gateway)
+                            && via.is_none()
+                        {
+                            gateway_host_route = true;
+                        }
                     }
                 }
                 Ok(())
             },
         )?;
-        if gateways != [Some(wanted.gateway.to_vec())] {
+        if gateways != [Some(wanted.gateway.to_vec())]
+            || (wanted.prefix == 32 && !gateway_host_route)
+        {
             return Err(invalid());
         }
         Ok(())
     }
-    fn link(&mut self, idx: u32, up: bool, mac: Option<&[u8; 6]>) -> io::Result<()> {
+    fn set_mac(&mut self, idx: u32, mac: &[u8; 6]) -> io::Result<()> {
+        // The managed virtio-net driver supports live MAC changes. Cycling the
+        // link here would remove unrelated routes and modify workload state.
         let mut msg = vec![0; 16];
         msg[4..8].copy_from_slice(&idx.to_ne_bytes());
-        msg[8..12].copy_from_slice(&(if up { libc::IFF_UP as u32 } else { 0 }).to_ne_bytes());
-        msg[12..16].copy_from_slice(&(libc::IFF_UP as u32).to_ne_bytes());
-        if let Some(mac) = mac {
-            attribute(&mut msg, libc::IFLA_ADDRESS, mac)
-        }
+        attribute(&mut msg, libc::IFLA_ADDRESS, mac);
         self.change(libc::RTM_NEWLINK, 0, &msg)
+    }
+
+    fn reset_neighbors(&mut self, idx: u32) -> io::Result<()> {
+        // Both Native and Fixed targets use a fresh Worker endpoint. A cached
+        // gateway MAC can still look reachable to the restored TCP/IP stack.
+        let mut query = [0; 12];
+        query[0] = libc::AF_INET as u8;
+        let mut addresses = Vec::new();
+        self.transact(libc::RTM_GETNEIGH, DUMP, &query, |kind, data| {
+            if kind != libc::RTM_NEWNEIGH || data.len() < 12 {
+                return Err(invalid());
+            }
+            if data[0] == query[0] && u32at(data, 4) == idx && data[10] & libc::NTF_PROXY == 0 {
+                attrs(&data[12..], |kind, value| {
+                    if kind == libc::NDA_DST && value.len() == 4 {
+                        addresses.push(<[u8; 4]>::try_from(value).unwrap());
+                    }
+                })?;
+                if addresses.len() > 4096 {
+                    return Err(io::Error::from_raw_os_error(libc::E2BIG));
+                }
+            }
+            Ok(())
+        })?;
+        query[4..8].copy_from_slice(&idx.to_ne_bytes());
+        for address in addresses {
+            let mut msg = query.to_vec();
+            attribute(&mut msg, libc::NDA_DST, &address);
+            match self.change(libc::RTM_DELNEIGH, 0, &msg) {
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => (),
+                result => result?,
+            }
+        }
+        Ok(())
     }
     fn addr(&mut self, idx: u32, a: Address, add: bool) -> io::Result<()> {
         let mut msg = vec![libc::AF_INET as u8, a.prefix, 0, 0];
@@ -327,6 +382,34 @@ impl RouteSocket {
             &msg,
         )
     }
+    fn gateway_host_route(&mut self, idx: u32, address: Address, add: bool) -> io::Result<()> {
+        let mut msg = vec![
+            libc::AF_INET as u8,
+            32,
+            0,
+            0,
+            MAIN,
+            if add { 4 } else { 0 },
+            libc::RT_SCOPE_LINK,
+            1,
+            0,
+            0,
+            0,
+            0,
+        ];
+        attribute(&mut msg, libc::RTA_DST, &address.gateway);
+        attribute(&mut msg, libc::RTA_OIF, &idx.to_ne_bytes());
+        self.change(
+            if add {
+                libc::RTM_NEWROUTE
+            } else {
+                libc::RTM_DELROUTE
+            },
+            if add { CREATE_EXCLUSIVE } else { 0 },
+            &msg,
+        )
+    }
+
     fn route(&mut self, idx: u32, a: Address, add: bool) -> io::Result<()> {
         let mut msg = vec![
             libc::AF_INET as u8,
@@ -364,17 +447,24 @@ pub(super) fn apply(frame: &[u8; 64], completed: &mut u32) -> io::Result<Ipv4Add
     }
     let mut net = RouteSocket::open()?;
     net.verify(idx, &plan.old_mac, plan.old)?;
-    if plan.old_mac != plan.new_mac || plan.old != plan.new {
+    if plan.old_mac != plan.new_mac {
+        net.set_mac(idx, &plan.new_mac)?;
+    }
+    if plan.old != plan.new {
         net.route(idx, plan.old, false)?;
-        net.link(idx, false, None)?;
-        net.link(idx, false, Some(&plan.new_mac))?;
+        if plan.old.prefix == 32 {
+            net.gateway_host_route(idx, plan.old, false)?;
+        }
         if plan.old.ip != plan.new.ip || plan.old.prefix != plan.new.prefix {
             net.addr(idx, plan.old, false)?;
             net.addr(idx, plan.new, true)?;
         }
-        net.link(idx, true, None)?;
+        if plan.new.prefix == 32 {
+            net.gateway_host_route(idx, plan.new, true)?;
+        }
         net.route(idx, plan.new, true)?;
     }
+    net.reset_neighbors(idx)?;
     net.verify(idx, &plan.new_mac, plan.new)?;
     *completed |= 8 | 16;
     Ok(plan.dns)
