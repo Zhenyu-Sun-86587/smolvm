@@ -226,11 +226,7 @@ fn stopped(catalog: &Catalog, route: &str, instance: &str, epoch: i64) -> Result
     if !valid_id(instance) || epoch < 0 {
         return Err(Fault::invalid("invalid attachment execution scope"));
     }
-    let binding: Option<(i64, Option<String>, Option<String>)> = catalog.db.query_row(
-        "SELECT execution_epoch,incarnation_id,active_operation_id FROM instance_bindings WHERE route_id=? AND instance_id=?",
-        params![route,instance], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-    ).optional()?;
-    if binding.unwrap_or_default() != (epoch, None, None) {
+    if crate::catalog::binding(&catalog.db, route, instance)? != (epoch, None, None) {
         return Err(busy(
             "attachment changes require the exact stopped execution",
         ));
