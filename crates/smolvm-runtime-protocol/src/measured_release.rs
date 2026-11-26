@@ -1,5 +1,5 @@
-use super::{CONTRACT_PROTOCOLS, Capability, Handshake};
-use serde_json::{Value, json};
+use super::{Capability, Handshake, CONTRACT_PROTOCOLS};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -8,6 +8,14 @@ const WORKER: &str = "smolvm-resourced";
 const SYSTEM_TEMPLATE: &str = "guest/system-debian.tar.gz";
 const NETWORK_CONTRACT: &str = "managed_private_network";
 const RESOURCE_CONTRACT: &str = "managed_live_resources";
+pub(crate) const AUTHORIZED_SCOPE: &str = "managed_authorized_scope";
+const AUTHORIZED_CASES: [&str; 5] = [
+    "system-boot",
+    "system-fork",
+    "system-restore",
+    "network-native",
+    "network-fixed",
+];
 const RESOURCE_CASES: [(&str, &str); 2] = [
     ("live-resources", "parked-capture"),
     ("live-resources-hot", "live-compute"),
@@ -44,6 +52,14 @@ pub struct MeasuredRelease {
     worker_sha256: String,
     private_network: bool,
     live_resources: bool,
+    authorized: Option<AuthorizedCases>,
+}
+
+struct AuthorizedCases {
+    fork: bool,
+    restore: bool,
+    native: bool,
+    fixed: bool,
 }
 
 impl MeasuredRelease {
@@ -72,6 +88,30 @@ impl MeasuredRelease {
             };
             handshake.capabilities.insert(name.into(), capability);
         };
+        if let Some(scope) = &self.authorized {
+            publish("boot.system", "system-debian-v1");
+            if scope.fork {
+                publish("state.independent_fork", "managed-parked-v1");
+                publish("state.fork_batch", "managed-parked-v1");
+            }
+            if scope.restore {
+                for name in ["state.checkpoint", "state.hibernate", "state.restore"] {
+                    publish(name, "managed-block-v1");
+                }
+                publish("boot.system_state_restore", "system-debian-v1");
+            }
+            if scope.native || scope.fixed {
+                publish("network.tap", "managed-private-system-v1");
+                publish("network.tap_restore", "managed-private-system-v1");
+            }
+            if scope.native {
+                publish("network.native", "managed-private-system-v1");
+            }
+            if scope.fixed {
+                publish("network.fixed_internal", "managed-private-system-v1");
+            }
+            return;
+        }
         publish("lifecycle.standby", "managed-parked-v1");
         publish("boot.system_state_restore", "system-debian-v1");
         if self.live_resources {
@@ -156,6 +196,34 @@ fn measurement_digest(manifest: &Value, record: &str) -> Option<String> {
     ))
 }
 
+fn authorized_cases(manifest: &Value, evidence: &Value, system: &str) -> Option<AuthorizedCases> {
+    let runs = evidence["runs"].as_object()?;
+    let contracts = &manifest["contracts"];
+    let harness = &runs.get("system-boot")?["harness_sha256"];
+    if contracts[AUTHORIZED_SCOPE].as_u64() != Some(1)
+        || MANAGED.iter().any(|key| contracts.get(*key).is_some())
+        || contracts.get(NETWORK_CONTRACT).is_some()
+        || contracts.get(RESOURCE_CONTRACT).is_some()
+        || evidence["system_template_sha256"] != system
+        || evidence["measurement_bundle_digest"]
+            != measurement_digest(manifest, evidence["build_record_sha256"].as_str()?)?
+        || !runs.iter().all(|(case, run)| {
+            AUTHORIZED_CASES.contains(&case.as_str())
+                && run.as_object().is_some_and(|fields| fields.len() == 2)
+                && run["harness_sha256"] == *harness
+                && log_matches(manifest, case, run)
+        })
+    {
+        return None;
+    }
+    Some(AuthorizedCases {
+        fork: runs.contains_key("system-fork"),
+        restore: runs.contains_key("system-restore"),
+        native: runs.contains_key("network-native"),
+        fixed: runs.contains_key("network-fixed"),
+    })
+}
+
 /// Derive capabilities from installed evidence indexed by the verified manifest.
 /// The installer checks the complete files, actual System archive and logs. Serve
 /// checks the evidence binding again before asking the current Worker for its digest.
@@ -163,8 +231,7 @@ pub fn measured_release(manifest: &Value, evidence_bytes: &[u8]) -> Option<Measu
     let contracts = &manifest["contracts"];
     let guest = &manifest["guest"];
     let boot = guest["boot_profiles"].as_array()?;
-    if !MANAGED.iter().all(|key| contracts[key].as_u64() == Some(1))
-        || !boot.iter().any(|name| name == "system-debian-v1")
+    if !boot.iter().any(|name| name == "system-debian-v1")
         || !boot.iter().any(|name| name == "oci-v1")
         || !matches_artifact(
             manifest,
@@ -195,9 +262,22 @@ pub fn measured_release(manifest: &Value, evidence_bytes: &[u8]) -> Option<Measu
         manifest,
         "metadata/build-record.json",
         &evidence["build_record_sha256"],
-    ) || !BASE_CASES
-        .iter()
-        .all(|case| log_matches(manifest, case, &evidence["runs"][case]))
+    ) {
+        return None;
+    }
+    if evidence["schema"] == "RuntimeManagedAcceptance/4" {
+        return Some(MeasuredRelease {
+            worker_sha256,
+            private_network: false,
+            live_resources: false,
+            authorized: Some(authorized_cases(manifest, &evidence, &system_template)?),
+        });
+    }
+    if contracts.get(AUTHORIZED_SCOPE).is_some()
+        || !MANAGED.iter().all(|key| contracts[key].as_u64() == Some(1))
+        || !BASE_CASES
+            .iter()
+            .all(|case| log_matches(manifest, case, &evidence["runs"][case]))
     {
         return None;
     }
@@ -256,6 +336,7 @@ pub fn measured_release(manifest: &Value, evidence_bytes: &[u8]) -> Option<Measu
         worker_sha256,
         private_network,
         live_resources,
+        authorized: None,
     })
 }
 
@@ -263,11 +344,11 @@ pub fn measured_release(manifest: &Value, evidence_bytes: &[u8]) -> Option<Measu
 mod tests {
     use super::*;
 
-    fn fixture(private_network: bool, live_resources: bool) -> (Value, Vec<u8>) {
-        fn entry(path: &str, data: &[u8]) -> Value {
-            json!({"path":path,"size":data.len(),"sha256":format!("{:x}",Sha256::digest(data))})
-        }
+    fn entry(path: &str, data: &[u8]) -> Value {
+        json!({"path":path,"size":data.len(),"sha256":format!("{:x}",Sha256::digest(data))})
+    }
 
+    fn fixture(private_network: bool, live_resources: bool) -> (Value, Vec<u8>) {
         let names = MEASURED_ARTIFACTS.map(|(_, installed)| installed);
         let files = [
             "metadata/build-lock.json",
@@ -406,5 +487,89 @@ mod tests {
         let (manifest, _) = fixture(true, false);
         evidence.push(b' ');
         assert!(measured_release(&manifest, &evidence).is_none());
+    }
+
+    #[test]
+    fn authorized_release_advertises_selected_cases_after_worker_verification() {
+        for scope in [
+            &["system-boot"][..],
+            &[
+                "system-boot",
+                "system-fork",
+                "system-restore",
+                "network-native",
+            ],
+        ] {
+            let (mut manifest, _) = fixture(false, false);
+            let contracts = manifest["contracts"].as_object_mut().unwrap();
+            for key in MANAGED {
+                contracts.remove(key);
+            }
+            contracts.insert(AUTHORIZED_SCOPE.into(), json!(1));
+            let artifacts = manifest["artifacts"].as_array_mut().unwrap();
+            artifacts.retain(|item| item["path"] != MANAGED_ACCEPTANCE_PATH);
+            for case in scope.iter().filter(|case| !BASE_CASES.contains(case)) {
+                let path = format!("metadata/managed/{case}.log");
+                artifacts.push(entry(&path, path.as_bytes()));
+            }
+            let runs: BTreeMap<_, _> = scope.iter().map(|case| (*case, json!({
+                "harness_sha256": format!("sha256:{}", "a".repeat(64)),
+                "log_sha256": artifact_digest(&manifest, &format!("metadata/managed/{case}.log")),
+            }))).collect();
+            let record = artifact_digest(&manifest, "metadata/build-record.json").unwrap();
+            let evidence = serde_json::to_vec(&json!({
+                "schema": "RuntimeManagedAcceptance/4",
+                "build_lock_sha256": artifact_digest(&manifest, "metadata/build-lock.json"),
+                "build_record_sha256": record,
+                "system_template_sha256": artifact_digest(&manifest, SYSTEM_TEMPLATE),
+                "measurement_bundle_digest": measurement_digest(&manifest, &record),
+                "runs": runs,
+            }))
+            .unwrap();
+            manifest["artifacts"]
+                .as_array_mut()
+                .unwrap()
+                .push(entry(MANAGED_ACCEPTANCE_PATH, &evidence));
+            let release = measured_release(&manifest, &evidence).unwrap();
+            let serve = artifact(&manifest, "smolvm-bin").unwrap()["sha256"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            manifest.sort_all_objects();
+            manifest["bundle_digest"] = json!(format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&manifest).unwrap())
+            ));
+            let mut response = crate::handshake(manifest, &serve).unwrap();
+            assert!(!response.capabilities["boot.system"].supported);
+            release.advertise(&mut response, None);
+            assert_eq!(response.state_reader_id, "fixture-reader");
+            assert!(response.capabilities["boot.system"].supported);
+            for (name, case) in [
+                ("state.fork_batch", "system-fork"),
+                ("state.restore", "system-restore"),
+                ("boot.system_state_restore", "system-restore"),
+                ("network.native", "network-native"),
+                ("network.tap_restore", "network-native"),
+            ] {
+                assert_eq!(
+                    response.capabilities[name].supported,
+                    scope.contains(&case),
+                    "{name}"
+                );
+            }
+            for name in [
+                "state.rollback",
+                "lifecycle.standby",
+                "lifecycle.standby_wake",
+                "network.fixed_internal",
+                "network.native_reidentity",
+                "boot.live_compute_growth",
+            ] {
+                assert!(!response.capabilities[name].supported, "{name}");
+            }
+            release.advertise(&mut response, Some("WORKER_RELEASE_MISMATCH"));
+            assert!(!response.capabilities["boot.system"].supported);
+        }
     }
 }

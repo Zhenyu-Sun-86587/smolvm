@@ -79,6 +79,7 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
         return Err("Serve binary does not match bundle");
     }
     let contracts = &manifest["contracts"];
+    let authorized_scope = contracts.get(measured_release::AUTHORIZED_SCOPE).is_some();
     let reader = contracts["state_reader_id"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
@@ -127,7 +128,7 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
         )
     })
     .collect();
-    if contracts["managed_block_launch"].as_u64() == Some(1)
+    if !authorized_scope && contracts["managed_block_launch"].as_u64() == Some(1)
         && manifest["guest"]["boot_profiles"]
             .as_array()
             .is_some_and(|p| p.iter().any(|v| v == "system-debian-v1"))
@@ -146,7 +147,7 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
             },
         );
     }
-    if contracts["managed_parked_fork"].as_u64() == Some(1)
+    if !authorized_scope && contracts["managed_parked_fork"].as_u64() == Some(1)
         && contracts["managed_block_launch"].as_u64() == Some(1)
         && manifest["guest"]["boot_profiles"].as_array().is_some_and(|profiles| profiles.iter().any(|p|p=="oci-v1"))
         && artifacts.iter().any(|a|a["path"]=="guest/identity-helper") {
@@ -157,7 +158,7 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
             });
         }
     }
-    if contracts["managed_statepoint"].as_u64() == Some(1)
+    if !authorized_scope && contracts["managed_statepoint"].as_u64() == Some(1)
         && contracts["managed_block_launch"].as_u64() == Some(1)
         && artifacts.iter().any(|a| a["path"] == "guest/identity-helper")
     {
