@@ -262,7 +262,8 @@ pub(crate) fn independent_restore_products(
              WHERE v.volume_id=?1 AND v.route_id=?2 AND v.bundle_digest=?3
                AND a.instance_id=?4 AND a.device_key=?5
                AND ( (?6 IS NULL AND a.mode='rw')
-                 OR (?6 IS NOT NULL AND a.mode='ro' AND a.generation_id=?6 AND v.state='available') )
+                 OR (?6 IS NOT NULL AND a.mode='ro' AND a.generation_id=?6
+                     AND (v.state='available' OR m.volume_id IS NOT NULL)) )
              ORDER BY a.attachment_id=?7 DESC, a.state='reserved' DESC, a.attachment_id LIMIT 1",
             params![old.volume_id, op.route_id, op.bundle_digest, source.instance_id, old.device_id, generation, old.attachment_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -664,13 +665,15 @@ pub(crate) fn mutate(catalog: &mut Catalog, objects: &File, request: &Request) -
             }
             None
         } else {
-            let (_, revision, state, _) = metadata(catalog, route, bundle, &lookup)?;
-            if input.expected_revision != revision
-                || (state != "available" && !matches!(input.command, Action::DropSnapshot { .. }))
-            {
+            let (lifecycle, revision, state, _) = metadata(catalog, route, bundle, &lookup)?;
+            let drop_snapshot = matches!(input.command, Action::DropSnapshot { .. });
+            let detach = matches!(input.command, Action::Detach { .. });
+            let attach_immutable = matches!(&input.command, Action::Attach { mode, .. } if mode == "ro");
+            let preserves_snapshot = drop_snapshot || (lifecycle == "machine" && (detach || attach_immutable));
+            if input.expected_revision != revision || (state != "available" && !preserves_snapshot) {
                 return Err(mismatch("volume has a different current revision"));
             }
-            if matches!(input.command, Action::DropSnapshot { .. }) {
+            if drop_snapshot || detach || attach_immutable {
                 None
             } else {
                 Some(
@@ -904,15 +907,12 @@ fn preflight(
             if in_use {
                 return Err(busy("device slot or writable volume already reserved"));
             }
-            let machine: Option<Option<String>> = catalog.db.query_row(
-                "SELECT instance_id FROM product_machine_volumes WHERE volume_id=?",
-                [&input.volume_id], |row| row.get(0),
-            ).optional()?;
-            if let Some(machine) = machine {
-                if mode != "rw" {
-                    return Err(Fault::invalid("machine volumes require writable attachment"));
-                }
-                if machine.as_deref().is_some_and(|owner| owner != instance_id) {
+            if mode == "rw" {
+                let foreign: bool = catalog.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM product_machine_volumes WHERE volume_id=? AND instance_id<>?)",
+                    params![input.volume_id, instance_id], |row| row.get(0),
+                )?;
+                if foreign {
                     return Err(busy("machine volume belongs to a different instance"));
                 }
             }
@@ -924,8 +924,9 @@ fn preflight(
         } => {
             stopped(catalog, route, instance_id, *execution_epoch)?;
             let exists: bool = catalog.db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM product_volume_attachments
-                WHERE attachment_id=? AND instance_id=? AND volume_id=? AND state='reserved')",
+                "SELECT EXISTS(SELECT 1 FROM product_volume_attachments a JOIN product_volumes v USING(volume_id)
+                WHERE a.attachment_id=? AND a.instance_id=? AND a.volume_id=? AND a.state='reserved'
+                    AND (v.state='available' OR a.mode='ro'))",
                 params![attachment_id, instance_id, input.volume_id],
                 |row| row.get(0),
             )?;
@@ -1022,8 +1023,10 @@ fn apply_metadata(
                     execution_epoch
                 ],
             )?;
-            tx.execute("UPDATE product_machine_volumes SET instance_id=? WHERE volume_id=? AND instance_id IS NULL",
-                params![instance_id, id])?;
+            if mode == "rw" {
+                tx.execute("UPDATE product_machine_volumes SET instance_id=? WHERE volume_id=? AND instance_id IS NULL",
+                    params![instance_id, id])?;
+            }
             if let Some(generation) = generation {
                 insert_pin(tx, "product_attachment", attachment_id, &generation, op)?;
             }
@@ -1102,7 +1105,8 @@ pub(crate) fn launch_device(
     let reservation: Option<Option<String>> = catalog.db.query_row(
         "SELECT a.generation_id FROM product_volume_attachments a JOIN product_volumes v USING(volume_id)
         WHERE a.attachment_id=? AND a.volume_id=? AND a.instance_id=? AND a.device_key=? AND a.declared_epoch<?
-        AND a.mode=? AND a.state='reserved' AND v.state='available' AND v.route_id=? AND v.bundle_digest=?
+        AND a.mode=? AND a.state='reserved' AND (v.state='available' OR (a.mode='ro' AND m.volume_id IS NOT NULL))
+        AND v.route_id=? AND v.bundle_digest=?
         AND NOT EXISTS (SELECT 1 FROM product_volume_operations p WHERE p.volume_id=v.volume_id AND p.result_json IS NULL)",
         params![disk.attachment_id, volume, instance, disk.device_id, epoch,
             if disk.read_only { "ro" } else { "rw" }, route, bundle],
@@ -1170,3 +1174,4 @@ pub(crate) fn require_capture_policy(
     }
     Ok(())
 }
+        LEFT JOIN product_machine_volumes m USING(volume_id)

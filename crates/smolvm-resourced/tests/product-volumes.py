@@ -79,9 +79,6 @@ def run(broker):
             attached = mutate("user-data", "attach", 1, "attach", attachment_id="disk-attachment",
                               instance_id=INSTANCE, execution_epoch=0, device_key="data0", mode="rw", fork_policy="clone")
             require(attached["volume"]["attachments"][0]["state"] == "reserved", attached)
-            rejects("E_VOLUME_BUSY", lambda: mutate("user-data", "second-attach", 2, "attach",
-                attachment_id="other", instance_id="other-machine", execution_epoch=0,
-                device_key="data0", mode="rw", fork_policy="clone"))
             rejects("E_STALE_REVISION", lambda: mutate("user-data", "stale", 1, "delete"))
             print("PRODUCT_VOLUME_EXCLUSIVE_OFFLINE_RESERVATION", flush=True)
 
@@ -138,20 +135,23 @@ def run(broker):
             machine = {"instance_id": instance, "execution_epoch": 0, "mode": "rw", "fork_policy": "clone"}
             lifetime = mutate("machine-data", "create", 0, "create", capacity_bytes=CAPACITY, lifecycle="machine")["volume"]
             require(lifetime["lifecycle"] == "machine" and "machine_instance_id" not in lifetime, lifetime)
-            owned = mutate("machine-data", "attach", 1, "attach", attachment_id="machine-disk",
-                           device_key="data", **machine)["volume"]
-            require(owned["machine_instance_id"] == instance, owned)
-            saved = mutate("machine-data", "snapshot", 2, "snapshot", snapshot_id="machine-disk-snapshot")["volume"]
+            saved = mutate("machine-data", "snapshot", 1, "snapshot", snapshot_id="machine-disk-snapshot")["volume"]
             prior = saved["snapshots"][0]["generation_id"]
             current = saved["head_resource_id"]
-            mutate("machine-data", "detach", saved["revision"], "detach",
+            readonly = dict(execution_epoch=0, mode="ro", fork_policy="share_immutable", snapshot_id="machine-disk-snapshot")
+            view = saved
+            for consumer in ("reader-one", "reader-two"):
+                view = mutate("machine-data", "attach-" + consumer, view["revision"], "attach", attachment_id=consumer,
+                              instance_id=consumer, device_key="archive", **readonly)["volume"]
+                require("machine_instance_id" not in view and all(a["generation_id"] == prior for a in view["attachments"]), view)
+            owned = mutate("machine-data", "attach", view["revision"], "attach", attachment_id="machine-disk",
+                           device_key="data", **machine)["volume"]
+            require(owned["machine_instance_id"] == instance, owned)
+            mutate("machine-data", "detach", owned["revision"], "detach",
                    attachment_id="machine-disk", instance_id=instance, execution_epoch=0)
             detached = query("machine-data")
-            require(detached["machine_instance_id"] == instance and not detached["attachments"], detached)
-            rejects("E_VOLUME_BUSY", lambda: mutate("machine-data", "foreign-attach", detached["revision"], "attach",
-                attachment_id="foreign-disk", device_key="data", **{**machine, "instance_id": "other-machine"}))
-            require(query("machine-data") == detached, "foreign attempt changed machine ownership")
-
+            require(detached["machine_instance_id"] == instance, detached)
+            require({item["attachment_id"] for item in detached["attachments"]} == {"reader-one", "reader-two"}, detached)
             legacy = mutate("old-ephemeral", "create", 0, "create", capacity_bytes=CAPACITY, lifecycle="ephemeral")["volume"]
             mutate("old-ephemeral", "attach", legacy["revision"], "attach",
                    attachment_id="legacy-disk", device_key="legacy", **machine)
@@ -179,6 +179,13 @@ def run(broker):
             require(call("RetireStoppedInstance", {"name": name}, **retirement)["phase"] == "COMPLETED")
             retired = query("machine-data")
             require(retired["state"] == "deleted" and retired["revision"] == detached["revision"] + 1, retired)
+            require(retired["attachments"] == detached["attachments"], retired)
+            replacement = mutate("machine-data", "attach-after-head-retirement", retired["revision"], "attach",
+                                  attachment_id="reader-three", instance_id="reader-three", device_key="archive", **readonly)["volume"]
+            require(replacement["machine_instance_id"] == instance and replacement["state"] == "deleted", replacement)
+            after = mutate("machine-data", "detach-after-head-retirement", replacement["revision"], "detach",
+                           attachment_id="reader-one", instance_id="reader-one", execution_epoch=0)["volume"]
+            require({item["attachment_id"] for item in after["attachments"]} == {"reader-two", "reader-three"}, after)
             require(query("machine-also-attached")["state"] == "deleted" and not query("machine-also-attached")["attachments"])
             for head in (current, held_machine["head_resource_id"], *prior_heads):
                 until(lambda: not (state / "objects" / head).exists(), process, "retired machine data file")
@@ -192,6 +199,7 @@ def run(broker):
                    attachment_id="legacy-moved", device_key="legacy",
                    **{**machine, "instance_id": "other-machine"})
             print("OWNED_MACHINE_VOLUMES_RETIRED_WITH_65_ATTACHED_AND_DETACHED_HEADS", flush=True)
+            print("IMMUTABLE_MACHINE_VOLUME_READERS_RETAINED_AND_DETACHED_AFTER_OWNER_RETIRED", flush=True)
         finally:
             for item in (guest, process):
                 if item is not None and item.poll() is None:

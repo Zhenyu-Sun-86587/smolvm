@@ -142,8 +142,10 @@ fn release_instance_links(tx: &Transaction<'_>, route: &str, bundle: &str, insta
     tx.execute("UPDATE product_volumes SET state='deleted',revision=revision+1
         WHERE route_id=? AND bundle_digest=? AND state='available' AND volume_id IN (
             SELECT volume_id FROM product_machine_volumes WHERE instance_id=?)", params![route, bundle, instance])?;
-    tx.execute("UPDATE product_volumes SET revision=revision+1 WHERE state='available' AND volume_id IN (
-        SELECT volume_id FROM product_volume_attachments WHERE instance_id=? AND state='reserved')", [instance])?;
+    tx.execute("UPDATE product_volumes SET revision=revision+1 WHERE volume_id IN (
+        SELECT volume_id FROM product_volume_attachments WHERE instance_id=?1 AND state='reserved')
+        AND NOT EXISTS(SELECT 1 FROM product_machine_volumes m
+            WHERE m.volume_id=product_volumes.volume_id AND m.instance_id=?1)", [instance])?;
     tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='product_attachment' AND state='active'
         AND owner_id IN (SELECT attachment_id FROM product_volume_attachments WHERE instance_id=? AND state='reserved')", [instance])?;
     tx.execute("UPDATE product_volume_attachments SET state='detached',revision=revision+1
