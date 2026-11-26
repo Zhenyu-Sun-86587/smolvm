@@ -12,6 +12,7 @@ import secrets
 import select
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -207,8 +208,11 @@ def change_source_epoch(source, destination):
                                                    + updated + data[end:])
 
 
-def orchestrate(broker, library, guest, helper, durable=False, mixed_capture=False):
+def orchestrate(broker, library, guest, helper, durable=False, mixed_capture=False, interrupt_capture=False):
     broker, library, guest, helper = [Path(path).resolve(strict=True) for path in (broker, library, guest, helper)]
+    if interrupt_capture:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tests"))
+        import capture_transport_kvm as transport
     with tempfile.TemporaryDirectory(prefix="parked-block-") as temporary:
         work = Path(temporary)
         root = work / "root"
@@ -303,18 +307,26 @@ def orchestrate(broker, library, guest, helper, durable=False, mixed_capture=Fal
             proc, addr, rows, _, _ = guest
             challenge, anchor = secrets.token_hex(16), secrets.token_hex(16)
             token = f"{sequence} {challenge}"
+            def confirmed(command):
+                if interrupt_capture:
+                    transport.cut(addr, command, "reply")
+                return request(addr, command)
+
             def gate_at(phase):
                 reply = request(addr, f"GUEST_GATE_QUERY {token}")
                 require(reply.split()[-1] == "0", "guest gate failed", reply)
                 return reply.endswith(f" {phase} 0")
 
-            request(addr, f"GUEST_GATE_PREPARE {token} 2500 5000")
+            confirmed(f"GUEST_GATE_PREPARE {token} 2500 5000")
             until(lambda: gate_at("armed"), proc, "guest armed")
-            request(addr, f"GUEST_GATE_PARK {token} {anchor}")
+            confirmed(f"GUEST_GATE_PARK {token} {anchor}")
             until(lambda: gate_at("parked"), proc, "guest parked")
-            request(addr, f"STANDBY_ENTER {token} managed")
-            require('"source_disposition":"HELD"' in request(addr, f"CAPTURE_PREPARE {token} parked"),
+            confirmed(f"STANDBY_ENTER {token} managed")
+            held = confirmed(f"CAPTURE_PREPARE {token} parked")
+            require('"source_disposition":"HELD"' in held,
                     "source did not hold")
+            if interrupt_capture:
+                require(request(addr, f"CAPTURE_QUERY {token}") == held, "capture reply changed after requester exit")
             fixed = rows()
             request(addr, f"CAPTURE_EXPORT {token}", response="ERR EBUSY")
             request(addr, f"CAPTURE_FINISH {token} RETURN_STANDBY", response="ERR EBUSY")
@@ -323,16 +335,32 @@ def orchestrate(broker, library, guest, helper, durable=False, mixed_capture=Fal
             next_heads = {item["volume_id"]: "next-" + item["head_resource_id"] for item in heads}
             command = dict(operation_id=pivot["operation_id"], request_digest=pivot["request_digest"],
                 previous_grant_revision=revision, next_grant_id=grant_id, destinations=next_heads)
-            receipt = json.loads(request(addr, f"CAPTURE_BLOCK_PIVOT {token} {json.dumps(command)}")[3:])
+            receipt = json.loads(confirmed(f"CAPTURE_BLOCK_PIVOT {token} {json.dumps(command)}")[3:])
             require(receipt["state"] == "complete" and rows() == fixed, receipt)
             request(addr, f"CAPTURE_CANCEL {token}", response="ERR EBUSY")
             if durable:
                 return token, fixed, pivot
+            if interrupt_capture:
+                original = transport.receive_capture(addr, token)
+                for cut_at in ("header", "checkpoint", "descriptor", "backing"):
+                    transport.cut(addr, f"CAPTURE_EXPORT {token}", cut_at)
+                    require(transport.receive_capture(addr, token) == original and rows() == fixed,
+                            "managed capture changed after a partial transfer", cut_at)
+                with sqlite3.connect((work / "catalog/catalog.sqlite").as_uri() + "?mode=ro", uri=True) as db:
+                    actual = db.execute("SELECT state,next_grant_id FROM writer_pivots WHERE operation_id=?",
+                                        (pivot["operation_id"],)).fetchall()
+                    require(actual == [("complete", grant_id)], "pivot was not committed once", actual)
             directory = work / (name + "-capture")
             descriptor, backings = export(addr, token, directory)
             handles.extend(backings)
-            require('"source_disposition":"STANDBY"' in request(addr, f"CAPTURE_FINISH {token} RETURN_STANDBY"),
+            require('"source_disposition":"STANDBY"' in confirmed(f"CAPTURE_FINISH {token} RETURN_STANDBY"),
                     "capture did not preserve standby")
+            if interrupt_capture:
+                require(rows() == fixed and '"source_disposition":"STANDBY"' in request(addr, f"CAPTURE_QUERY {token}"),
+                        "source left its original standby after the requester exited")
+                print("Interrupted managed capture", name, "retained its Guest counters, two-disk pivot", pivot["operation_id"],
+                      "checkpoint", original[1].hex(), "descriptor", original[2].hex(), "and", len(original[3]), "sealed backings",
+                      flush=True)
             return token, fixed, dict(restore=str(directory), descriptor=descriptor, backings=backings,
                                       anchor=anchor, source_pivot_id=pivot["operation_id"])
 
@@ -636,5 +664,7 @@ if __name__ == "__main__":
         orchestrate(*sys.argv[2:], durable=True)
     elif len(sys.argv) == 6 and sys.argv[1] == "--mixed-capture":
         orchestrate(*sys.argv[2:], mixed_capture=True)
+    elif len(sys.argv) == 6 and sys.argv[1] == "--interrupt-capture":
+        orchestrate(*sys.argv[2:], interrupt_capture=True)
     else:
-        sys.exit(f"usage: {sys.argv[0]} [--durable|--mixed-capture] RESOURCED LIBKRUN STATIC_GUEST IDENTITY_HELPER")
+        sys.exit(f"usage: {sys.argv[0]} [--durable|--mixed-capture|--interrupt-capture] RESOURCED LIBKRUN STATIC_GUEST IDENTITY_HELPER")
