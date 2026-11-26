@@ -210,10 +210,12 @@ static STOPPING: AtomicBool = AtomicBool::new(false);
 pub fn prepare_state() -> io::Result<()> {
     let root = tempfile::Builder::new()
         .prefix("smolvm-workloads-")
-        .tempdir_in("/tmp")?
-        .keep();
+        .tempdir_in("/tmp")?;
+    // /tmp can be on the post-pivot root. Put the state on captured Guest
+    // RAM even if that root is supplied by a host shared filesystem.
+    crate::storage::mount_private_tmpfs(root.path(), c"mode=0700")?;
     STATE_PATH
-        .set(root.join("registry.json"))
+        .set(root.keep().join("registry.json"))
         .map_err(|_| io::Error::other("workload state already initialized"))
 }
 
