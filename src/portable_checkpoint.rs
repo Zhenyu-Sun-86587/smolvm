@@ -164,12 +164,19 @@ fn readonly_input_dirs(vm_dir: &Path) -> Vec<PathBuf> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut dirs = vec![vm_dir.join(READONLY_INPUT_DIR)];
     #[cfg(target_os = "linux")]
-    if let (Some(name), Some(root)) = (vm_dir.file_name(), restore_tmpfs_path()) {
-        let mut tmpfs_name = name.to_os_string();
-        tmpfs_name.push(READONLY_INPUT_DIR);
-        dirs.push(root.join(tmpfs_name));
+    if let Some(input) =
+        restore_tmpfs_path().and_then(|root| readonly_tmpfs_input_dir(vm_dir, &root))
+    {
+        dirs.push(input);
     }
     dirs
+}
+
+#[cfg(target_os = "linux")]
+fn readonly_tmpfs_input_dir(vm_dir: &Path, root: &Path) -> Option<PathBuf> {
+    let mut name = vm_dir.file_name()?.to_os_string();
+    name.push(READONLY_INPUT_DIR);
+    Some(root.join(name))
 }
 
 fn remove_readonly_input(vm_dir: &Path) -> std::io::Result<()> {
@@ -250,13 +257,10 @@ fn stage_readonly_memory(
     // the data directory would cross filesystems and fall back to a disk copy.
     let tmpfs = restore_tmpfs_root()
         .filter(|root| std::fs::metadata(root).is_ok_and(|root| root.dev() == metadata.dev()));
-    let [on_disk, on_tmpfs]: [PathBuf; 2] = readonly_input_dirs(vm_dir)
-        .try_into()
-        .expect("disk and tmpfs input directories");
-    let (parent, destination) = match &tmpfs {
-        Some(root) => (root.as_path(), on_tmpfs),
-        None => (vm_dir, on_disk),
-    };
+    let (parent, destination) = tmpfs
+        .as_deref()
+        .and_then(|root| readonly_tmpfs_input_dir(vm_dir, root).map(|input| (root, input)))
+        .unwrap_or_else(|| (vm_dir, vm_dir.join(READONLY_INPUT_DIR)));
     let staging = tempfile::Builder::new()
         .prefix(".restore-input-")
         .permissions(std::fs::Permissions::from_mode(0o700))
