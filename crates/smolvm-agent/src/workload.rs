@@ -12,9 +12,11 @@
 //! most their timeout, kills what is left, and only then quiesces storage, so a
 //! workload gets to save its state before the machine goes away.
 
+use serde::{Deserialize, Serialize};
 use smolvm_protocol::{guest_env, ports};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
@@ -35,56 +37,50 @@ const STOP_POLL: Duration = Duration::from_millis(50);
 /// Output bytes dropped because the queue to the host was full.
 static DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// The queue to the log sender, created on first use when the host asked for
-/// workload logs; `None` when it did not.
-fn log_queue() -> Option<&'static SyncSender<Vec<u8>>> {
-    static QUEUE: OnceLock<Option<SyncSender<Vec<u8>>>> = OnceLock::new();
-    QUEUE
-        .get_or_init(|| {
-            if std::env::var(guest_env::WORKLOAD_LOGS).as_deref() != Ok(guest_env::VALUE_ON) {
-                return None;
-            }
-            let (tx, rx) = mpsc::sync_channel(LOG_QUEUE_CHUNKS);
-            match std::thread::Builder::new()
-                .name("workload-log-send".into())
-                .spawn(move || send_logs(rx))
-            {
-                Ok(_) => Some(tx),
-                Err(e) => {
-                    warn!(error = %e, "could not start the workload log sender; output is discarded");
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
+static LOG_WRITER: OnceLock<OwnedFd> = OnceLock::new();
 
 /// Whether workload output reaches the host.
 pub fn logs_enabled() -> bool {
-    log_queue().is_some()
+    LOG_WRITER.get().is_some()
 }
 
 /// The write end of a pipe whose output is forwarded to the host's workload
 /// log, to hand to a workload as both stdout and stderr; `None` when workload
 /// logs are off, in which case the caller discards the output as before.
 pub fn output_pipe() -> Option<OwnedFd> {
-    let queue = log_queue()?.clone();
+    LOG_WRITER.get()?.try_clone().ok()
+}
+
+/// Keep stdout and stderr connected across changes of the management process.
+/// The supervisor owns the reader and a separate process drains it.
+pub fn prepare_log_pipe() -> io::Result<Option<OwnedFd>> {
+    if std::env::var(guest_env::WORKLOAD_LOGS).as_deref() != Ok(guest_env::VALUE_ON) {
+        return Ok(None);
+    }
     let mut fds = [0; 2];
     // SAFETY: pipe2 writes two descriptors into the array on success.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        warn!(error = %std::io::Error::last_os_error(), "could not create the workload output pipe");
-        return None;
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: both descriptors were just created and are owned only here.
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    let spawned = std::thread::Builder::new()
-        .name("workload-log-read".into())
-        .spawn(move || drain_output(std::fs::File::from(read), queue));
-    if let Err(e) = spawned {
-        warn!(error = %e, "could not start the workload output reader");
-        return None;
+    LOG_WRITER
+        .set(write)
+        .map_err(|_| io::Error::other("workload log pipe already initialized"))?;
+    Ok(Some(read))
+}
+
+pub fn relay_logs(reader: OwnedFd) -> ! {
+    let (queue, pending) = mpsc::sync_channel(LOG_QUEUE_CHUNKS);
+    if let Err(error) = std::thread::Builder::new()
+        .name("workload-log-send".into())
+        .spawn(move || send_logs(pending))
+    {
+        warn!(%error, "could not start the workload log sender");
+        std::process::exit(1);
     }
-    Some(write)
+    drain_output(std::fs::File::from(reader), queue);
+    std::process::exit(0);
 }
 
 /// Move a workload's output into the queue until every writer has closed the
@@ -169,7 +165,7 @@ fn connect_to_host() -> Option<crate::vsock::VsockStream> {
 
 /// What a stop signals: the workload process itself, or the init of a
 /// container whose init is the workload.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum StopTarget {
     Process(crate::CrunProcessIdentity),
     Container(String),
@@ -188,37 +184,146 @@ impl StopTarget {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct Workload {
     target: StopTarget,
     signal: i32,
     timeout: Duration,
+    stop_on_exit: bool,
 }
 
-static WORKLOADS: Mutex<Vec<Workload>> = Mutex::new(Vec::new());
+#[derive(Clone, Deserialize, Serialize)]
+struct WorkloadState {
+    workloads: Vec<Workload>,
+    stopping: bool,
+}
+
+static WORKLOADS: Mutex<WorkloadState> = Mutex::new(WorkloadState {
+    workloads: Vec::new(),
+    stopping: false,
+});
+static STATE_PATH: OnceLock<PathBuf> = OnceLock::new();
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
-/// Remember a launched workload so a shutdown stops it gracefully.
-pub fn register(target: StopTarget, signal: i32, timeout: Duration) {
-    let mut workloads = WORKLOADS.lock().unwrap_or_else(|e| e.into_inner());
-    workloads.retain(|workload| workload.target.alive().is_some());
-    workloads.push(Workload {
-        target,
+/// Allocate the state directory once in the VM's supervisor. All management
+/// incarnations inherit this path, including those started after a crash.
+pub fn prepare_state() -> io::Result<()> {
+    let root = tempfile::Builder::new()
+        .prefix("smolvm-workloads-")
+        .tempdir_in("/tmp")?
+        .keep();
+    STATE_PATH
+        .set(root.join("registry.json"))
+        .map_err(|_| io::Error::other("workload state already initialized"))
+}
+
+fn state_path() -> io::Result<&'static PathBuf> {
+    STATE_PATH
+        .get()
+        .ok_or_else(|| io::Error::other("workload state is unavailable"))
+}
+
+fn save(state: &WorkloadState) -> io::Result<()> {
+    let path = state_path()?;
+    let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    serde_json::to_writer(temporary.as_file_mut(), state)?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+pub fn restore() -> io::Result<()> {
+    let state: WorkloadState = match std::fs::read(state_path()?) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    STOPPING.store(state.stopping, Ordering::SeqCst);
+    if !state.stopping {
+        for entry in state.workloads.iter().filter(|entry| entry.stop_on_exit) {
+            watch_exit(entry.target.clone());
+        }
+    }
+    *WORKLOADS.lock().unwrap_or_else(|error| error.into_inner()) = state;
+    Ok(())
+}
+
+/// Remember the exact workload and its stop contract before acknowledging launch.
+pub fn register(
+    target: StopTarget,
+    signal: i32,
+    timeout: Duration,
+    stop_on_exit: bool,
+) -> io::Result<()> {
+    let mut state = WORKLOADS.lock().unwrap_or_else(|error| error.into_inner());
+    if state.stopping {
+        return Err(io::Error::other("workload shutdown already began"));
+    }
+    let mut updated = state.clone();
+    updated
+        .workloads
+        .retain(|entry| entry.stop_on_exit || entry.target.alive().is_some());
+    updated.workloads.push(Workload {
+        target: target.clone(),
         signal,
         timeout,
+        stop_on_exit,
     });
+    save(&updated)?;
+    *state = updated;
+    if stop_on_exit {
+        watch_exit(target);
+    }
+    Ok(())
 }
 
 /// Whether a shutdown has begun stopping the workloads, so a workload exiting
 /// now is being stopped rather than ending on its own.
-pub fn stopping() -> bool {
+fn stopping() -> bool {
     STOPPING.load(Ordering::SeqCst)
+}
+
+fn watch_exit(target: StopTarget) {
+    let spawned = std::thread::Builder::new()
+        .name("stop-on-exit".into())
+        .spawn(move || {
+            while let Some(pid) = target.alive() {
+                if !crate::wait_for_pid_exit(pid) {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+            if stopping() {
+                return;
+            }
+            info!("workload exited; stopping the machine (stop_on_exit)");
+            if let Err(error) = crate::shutdown_freeze::freeze_internal_filesystems() {
+                warn!(%error, "stop_on_exit: flushing storage before power-off failed");
+                // Perform a best-effort flush after the coordinated freeze
+                // failed. SAFETY: sync takes no pointers.
+                unsafe { libc::sync() };
+            }
+            // libkrun's init uses RB_AUTOBOOT to exit the VMM. Use the same
+            // reset route after flushing storage so the host observes exit.
+            // SAFETY: this is the configured stop-on-exit action in the guest.
+            unsafe { libc::reboot(libc::RB_AUTOBOOT) };
+            warn!(error = %io::Error::last_os_error(), "stop_on_exit: guest reset returned");
+        });
+    if let Err(error) = spawned {
+        warn!(%error, "stop_on_exit: could not start the workload watcher");
+    }
 }
 
 /// Signal every live workload, wait for them to exit for at most their
 /// timeouts (or `timeout_override`), then kill whatever is still running.
-pub fn stop_all(timeout_override: Option<Duration>) {
-    STOPPING.store(true, Ordering::SeqCst);
-    let workloads = std::mem::take(&mut *WORKLOADS.lock().unwrap_or_else(|e| e.into_inner()));
+pub fn stop_all(timeout_override: Option<Duration>) -> io::Result<()> {
+    let mut state = WORKLOADS.lock().unwrap_or_else(|error| error.into_inner());
+    if !state.stopping {
+        let mut updated = state.clone();
+        updated.stopping = true;
+        save(&updated)?;
+        state.stopping = true;
+        STOPPING.store(true, Ordering::SeqCst);
+    }
+    let workloads = std::mem::take(&mut state.workloads);
     stop(
         workloads
             .into_iter()
@@ -233,6 +338,7 @@ pub fn stop_all(timeout_override: Option<Duration>) {
             unsafe { libc::kill(pid as libc::pid_t, signal) };
         },
     );
+    Ok(())
 }
 
 fn stop(workloads: Vec<Workload>, send: impl Fn(u32, i32)) {
@@ -297,6 +403,7 @@ mod tests {
             target: StopTarget::Process(identity(child)),
             signal: libc::SIGTERM,
             timeout,
+            stop_on_exit: false,
         }
     }
 

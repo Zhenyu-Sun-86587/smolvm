@@ -681,6 +681,12 @@ fn main() {
 }
 
 fn serve_oci_agent(start_uptime: u64) -> ! {
+    #[cfg(target_os = "linux")]
+    if let Err(error) = workload::restore() {
+        error!(%error, "could not restore workload stop policy");
+        std::process::exit(1);
+    }
+
     let listener = match vsock::listen(ports::AGENT_CONTROL) {
         Ok(listener) => listener,
         Err(error) => {
@@ -2680,7 +2686,7 @@ fn handle_connection(
             shutdown::respond(stream, progress, || {
                 // The workload saves its state before storage is frozen under it.
                 #[cfg(target_os = "linux")]
-                workload::stop_all(stop_timeout_secs.map(std::time::Duration::from_secs));
+                workload::stop_all(stop_timeout_secs.map(std::time::Duration::from_secs))?;
                 #[cfg(not(target_os = "linux"))]
                 let _ = stop_timeout_secs;
                 // Serialize shutdown requests without blocking progress for a
@@ -5391,26 +5397,26 @@ fn handle_run_detached(
                     }
                 }
             };
-            workload::register(
+            if let Err(error) = workload::register(
                 match workload {
                     Some(identity) => workload::StopTarget::Process(identity),
                     None => workload::StopTarget::Container(container_id.clone()),
                 },
                 stop_signal,
                 stop_timeout,
-            );
-            if stop_vm_on_exit {
-                match workload {
-                    Some(workload) => stop_machine_when_exited(move || {
-                        let stat =
-                            std::fs::read_to_string(format!("/proc/{}/stat", workload.pid)).ok()?;
-                        validate_crun_process_identity(workload, &stat)
-                    }),
-                    None => {
-                        let container_id = container_id.clone();
-                        stop_machine_when_exited(move || crun_container_pid(&container_id))
-                    }
-                }
+                stop_vm_on_exit,
+            ) {
+                let _ = std::fs::remove_file(&id_path);
+                let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+                let _ = crun::CrunCommand::delete(&container_id, true).output();
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        format!("persist workload stop policy: {error}"),
+                        error_codes::INTERNAL_ERROR,
+                    ),
+                )?;
+                return Ok(());
             }
             send_response(
                 stream,
@@ -5697,51 +5703,9 @@ fn launch_workload(
     Ok(CrunProcessIdentity { pid, start_time })
 }
 
-/// Power the machine off once the workload exits, whatever its exit status
-/// (`stop_on_exit`). `alive` returns the workload's pid while it is running.
-/// Storage is flushed exactly as for a `machine stop` before the power-off, so
-/// nothing the workload wrote is lost.
-///
-/// The workload's process is re-parented to the agent, which does not reap
-/// unknown children, so it may linger as a zombie; both the pidfd wait and
-/// the identity check behind `alive` treat a zombie as exited.
-#[cfg(target_os = "linux")]
-fn stop_machine_when_exited(alive: impl Fn() -> Option<u32> + Send + 'static) {
-    let spawned = std::thread::Builder::new()
-        .name("stop-on-exit".into())
-        .spawn(move || {
-            while let Some(pid) = alive() {
-                if !wait_for_pid_exit(pid) {
-                    // No pidfd for that pid (it already exited, or poll
-                    // failed): the old poll interval is the fallback.
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-            }
-            if workload::stopping() {
-                // A shutdown stopped it and quiesces storage itself.
-                return;
-            }
-            info!("workload exited; stopping the machine (stop_on_exit)");
-            if let Err(e) = shutdown_freeze::freeze_internal_filesystems() {
-                warn!(error = %e, "stop_on_exit: flushing storage before power-off failed");
-            }
-            // SAFETY: sync(2) and reboot(2) take no pointers; the agent is PID 1,
-            // so RB_POWER_OFF ends the VM once the flush above has completed.
-            unsafe {
-                libc::sync();
-                libc::reboot(libc::RB_POWER_OFF);
-            }
-        });
-    if let Err(e) = spawned {
-        warn!(error = %e, "stop_on_exit: could not start the workload watcher");
-    }
-}
-
 /// Block until `pid` terminates, observed through a pidfd the moment it
 /// happens instead of on the next 500ms poll tick. A zombie counts: the pidfd
-/// becomes readable on termination whether or not anything reaps the process,
-/// which matters here because the workload re-parents to the agent and the
-/// agent does not reap unknown children.
+/// becomes readable on termination before the workload's parent reaps it.
 ///
 /// Returns `true` only on an observed exit. `false` means no pidfd could be
 /// opened (the process is already gone, or the pid was reused and raced the
@@ -5900,7 +5864,7 @@ fn crun_container_pid_at(
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct CrunProcessIdentity {
     pid: u32,
     start_time: u64,
