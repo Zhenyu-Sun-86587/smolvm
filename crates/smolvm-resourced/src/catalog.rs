@@ -517,7 +517,7 @@ impl Catalog {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !abort && operation.launches_execution() {
             let registered: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM executions WHERE last_operation_id=?)",
+                "SELECT EXISTS(SELECT 1 FROM executions WHERE last_operation_id=? AND phase='registered')",
                 [id],
                 |r| r.get(0),
             )?;
@@ -563,14 +563,14 @@ impl Catalog {
         let occupied: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM writer_reservations r LEFT JOIN writer_grants g USING(operation_id)
                 WHERE r.operation_id=? AND (? OR g.grant_id IS NULL OR g.state!='attached'))
-             OR (? AND EXISTS (SELECT 1 FROM executions WHERE last_operation_id=? AND (? OR phase<>'exited')))
+             OR (? AND EXISTS (SELECT 1 FROM executions WHERE last_operation_id=? AND phase<>'exited'))
              OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='operation' AND owner_id=? AND state='active')
              OR EXISTS (SELECT 1 FROM fd_transfers WHERE operation_id=? AND state='staging')
              OR EXISTS (SELECT 1 FROM fd_leases WHERE operation_id=? AND state='pending')
              OR EXISTS (SELECT 1 FROM managed_blocks WHERE operation_id=? AND backing_identity IS NULL)
              OR EXISTS (SELECT 1 FROM root_refs WHERE owner_kind='block_seal' AND owner_id=? AND state='active')
              OR EXISTS (SELECT 1 FROM writer_pivots WHERE operation_id=? AND state NOT IN ('complete','aborted'))",
-            params![id, abort, abort, id, operation.kind != "restore_target", id, id, id, id, id, id], |r| r.get(0))?;
+            params![id, abort, abort, id, id, id, id, id, id, id], |r| r.get(0))?;
         if occupied {
             return Err(conflict(
                 "E_OPERATION_HAS_EFFECTS",
