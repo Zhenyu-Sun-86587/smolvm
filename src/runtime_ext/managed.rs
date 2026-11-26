@@ -283,7 +283,9 @@ fn confirm(
             .transpose()?
             .flatten()
             .is_some();
-        if exited || (child.is_none() && !control.exists()) {
+        // A restarted launcher has no Child handle. The previous VMM may
+        // leave a Unix socket path behind after it has exited.
+        if exited || (child.is_none() && (!bound || !control.exists())) {
             let binding = client
                 .binding(&launch.execution.instance_id)
                 .map_err(failed)?;

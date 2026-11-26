@@ -755,9 +755,25 @@ impl Catalog {
             }
         }
         if operation.kind == "restore_target" {
+            // A commit intent can outlive a target that never reached recorded publication.
+            // Accept its failure only after the exact execution has been fenced.
             let finalized: bool = tx.query_row(
                 "SELECT CASE WHEN ?1 THEN NOT EXISTS (
-                    SELECT 1 FROM target_activations WHERE operation_id=?2 AND decision='commit'
+                    SELECT 1 FROM target_activations a WHERE a.operation_id=?2 AND a.decision='commit'
+                      AND NOT (
+                        a.phase='failed_held' AND EXISTS (
+                          SELECT 1 FROM executions e JOIN instance_bindings b
+                            ON b.route_id=e.route_id AND b.instance_id=e.instance_id AND b.execution_epoch=e.execution_epoch
+                          WHERE e.incarnation_id=a.incarnation_id AND e.execution_epoch=a.execution_epoch
+                            AND e.last_operation_id=a.operation_id AND e.instance_id=a.instance_id
+                            AND e.bundle_digest=a.bundle_digest AND e.host_boot_id=a.host_boot_id
+                            AND e.phase='exited' AND b.incarnation_id IS NULL AND b.active_operation_id=a.operation_id
+                        ) AND NOT EXISTS (
+                          SELECT 1 FROM network_tap_leases t LEFT JOIN network_kernel_receipts k USING(lease_id)
+                          WHERE t.incarnation_id=a.incarnation_id AND t.execution_epoch=a.execution_epoch
+                            AND (t.state<>'retired' OR k.lease_id IS NOT NULL)
+                        )
+                      )
                 ) ELSE EXISTS (
                     SELECT 1 FROM target_activations WHERE operation_id=?2 AND phase='released' AND decision='commit'
                 ) END",
