@@ -1,6 +1,7 @@
 //! Bounded transfer methods for the System Agent's VM filesystem.
 
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use smolvm_protocol::{
