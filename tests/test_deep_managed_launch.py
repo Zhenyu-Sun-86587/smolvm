@@ -4,7 +4,7 @@
 import argparse
 import array
 import base64
-from contextlib import ExitStack, suppress
+from contextlib import contextmanager, ExitStack, suppress
 import grp
 import hashlib
 import importlib.util
@@ -32,6 +32,20 @@ rpc = worker_resource.rpc
 
 def digest(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+@contextmanager
+def installed_bundle(source, root):
+    """Expose an immutable installation to the VM UID inside the private test namespace."""
+    target = root / "measured"
+    target.mkdir()
+    subprocess.run(["mount", "--bind", source, target], check=True)
+    try:
+        subprocess.run(["mount", "-o", "remount,bind,ro", target], check=True)
+        yield target
+    finally:
+        # Kernel-held executable references can outlive the last SIGKILL briefly.
+        subprocess.run(["umount", "--lazy", target], check=True)
 
 
 def settled(endpoint, operation_id, timeout=150):
@@ -151,14 +165,15 @@ def partial_fork(endpoint, root, ref):
     print("One of two targets was killed before activation. Retry kept the successful execution and original capture, and advanced only the failed child's epoch.",flush=True)
 
 
-def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults, lifecycle=False, *, observer=None):
+def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults, lifecycle=False, *, observer=None, stage_bundle=True):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
-    staged = root / "bundle"
-    shutil.copytree(bundle, staged, symlinks=True)
-    bundle = staged
+    if stage_bundle:
+        staged = root / "bundle"
+        shutil.copytree(bundle, staged, symlinks=True)
+        bundle = staged
     Path("/run/smolvm-custom").mkdir(exist_ok=True)
     subprocess.run(["mount","--bind",root/"local-run","/run/smolvm-custom"],check=True)
     tree = root / "root-tree"

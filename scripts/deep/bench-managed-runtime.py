@@ -2,7 +2,7 @@
 """Measure isolated managed KVM launches and capture/restore with real Guest I/O."""
 
 import argparse
-from contextlib import closing
+from contextlib import closing, nullcontext
 import hashlib
 import json
 import math
@@ -19,7 +19,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tests"))
-from test_deep_managed_launch import EXT, digest, http, until, verify
+from test_deep_managed_launch import EXT, digest, http, installed_bundle, until, verify
+from kvm_pause import record_vcpus
 
 
 def scope(binding):
@@ -74,12 +75,13 @@ def process_metrics(pid):
 
 
 class Bench:
-    def __init__(self, endpoint, root, source, inventory):
+    def __init__(self, endpoint, root, source, inventory, trace_vcpus):
         self.endpoint = endpoint
         self.catalog = root / "catalog/catalog.sqlite"
         self.logs = root / "state/managed"
         self.source = source
         self.source_pid = inventory["execution"]["pid"]
+        self.trace_dir = root if trace_vcpus else None
         self.sequence = 0
         self.rows = []
 
@@ -88,6 +90,12 @@ class Bench:
 
     def boot_logs(self, ref):
         return GuestLog(self.logs / (ref["incarnation_id"] + ".log"))
+
+    def capture_trace(self, source, scenario):
+        if self.trace_dir is None:
+            return nullcontext()
+        inventory = self.request(f"/instances/{source['instance_id']}/inventory")
+        return record_vcpus(inventory["execution"], self.trace_dir / (scenario + ".perf"))
 
     def operation(self, kind, expected, parameters):
         self.sequence += 1
@@ -172,10 +180,11 @@ class Bench:
             tail = log.ticks()
         before = len(tail)
         kind = "independent_fork" if len(names) == 1 else "fork_batch"
-        key, start, accepted = self.operation(kind, source, {"children": names})
         child_logs, work_ready = {}, {}
 
         def identify_work(_, progress):
+            if trace:
+                trace.observe(progress.get("stage"), lambda: self.request(f"/instances/{source['instance_id']}/inventory"))
             for child in progress.get("children", []):
                 name = child["name"]
                 incarnation = child["incarnation_id"]
@@ -185,8 +194,11 @@ class Bench:
                     if child_logs[name].first_task(name):
                         work_ready[name] = elapsed(start)
 
-        receipt, timings = self.settled(key, start, "fork", identify_work)
-        ready = elapsed(start)
+        with self.capture_trace(source, scenario) as trace:
+            key, start, accepted = self.operation(kind, source, {"children": names})
+            receipt, timings = self.settled(key, start, "fork", identify_work)
+            ready = elapsed(start)
+        pause = trace.result() if trace else {}
         progress = receipt["fork"]
         if progress["outcome"] != "applied" or not progress["source_released"]:
             raise RuntimeError(receipt)
@@ -218,6 +230,7 @@ class Bench:
         heartbeat = max((later - earlier) / 1_000_000 for earlier, later in zip(timestamps, timestamps[1:]))
         self.rows.append({
             "scenario": scenario, "op_id": key, "capture_id": progress["capture_id"], "fanout": len(names),
+            **pause,
             "api_ms": accepted, "ready_ms": ready, "source_heartbeat_gap_ms": heartbeat,
             "source_release_ms": timings["source_released"], "tasks": tasks,
             "milestones_ms": timings,
@@ -264,7 +277,7 @@ class Bench:
 
 
 def local_case(args):
-    with tempfile.TemporaryDirectory(prefix="smbench-", dir="/var/tmp") as tmp:
+    with tempfile.TemporaryDirectory(prefix="smbench-", dir=args.work_dir) as tmp:
         root = Path(tmp)
         root.chmod(0o755)
         dirty = 16 if args.mode == "dirty" else 0
@@ -277,7 +290,7 @@ def local_case(args):
         output = {}
 
         def measure(endpoint, root, source, inventory, launch):
-            bench = Bench(endpoint, root, source, inventory)
+            bench = Bench(endpoint, root, source, inventory, args.trace_vcpus)
             source_log = bench.boot_logs(source)
             task = source_log.first_task("capture-source")
             if task is None:
@@ -310,7 +323,9 @@ def local_case(args):
                            "guest_sha256": guest_digest, "rows": bench.rows})
 
         try:
-            verify(args.bundle, root, guest, None, False, False, False, False, observer=measure)
+            with installed_bundle(args.bundle, root) as measured:
+                verify(measured, root, guest, None, False, False, False, False,
+                       observer=measure, stage_bundle=False)
         except BaseException:
             for log in (root / "serve.log", root / "worker.log", *sorted((root / "state/managed").glob("*.log"))):
                 if log.exists():
@@ -325,7 +340,7 @@ def summarize(samples):
         for row in sample["rows"]:
             key = (sample["workload"], sample["read_lanes"], row["scenario"])
             values = groups.setdefault(key, {})
-            for name in ("api_ms", "ready_ms", "source_release_ms", "source_heartbeat_gap_ms",
+            for name in ("api_ms", "ready_ms", "source_release_ms", "source_heartbeat_gap_ms", "all_vcpus_out_ms",
                          "first_task_observed_upper_bound_ms", "targets_per_sec", "target_pss_kib", "target_threads"):
                 if name in row:
                     values.setdefault(name, []).append(row[name])
@@ -355,6 +370,9 @@ def main():
     parser.add_argument("--fanout", type=int, default=2)
     parser.add_argument("--depth", type=int, default=3, help="Recursive fork depth, or 0 to skip the depth sweep")
     parser.add_argument("--durable", action="store_true")
+    parser.add_argument("--trace-vcpus", action="store_true",
+                        help="Measure the source vCPUs' common KVM exit-to-entry interval across HELD")
+    parser.add_argument("--work-dir", type=lambda value: Path(value).resolve(), default=Path("/var/tmp"))
     parser.add_argument("--guest-dir", type=lambda value: Path(value).resolve(),
                         help="Directory with prebuilt bench-guest-clean and bench-guest-dirty binaries")
     parser.add_argument("--local-case", action="store_true", help=argparse.SUPPRESS)
@@ -382,7 +400,9 @@ def main():
             for lanes in counts:
                 command = ["unshare", "--mount", "--propagation", "private", "--net", "--", sys.executable, __file__,
                            "--local-case", "--bundle", str(args.bundle), "--mode", mode, "--lane", str(lanes),
-                           "--fanout", str(args.fanout), "--depth", str(args.depth)]
+                           "--fanout", str(args.fanout), "--depth", str(args.depth), "--work-dir", str(args.work_dir)]
+                if args.trace_vcpus:
+                    command.append("--trace-vcpus")
                 if args.durable:
                     command.append("--durable")
                 if args.guest_dir:
