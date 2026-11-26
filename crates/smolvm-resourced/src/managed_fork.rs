@@ -50,17 +50,26 @@ pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
              CASE WHEN o.phase='COMPLETED' THEN EXISTS(
                 SELECT 1 FROM product_volume_attachments a
                 WHERE a.instance_id=ch.instance_id AND a.declared_epoch=ch.prior_epoch
-             ) ELSE 0 END
+             ) ELSE 0 END, activation.decision
          FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id
          LEFT JOIN managed_launches m ON m.operation_id=ch.operation_id
+         LEFT JOIN target_activations activation ON activation.operation_id=o.operation_id
+           AND activation.incarnation_id=m.incarnation_id AND activation.instance_id=ch.instance_id
+           AND activation.execution_epoch=ch.prior_epoch+1 AND activation.bundle_digest=o.bundle_digest
          WHERE ch.batch_id=? ORDER BY ch.ordinal")?;
-    let rows = stmt.query_map([id], |r| Ok(json!({
-        "name":r.get::<_,String>(0)?, "instance_id":r.get::<_,String>(1)?, "operation_id":r.get::<_,String>(2)?,
-        "phase":r.get::<_,String>(3)?, "incarnation_id":r.get::<_,Option<String>>(4)?,
-        "execution_epoch":r.get::<_,i64>(5)?+1, "attempt":r.get::<_,i64>(6)?, "cancelled":r.get::<_,bool>(7)?,
-        "admission_error":r.get::<_,Option<String>>(8)?,
-        "has_product_volumes":r.get::<_,bool>(9)?
-    })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = stmt.query_map([id], |r| {
+        let mut child = json!({
+            "name":r.get::<_,String>(0)?, "instance_id":r.get::<_,String>(1)?, "operation_id":r.get::<_,String>(2)?,
+            "phase":r.get::<_,String>(3)?, "incarnation_id":r.get::<_,Option<String>>(4)?,
+            "execution_epoch":r.get::<_,i64>(5)?+1, "attempt":r.get::<_,i64>(6)?, "cancelled":r.get::<_,bool>(7)?,
+            "admission_error":r.get::<_,Option<String>>(8)?,
+            "has_product_volumes":r.get::<_,bool>(9)?
+        });
+        if let Some(decision) = r.get::<_, Option<String>>(10)? {
+            child["activation_decision"] = json!(decision);
+        }
+        Ok(child)
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
     let successful = rows.iter().filter(|r|r["phase"] == "COMPLETED").count();
     let failed = rows.iter().filter(|r|r["phase"] == "ABORTED").count();
     let outcome = match (stage.as_str(), successful, failed) {
