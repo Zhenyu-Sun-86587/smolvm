@@ -8,6 +8,7 @@ use imago::{file::File as ImageFile, qcow2::Qcow2, raw::Raw, DynStorage, FormatA
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
@@ -228,32 +229,80 @@ pub(crate) struct RestoredProduct {
     capture: String,
 }
 
+struct CapturedProductDisk {
+    attachment: String,
+    device: String,
+    volume: String,
+    generation: Option<String>,
+}
+
+struct ForkBlockCut {
+    incarnation: String,
+    machine: crate::managed::Machine,
+    disks: BTreeMap<String, (String, String)>,
+}
+
+fn fork_block_cut(catalog: &Catalog, target: &str) -> Result<Option<ForkBlockCut>> {
+    let cut: Option<(String, String, String)> = catalog.db.query_row(
+        "SELECT b.source_incarnation,b.template,b.disk_json FROM managed_fork_children ch
+         JOIN managed_fork_batches b ON b.operation_id=ch.batch_id
+         WHERE ch.operation_id=? AND b.source_released=1",
+        [target], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).optional()?;
+    cut.map(|(incarnation, machine, disks)| {
+        let decode = |error: serde_json::Error| Fault::new("E_CATALOG", error.to_string());
+        Ok(ForkBlockCut {
+            incarnation,
+            machine: serde_json::from_str(&machine).map_err(decode)?,
+            disks: serde_json::from_str(&disks).map_err(decode)?,
+        })
+    }).transpose()
+}
+
 /// Preserve the captured disk's wire attachment ID for the parked reader. The
 /// independent machine gets a distinct, durable product attachment ID.
 pub(crate) fn independent_restore_products(
     catalog: &Catalog,
     op: &Operation,
 ) -> Result<Vec<RestoredProduct>> {
-    let restore: Option<(String, String)> = catalog.db.query_row(
-        "SELECT r.capture_id,m.devices_json FROM managed_state_restores r
-         JOIN managed_launches m USING(operation_id) WHERE r.operation_id=?",
-        [&op.operation_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    let restore: Option<String> = catalog.db.query_row(
+        "SELECT capture_id FROM managed_state_restores WHERE operation_id=?",
+        [&op.operation_id], |row| row.get(0),
     ).optional()?;
-    let Some((capture, devices)) = restore else { return Ok(Vec::new()) };
-    let point = catalog.require_statepoint(&capture)?;
-    let source = catalog.execution(&point.point.incarnation_id)?;
+    let is_fork = restore.is_none();
+    let (source, captured): (_, Vec<CapturedProductDisk>) = if let Some(capture) = restore {
+        let point = catalog.require_statepoint(&capture)?.point;
+        let disks = point.devices.iter().filter_map(|d| d.block()).map(|disk| CapturedProductDisk {
+            attachment: disk.attachment_id.clone(),
+            device: disk.device_id.clone(),
+            volume: disk.volume_id.clone(),
+            generation: disk.writable_head_id.is_none().then(|| disk.generation_id.clone()),
+        }).collect();
+        (catalog.execution(&point.incarnation_id)?, disks)
+    } else if let Some(cut) = fork_block_cut(catalog, &op.operation_id)? {
+        let disks = cut.machine.disks.into_iter().map(|disk| {
+            let (generation, volume) = cut.disks.get(&disk.device_id)
+                .ok_or_else(|| Fault::new("E_CATALOG", "fork capture omits a declared block device"))?;
+            Ok(CapturedProductDisk {
+                attachment: disk.attachment_id,
+                device: disk.device_id,
+                volume: volume.clone(),
+                generation: disk.read_only.then(|| generation.clone()),
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        (catalog.execution(&cut.incarnation)?, disks)
+    } else {
+        return Ok(Vec::new());
+    };
     if source.instance_id == op.instance_id {
         return Ok(Vec::new());
     }
-    let restored: Vec<crate::managed::Device> = serde_json::from_str(&devices)
-        .map_err(|err| Fault::new("E_CATALOG", err.to_string()))?;
-    let captured: Vec<_> = point.point.devices.iter().filter_map(|device| device.block()).collect();
+    let restored = target_devices(catalog, &op.operation_id)?;
     if captured.len() != restored.len() {
         return Err(Fault::new("E_CATALOG", "restore volume plan differs from its captured disk set"));
     }
     let mut products = Vec::new();
     for (index, (old, new)) in captured.into_iter().zip(restored).enumerate() {
-        let generation = new.disk.read_only.then_some(&old.generation_id);
         let row: Option<(String, String, String, String)> = catalog.db.query_row(
             "SELECT v.owner_id,CASE WHEN m.volume_id IS NULL THEN v.lifecycle ELSE 'machine' END,
                 a.fork_policy,a.capture_policy FROM product_volumes v
@@ -261,17 +310,19 @@ pub(crate) fn independent_restore_products(
              LEFT JOIN product_machine_volumes m USING(volume_id)
              WHERE v.volume_id=?1 AND v.route_id=?2 AND v.bundle_digest=?3
                AND a.instance_id=?4 AND a.device_key=?5
+               AND (NOT ?8 OR m.volume_id IS NOT NULL)
                AND ( (?6 IS NULL AND a.mode='rw')
                  OR (?6 IS NOT NULL AND a.mode='ro' AND a.generation_id=?6
                      AND (v.state='available' OR m.volume_id IS NOT NULL)) )
              ORDER BY a.attachment_id=?7 DESC, a.state='reserved' DESC, a.attachment_id LIMIT 1",
-            params![old.volume_id, op.route_id, op.bundle_digest, source.instance_id, old.device_id, generation, old.attachment_id],
+            params![old.volume, op.route_id, op.bundle_digest, source.instance_id, old.device, old.generation, old.attachment, is_fork],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).optional()?;
         if let Some((owner, lifecycle, fork, capture)) = row {
-            if old.device_id != new.disk.device_id
-                || old.attachment_id != new.disk.attachment_id
-                || new.disk.read_only != (old.volume_id == new.volume_id)
+            if old.device != new.disk.device_id
+                || old.attachment != new.disk.attachment_id
+                || new.disk.read_only != old.generation.is_some()
+                || new.disk.read_only != (old.volume == new.volume_id)
             {
                 return Err(Fault::new("E_CATALOG", "restore product volume has inconsistent disk provenance"));
             }
@@ -281,13 +332,38 @@ pub(crate) fn independent_restore_products(
                 lifecycle,
                 attachment: crate::managed::key(&op.operation_id, "product-attachment", index),
                 device: new.disk.device_id,
-                generation: generation.cloned(),
+                generation: old.generation,
                 fork,
                 capture,
             });
         }
     }
     Ok(products)
+}
+
+fn target_devices(catalog: &Catalog, operation: &str) -> Result<Vec<crate::managed::Device>> {
+    let raw: String = catalog.db.query_row(
+        "SELECT devices_json FROM managed_launches WHERE operation_id=?",
+        [operation], |row| row.get(0),
+    )?;
+    serde_json::from_str(&raw).map_err(|error| Fault::new("E_CATALOG", error.to_string()))
+}
+
+pub(crate) fn fork_volume_receipt(catalog: &Catalog, op: &Operation) -> Result<Option<Value>> {
+    let Some(cut) = fork_block_cut(catalog, &op.operation_id)? else { return Ok(None) };
+    let attachments = restore_attachment_receipt(catalog, op)?;
+    if attachments.is_empty() {
+        return Ok(None);
+    }
+    let mut volumes = BTreeMap::new();
+    for device in target_devices(catalog, &op.operation_id)? {
+        if attachments.contains_key(&device.volume_id) {
+            let (_, source) = cut.disks.get(&device.disk.device_id)
+                .ok_or_else(|| Fault::new("E_CATALOG", "fork volume receipt lacks its source device"))?;
+            volumes.insert(source.clone(), device.volume_id);
+        }
+    }
+    Ok(Some(json!({"volume_map": volumes, "product_attachments": attachments})))
 }
 
 pub(crate) fn publish_restore_products(
@@ -1104,6 +1180,7 @@ pub(crate) fn launch_device(
 ) -> Result<(Device, Vec<BlockObject>)> {
     let reservation: Option<Option<String>> = catalog.db.query_row(
         "SELECT a.generation_id FROM product_volume_attachments a JOIN product_volumes v USING(volume_id)
+        LEFT JOIN product_machine_volumes m USING(volume_id)
         WHERE a.attachment_id=? AND a.volume_id=? AND a.instance_id=? AND a.device_key=? AND a.declared_epoch<?
         AND a.mode=? AND a.state='reserved' AND (v.state='available' OR (a.mode='ro' AND m.volume_id IS NOT NULL))
         AND v.route_id=? AND v.bundle_digest=?
@@ -1174,4 +1251,3 @@ pub(crate) fn require_capture_policy(
     }
     Ok(())
 }
-        LEFT JOIN product_machine_volumes m USING(volume_id)

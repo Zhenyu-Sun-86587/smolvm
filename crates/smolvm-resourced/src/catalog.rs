@@ -558,6 +558,9 @@ impl Catalog {
         }
         if operation.kind == "restore_target" {
             operation.statepoint = crate::managed_state_restore::receipt(self, &operation)?;
+            if operation.phase == "COMPLETED" && operation.statepoint.is_none() {
+                operation.fork = crate::product_volumes::fork_volume_receipt(self, &operation)?;
+            }
         }
         if operation.kind == crate::resource_resize::KIND {
             operation.resize = crate::resource_resize::progress(&self.db, id)?;

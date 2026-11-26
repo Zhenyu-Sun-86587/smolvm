@@ -46,7 +46,11 @@ pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
     let mut stmt = c.db.prepare(
         "SELECT ch.name,ch.instance_id,ch.operation_id,
              CASE WHEN (ch.cancelled=1 OR ch.admission_error IS NOT NULL) AND o.operation_id IS NULL THEN 'ABORTED' ELSE COALESCE(o.phase,'RESERVED') END,
-             m.incarnation_id,ch.prior_epoch,ch.attempt,ch.cancelled,ch.admission_error
+             m.incarnation_id,ch.prior_epoch,ch.attempt,ch.cancelled,ch.admission_error,
+             CASE WHEN o.phase='COMPLETED' THEN EXISTS(
+                SELECT 1 FROM product_volume_attachments a JOIN product_machine_volumes v USING(volume_id)
+                WHERE a.instance_id=ch.instance_id AND a.declared_epoch=ch.prior_epoch
+             ) ELSE 0 END
          FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id
          LEFT JOIN managed_launches m ON m.operation_id=ch.operation_id
          WHERE ch.batch_id=? ORDER BY ch.ordinal")?;
@@ -54,7 +58,8 @@ pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
         "name":r.get::<_,String>(0)?, "instance_id":r.get::<_,String>(1)?, "operation_id":r.get::<_,String>(2)?,
         "phase":r.get::<_,String>(3)?, "incarnation_id":r.get::<_,Option<String>>(4)?,
         "execution_epoch":r.get::<_,i64>(5)?+1, "attempt":r.get::<_,i64>(6)?, "cancelled":r.get::<_,bool>(7)?,
-        "admission_error":r.get::<_,Option<String>>(8)?
+        "admission_error":r.get::<_,Option<String>>(8)?,
+        "has_product_volumes":r.get::<_,bool>(9)?
     })))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let successful = rows.iter().filter(|r|r["phase"] == "COMPLETED").count();
     let failed = rows.iter().filter(|r|r["phase"] == "ABORTED").count();
