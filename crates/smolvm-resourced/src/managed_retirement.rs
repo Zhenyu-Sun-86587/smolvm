@@ -212,7 +212,7 @@ pub(crate) fn reconcile(catalog: &mut Catalog, objects: &File) -> Result<()> {
     }
     for (resource, state, revision) in collectible(catalog)? {
         let revision = if state == "available" {
-            match catalog.gc(&resource, revision, false) {
+            match catalog.mark_gc(&resource, revision) {
                 Ok(_) => revision + 1,
                 Err(error) if error.code == "E_RESOURCE_PINNED" => continue,
                 Err(error) => return Err(error),
@@ -220,9 +220,13 @@ pub(crate) fn reconcile(catalog: &mut Catalog, objects: &File) -> Result<()> {
         } else {
             revision
         };
-        crate::blocks::collect(catalog, objects, &resource)?;
-        if state != "deleted" {
-            catalog.gc(&resource, revision, true)?;
+        if state == "deleted" {
+            // Reconcile deletions committed by an older Worker before unlink.
+            crate::blocks::collect(catalog, objects, &resource)?;
+        } else {
+            catalog.collect_gc(&resource, revision, |catalog| {
+                crate::blocks::collect(catalog, objects, &resource)
+            })?;
         }
         catalog.db.execute("DELETE FROM retired_instance_blocks WHERE resource_id=?", [&resource])?;
     }

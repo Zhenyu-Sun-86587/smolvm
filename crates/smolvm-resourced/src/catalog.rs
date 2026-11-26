@@ -1,5 +1,5 @@
 use crate::ipc::{valid_id, Expected, Fault, Request, Result};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -210,6 +210,26 @@ fn resource_available(db: &Connection, id: &str) -> Result<()> {
         return Err(conflict(
             "E_RESOURCE_UNAVAILABLE",
             "resource is unavailable",
+        ));
+    }
+    Ok(())
+}
+
+fn check_gc(db: &Connection, id: &str, revision: i64, state: &str) -> Result<()> {
+    let eligible: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM resources r JOIN operations o ON o.operation_id=r.created_by_operation
+              WHERE r.resource_id=?1 AND r.kind='descriptor' AND r.state=?2 AND r.revision=?3
+                AND o.phase IN ('COMPLETED','ABORTED'))
+         AND NOT EXISTS(SELECT 1 FROM root_refs WHERE resource_id=?1 AND state='active')
+         AND NOT EXISTS(SELECT 1 FROM resource_edges WHERE child_resource_id=?1)
+         AND NOT EXISTS(SELECT 1 FROM fd_leases WHERE resource_id=?1 AND state<>'released')
+         AND NOT EXISTS(SELECT 1 FROM writer_reservations WHERE head_resource_id=?1)",
+        params![identifier(id)?, state, revision], |r| r.get(0),
+    )?;
+    if !eligible {
+        return Err(conflict(
+            "E_RESOURCE_PINNED",
+            "resource state, revision or references prevent collection",
         ));
     }
     Ok(())
@@ -1042,6 +1062,8 @@ impl Catalog {
                 | "statepoint_checkpoint"
                 | "statepoint_hibernate"
                 | "statepoint_rescue"
+                | "backup"
+                | "backup_import"
                 | "fork_capture"
                 | "managed_execution"
                 | "product_snapshot"
@@ -1126,51 +1148,67 @@ impl Catalog {
         Ok(json!({"owner_kind":kind,"owner_id":id,"resources":rows}))
     }
 
-    pub fn gc(&mut self, id: &str, revision: i64, collect: bool) -> Result<Value> {
+    pub fn mark_gc(&mut self, id: &str, revision: i64) -> Result<Value> {
         self.ready()?;
-        if collect {
-            let already_deleted: Option<i64> = self
-                .db
-                .query_row(
-                    "SELECT revision FROM resources WHERE resource_id=? AND state='deleted'",
-                    [identifier(id)?],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if already_deleted.is_some() && already_deleted == revision.checked_add(1) {
-                return self.resource(id);
-            }
-        }
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let initial = if collect { "deleting" } else { "available" };
-        let final_state = if collect { "deleted" } else { "deleting" };
-        let eligible: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM resources r JOIN operations o ON o.operation_id=r.created_by_operation
-                  WHERE r.resource_id=?1 AND r.kind='descriptor' AND r.state=?2 AND r.revision=?3
-                    AND o.phase IN ('COMPLETED','ABORTED'))
-             AND NOT EXISTS(SELECT 1 FROM root_refs WHERE resource_id=?1 AND state='active')
-             AND NOT EXISTS(SELECT 1 FROM resource_edges WHERE child_resource_id=?1)
-             AND NOT EXISTS(SELECT 1 FROM fd_leases WHERE resource_id=?1 AND state<>'released')
-             AND NOT EXISTS(SELECT 1 FROM writer_reservations WHERE head_resource_id=?1)",
-            params![identifier(id)?, initial, revision], |r| r.get(0))?;
-        if !eligible {
-            return Err(conflict(
-                "E_RESOURCE_PINNED",
-                "resource state, revision or references prevent collection",
-            ));
-        }
+        check_gc(&tx, id, revision, "available")?;
         tx.execute(
-            "UPDATE resources SET state=?,revision=revision+1 WHERE resource_id=?",
-            [final_state, id],
+            "UPDATE resources SET state='deleting',revision=revision+1 WHERE resource_id=?",
+            [id],
         )?;
-        if collect {
-            tx.execute("DELETE FROM resource_edges WHERE owner_resource_id=?", [id])?;
-            tx.execute("UPDATE fd_transfers SET state='collected' WHERE resource_id=? AND state='committed'", [id])?;
-        }
         tx.commit()?;
         self.resource(id)
+    }
+
+    pub(crate) fn collect_gc(
+        &mut self,
+        id: &str,
+        revision: i64,
+        remove_backing: impl FnOnce(&Self) -> Result<()>,
+    ) -> Result<Value> {
+        self.ready()?;
+        // Keep the deletion fence and ancestry intact until the storage owner
+        // has finished. On failure the committed deleting row is retryable.
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let already_deleted: Option<i64> = tx.query_row(
+            "SELECT revision FROM resources WHERE resource_id=? AND state='deleted'",
+            [identifier(id)?], |row| row.get(0),
+        ).optional()?;
+        if already_deleted.is_some() && already_deleted == revision.checked_add(1) {
+            // Older Workers could commit the receipt before unlinking a block.
+            remove_backing(self)?;
+            return self.resource(id);
+        }
+        check_gc(&tx, id, revision, "deleting")?;
+        remove_backing(self)?;
+        tx.execute(
+            "UPDATE resources SET state='deleted',revision=revision+1 WHERE resource_id=?",
+            [id],
+        )?;
+        tx.execute("DELETE FROM resource_edges WHERE owner_resource_id=?", [id])?;
+        tx.execute("UPDATE fd_transfers SET state='collected' WHERE resource_id=? AND state='committed'", [id])?;
+        tx.commit()?;
+        self.resource(id)
+    }
+
+    pub(crate) fn pending_gc(&self, after_row: i64) -> Result<Vec<(i64, String, i64, bool)>> {
+        let mut query = self.db.prepare(
+            "SELECT r.rowid,r.resource_id,r.revision,r.state='available' FROM resources r
+             WHERE r.rowid>? AND (r.state='deleting' OR (r.state='available'
+                AND EXISTS(SELECT 1 FROM root_refs p WHERE p.resource_id=r.resource_id
+                  AND p.owner_kind IN ('statepoint_checkpoint','statepoint_hibernate') AND p.state='dropped')
+                AND NOT EXISTS(SELECT 1 FROM root_refs p WHERE p.resource_id=r.resource_id AND p.state='active')
+                AND NOT EXISTS(SELECT 1 FROM resource_edges e WHERE e.child_resource_id=r.resource_id)
+                AND NOT EXISTS(SELECT 1 FROM fd_leases l WHERE l.resource_id=r.resource_id AND l.state<>'released')
+                AND NOT EXISTS(SELECT 1 FROM writer_reservations w WHERE w.head_resource_id=r.resource_id)))
+             ORDER BY r.rowid LIMIT 16",
+        )?;
+        let rows = query.query_map([after_row], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub(crate) fn unused_fork_ram(&self) -> Result<Vec<(String, String, i64)>> {

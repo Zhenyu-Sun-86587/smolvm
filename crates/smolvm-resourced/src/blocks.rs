@@ -270,7 +270,9 @@ fn clear_object_files(dir: &File) -> Result<()> {
 fn remove_object_dir(root: &File, name: &str) -> Result<()> {
     let dir = match crate::worker::openat(root, name, libc::O_RDONLY | libc::O_DIRECTORY) {
         Ok(dir) => dir,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return root.sync_all().map_err(io_fault);
+        }
         Err(error) => return Err(io_fault(error)),
     };
     clear_object_files(&dir)?;

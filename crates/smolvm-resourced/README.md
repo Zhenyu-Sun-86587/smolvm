@@ -28,7 +28,8 @@ The request envelope uses `protocol`, `method`, `request_id`, and `payload`. Sco
 | `AddResourceEdge` | Adds a directed edge using `owner_resource_id`, `child_resource_id` and `role`. Rejects cycles. |
 | `AddOwnerRef`, `DropOwnerRef` | Manage a root with `owner_kind`, `owner_id`, `resource_id` and `expected_revision`. An `operation` root pins objects to that operation. |
 | `QueryOwnerClosure` | Reads the graph reachable from `owner_kind` and `owner_id`. |
-| `MarkResourceForGC`, `CollectResource` | Mark and collect a catalog descriptor by `resource_id` and `expected_revision` after checking roots, incoming edges and operation ownership. Backing data files remain under their storage owner. |
+| `MarkResourceForGC`, `CollectResource` | Mark a descriptor by `resource_id` and `expected_revision` after checking roots, edges, consumers and its creating operation. Marking establishes a durable deletion fence. A ready Worker also resumes marked descriptors. Managed file removal and directory sync precede the deleted receipt. |
+| `ReleaseStatePoint` | Release the retained root for `capture_id` and `manifest_digest` in the original route and bundle. A live restore or the current hibernated execution prevents release. Export pins remain active through their own protocol. The Worker collects the representation after the last reference goes away. |
 | `RegisterVolumeHead` | Registers an administrator-staged regular file at `objects/<head_resource_id>/data` under the state directory. Supply `volume_id` and `head_resource_id`. |
 | `ReserveWriterSet`, `QueryWriterSet`, `ReleaseWriterReservation` | Reserves a group of `heads` entries containing volume and head IDs. The broker keeps the backing OFD locks and enforces a global unique volume and inode identity. Query by operation ID and release using the reservation's `expected_revision`. |
 | `ReconcileExecution` | An existing process reestablishes its recorded process identity after a broker restart. |

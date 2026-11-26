@@ -364,3 +364,26 @@ pub(crate) fn verify_replay(
     let _ = materialize(directory, manifest, disks)?;
     fs::File::open(directory)?.sync_all()
 }
+
+pub(crate) fn collect(directory: &Path, resource: &str) -> io::Result<()> {
+    if !crate::ipc::valid_id(resource) {
+        return Err(invalid("invalid StatePoint representation ID"));
+    }
+    let artifact = directory.join(resource);
+    let tombstone = directory.join(format!(".gc-{resource}"));
+    match fs::symlink_metadata(&artifact) {
+        Ok(meta) if meta.is_dir() => store::publish(&artifact, &tombstone)?,
+        Ok(_) => return Err(invalid("StatePoint representation is not a directory")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match fs::symlink_metadata(&tombstone) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(&tombstone)?,
+        Ok(_) => return Err(invalid("StatePoint tombstone is not a directory")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    File::open(directory)?.sync_all()?;
+    store::prune_in_batches(&directory.join(".chunks"), 128)?;
+    Ok(())
+}
