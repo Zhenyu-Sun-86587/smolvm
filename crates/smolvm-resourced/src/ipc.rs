@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use socket2::{Domain, SockAddr, Socket, Type};
-use std::io;
+use std::io::{self, Write};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
@@ -85,7 +85,8 @@ pub type Result<T> = std::result::Result<T, Fault>;
 
 impl From<rusqlite::Error> for Fault {
     fn from(error: rusqlite::Error) -> Self {
-        eprintln!("resourced catalog error: {error}");
+        // The diagnostic sink can share a full filesystem with SQLite.
+        let _ = writeln!(io::stderr().lock(), "resourced catalog error: {error}");
         Self::new("E_CATALOG", "worker catalog operation failed")
     }
 }
