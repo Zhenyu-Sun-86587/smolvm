@@ -7,6 +7,11 @@ pub const MANAGED_ACCEPTANCE_PATH: &str = "metadata/managed-acceptance.json";
 const WORKER: &str = "smolvm-resourced";
 const SYSTEM_TEMPLATE: &str = "guest/system-debian.tar.gz";
 const NETWORK_CONTRACT: &str = "managed_private_network";
+const RESOURCE_CONTRACT: &str = "managed_live_resources";
+const RESOURCE_CASES: [(&str, &str); 2] = [
+    ("live-resources", "parked-capture"),
+    ("live-resources-hot", "live-compute"),
+];
 const BASE_CASES: [&str; 5] = [
     "oci-capture",
     "lifecycle",
@@ -38,6 +43,7 @@ const MEASURED_ARTIFACTS: [(&str, &str); 7] = [
 pub struct MeasuredRelease {
     worker_sha256: String,
     private_network: bool,
+    live_resources: bool,
 }
 
 impl MeasuredRelease {
@@ -68,6 +74,9 @@ impl MeasuredRelease {
         };
         publish("lifecycle.standby", "managed-parked-v1");
         publish("boot.system_state_restore", "system-debian-v1");
+        if self.live_resources {
+            publish("boot.live_compute_growth", "managed-live-compute-v1");
+        }
         if self.private_network {
             for name in [
                 "network.native",
@@ -192,33 +201,61 @@ pub fn measured_release(manifest: &Value, evidence_bytes: &[u8]) -> Option<Measu
     {
         return None;
     }
-    let private_network = match evidence["schema"].as_str()? {
-        "RuntimeManagedAcceptance/1" if contracts.get(NETWORK_CONTRACT).is_none() => false,
-        "RuntimeManagedAcceptance/2" if contracts[NETWORK_CONTRACT].as_u64() == Some(1) => {
-            let packet = &evidence["private_network"];
-            let measured = measurement_digest(manifest, evidence["build_record_sha256"].as_str()?)?;
-            if packet["measurement_bundle_digest"] != measured
-                || packet["system_template_sha256"] != system_template
-                || !PACKET_CASES.iter().all(|(case, source, target)| {
-                    let run = &packet["runs"][case];
-                    run["source_mode"] == *source
-                        && run["target_mode"] == *target
-                        && run["harness_sha256"]
-                            == evidence["runs"]["system-fork"]["harness_sha256"]
-                        && log_matches(manifest, case, run)
-                })
-                || packet["runs"]["packet-native"]["log_sha256"]
-                    == packet["runs"]["packet-fixed"]["log_sha256"]
-            {
-                return None;
-            }
-            true
-        }
+    let (private_network, live_resources) = match evidence["schema"].as_str()? {
+        "RuntimeManagedAcceptance/1" => (false, false),
+        "RuntimeManagedAcceptance/2" => (true, false),
+        "RuntimeManagedAcceptance/3" => (evidence.get("private_network").is_some(), true),
         _ => return None,
     };
+    for (key, field, enabled) in [
+        (NETWORK_CONTRACT, "private_network", private_network),
+        (RESOURCE_CONTRACT, "live_resources", live_resources),
+    ] {
+        if !enabled {
+            if contracts.get(key).is_some() || evidence.get(field).is_some() {
+                return None;
+            }
+            continue;
+        }
+        let group = &evidence[field];
+        if contracts[key].as_u64() != Some(1)
+            || group["system_template_sha256"] != system_template
+            || group["measurement_bundle_digest"]
+                != measurement_digest(manifest, evidence["build_record_sha256"].as_str()?)?
+        {
+            return None;
+        }
+    }
+    let verified_run = |case, run: &Value| {
+        run["harness_sha256"] == evidence["runs"]["system-fork"]["harness_sha256"]
+            && log_matches(manifest, case, run)
+    };
+    if private_network {
+        let runs = &evidence["private_network"]["runs"];
+        if !PACKET_CASES.iter().all(|(case, source, target)| {
+            let run = &runs[case];
+            run["source_mode"] == *source
+                && run["target_mode"] == *target
+                && verified_run(case, run)
+        }) || runs["packet-native"]["log_sha256"] == runs["packet-fixed"]["log_sha256"]
+        {
+            return None;
+        }
+    }
+    if live_resources {
+        let runs = &evidence["live_resources"]["runs"];
+        if !RESOURCE_CASES.iter().all(|(case, profile)| {
+            let run = &runs[case];
+            run["profile"] == *profile && verified_run(case, run)
+        }) || runs["live-resources"]["log_sha256"] == runs["live-resources-hot"]["log_sha256"]
+        {
+            return None;
+        }
+    }
     Some(MeasuredRelease {
         worker_sha256,
         private_network,
+        live_resources,
     })
 }
 
@@ -226,7 +263,7 @@ pub fn measured_release(manifest: &Value, evidence_bytes: &[u8]) -> Option<Measu
 mod tests {
     use super::*;
 
-    fn fixture(private_network: bool) -> (Value, Vec<u8>) {
+    fn fixture(private_network: bool, live_resources: bool) -> (Value, Vec<u8>) {
         fn entry(path: &str, data: &[u8]) -> Value {
             json!({"path":path,"size":data.len(),"sha256":format!("{:x}",Sha256::digest(data))})
         }
@@ -242,6 +279,7 @@ mod tests {
             BASE_CASES
                 .into_iter()
                 .chain(PACKET_CASES.map(|(case, _, _)| case))
+                .chain(RESOURCE_CASES.map(|(case, _)| case))
                 .map(|case| format!("metadata/managed/{case}.log")),
         );
         let artifacts: Vec<_> = paths.map(|path| entry(&path, path.as_bytes())).collect();
@@ -286,7 +324,26 @@ mod tests {
             evidence["private_network"] = json!({"runs":packet,
                 "system_template_sha256":artifact_digest(&manifest,SYSTEM_TEMPLATE),
                 "measurement_bundle_digest":measurement_digest(&manifest,evidence["build_record_sha256"].as_str().unwrap())});
+        }
+        if live_resources {
+            let resources: BTreeMap<_, _> = RESOURCE_CASES
+                .map(|(case, profile)| {
+                    let mut row = run(case);
+                    row["profile"] = json!(profile);
+                    (case, row)
+                })
+                .into_iter()
+                .collect();
+            evidence["schema"] = json!("RuntimeManagedAcceptance/3");
+            evidence["live_resources"] = json!({"runs":resources,
+                "system_template_sha256":artifact_digest(&manifest,SYSTEM_TEMPLATE),
+                "measurement_bundle_digest":measurement_digest(&manifest,evidence["build_record_sha256"].as_str().unwrap())});
+        }
+        if private_network {
             manifest["contracts"][NETWORK_CONTRACT] = json!(1);
+        }
+        if live_resources {
+            manifest["contracts"][RESOURCE_CONTRACT] = json!(1);
         }
         let bytes = serde_json::to_vec(&evidence).unwrap();
         let index = manifest["artifacts"].as_array_mut().unwrap();
@@ -296,8 +353,10 @@ mod tests {
 
     #[test]
     fn measured_profiles_keep_legacy_and_unmeasured_names_scoped() {
-        for private_network in [false, true] {
-            let (mut manifest, evidence) = fixture(private_network);
+        for (private_network, live_resources) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (mut manifest, evidence) = fixture(private_network, live_resources);
             let release = measured_release(&manifest, &evidence).unwrap();
             let sha = artifact(&manifest, "smolvm-bin").unwrap()["sha256"]
                 .as_str()
@@ -322,8 +381,13 @@ mod tests {
                 private_network
             );
             assert!(!response.capabilities["network.native_reidentity"].supported);
+            assert_eq!(
+                response.capabilities["boot.live_compute_growth"].supported,
+                live_resources
+            );
             release.advertise(&mut response, Some("WORKER_RELEASE_MISMATCH"));
             assert!(!response.capabilities["lifecycle.standby"].supported);
+            assert!(!response.capabilities["boot.live_compute_growth"].supported);
             assert_eq!(response.capabilities["lifecycle.standby"].status, "unknown");
             assert!(response.capabilities["boot.system"].supported);
         }
@@ -331,7 +395,7 @@ mod tests {
 
     #[test]
     fn network_evidence_rejects_a_different_worker_and_changed_measurement() {
-        let (mut manifest, mut evidence) = fixture(true);
+        let (mut manifest, mut evidence) = fixture(true, false);
         let original = measured_release(&manifest, &evidence).unwrap();
         assert_eq!(
             Some(original.worker_sha256.clone()),
@@ -339,7 +403,7 @@ mod tests {
         );
         manifest["artifacts"][1]["sha256"] = json!("b".repeat(64));
         assert!(measured_release(&manifest, &evidence).is_none());
-        let (manifest, _) = fixture(true);
+        let (manifest, _) = fixture(true, false);
         evidence.push(b' ');
         assert!(measured_release(&manifest, &evidence).is_none());
     }

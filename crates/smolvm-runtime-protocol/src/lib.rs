@@ -110,6 +110,7 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
         "network.fixed_internal",
         "network.native_reidentity",
         "boot.system",
+        "boot.live_compute_growth",
         "boot.system_state_restore",
     ]
     .into_iter()
