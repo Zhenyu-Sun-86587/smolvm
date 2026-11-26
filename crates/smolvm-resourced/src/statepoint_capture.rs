@@ -148,6 +148,11 @@ fn parked_gate(mut checkpoint: &[u8]) -> Result<ParkedGate> {
         Some(section)
     }
     let invalid = || Fault::invalid("native checkpoint lacks its parked Guest gate");
+    // The Linux x86-64 reader places its measured pause duration before the
+    // ordinary checkpoint sections when it exports an existing Standby hold.
+    if let Some(held) = checkpoint.strip_prefix(b"SMVCSBY1") {
+        checkpoint = held.get(8..).ok_or_else(invalid)?;
+    }
     take(&mut checkpoint).ok_or_else(invalid)?;
     let cpus = count(&mut checkpoint)
         .filter(|count| (1..=256).contains(count))
@@ -375,4 +380,32 @@ pub(crate) fn open_disks(
         }
     }
     Ok(available)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parked_gate_accepts_the_standby_clock_envelope() {
+        let anchor = [1; 16];
+        let helper = [2; 32];
+        let devices = serde_json::to_vec(&serde_json::json!({"devices": [
+            {"ParkedGuestGate": {"anchor": anchor, "helper": helper}}
+        ]}))
+        .unwrap();
+        let mut checkpoint = Vec::new();
+        for field in [0_u32, 1, 0, devices.len() as u32] {
+            checkpoint.extend_from_slice(&field.to_le_bytes());
+        }
+        checkpoint.extend(devices);
+        assert_eq!(parked_gate(&checkpoint).unwrap().anchor, anchor);
+
+        let mut held = b"SMVCSBY1".to_vec();
+        assert!(parked_gate(&held).is_err());
+        held.extend(24_000_000_000_u64.to_le_bytes());
+        held.extend(checkpoint);
+        assert_eq!(parked_gate(&held).unwrap().anchor, anchor);
+        assert_eq!(parked_gate(&held).unwrap().helper, helper);
+    }
 }
