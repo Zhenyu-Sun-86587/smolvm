@@ -101,6 +101,14 @@ fn head(catalog: &Catalog, volume_id: &str) -> Result<Option<BlockObject>> {
     .transpose()
 }
 
+fn pending_change(catalog: &Catalog, volume: &str) -> Result<bool> {
+    Ok(catalog.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM product_volume_operations
+         WHERE volume_id=? AND result_json IS NULL)",
+        [volume], |row| row.get(0),
+    )?)
+}
+
 fn metadata(
     catalog: &Catalog,
     route: &str,
@@ -132,13 +140,7 @@ fn describe(catalog: &Catalog, route: &str, bundle: &str, input: &Lookup) -> Res
     } else {
         head(catalog, &input.volume_id)?
     };
-    let pending: bool = catalog.db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM product_volume_operations
-        WHERE volume_id=? AND result_json IS NULL)",
-        [&input.volume_id],
-        |row| row.get(0),
-    )?;
-    if pending && state != "deleted" {
+    if pending_change(catalog, &input.volume_id)? && state != "deleted" {
         state = "changing".into();
     }
     let mut snapshots = catalog.db.prepare(
@@ -430,6 +432,7 @@ fn grow_image(
     catalog: &Catalog,
     objects: &File,
     generation: &str,
+    fenced_writer: Option<&File>,
     target: &File,
     capacity: u64,
 ) -> Result<()> {
@@ -438,7 +441,10 @@ fn grow_image(
     let old = closure[0].spec.capacity_bytes;
     let mut prior: Option<(String, String, Arc<FormatAccess<Storage>>)> = None;
     for object in closure.iter().rev() {
-        let file = blocks::open_object(objects, object, false)?;
+        let file = match fenced_writer {
+            Some(writer) if object.spec.resource_id == generation => writer.try_clone().map_err(host)?,
+            _ => blocks::open_object(objects, object, false)?,
+        };
         let storage: Storage = Box::new(ImageFile::try_from(file).map_err(host)?);
         let access = if object.format == "raw" && prior.is_none() {
             FormatAccess::new(Raw::open_image_sync(storage, false).map_err(host)?)
@@ -491,15 +497,17 @@ fn grow_image(
 fn grow(
     catalog: &mut Catalog,
     objects: &File,
-    op: &str,
+    request: &Request,
     volume: &str,
     old: &str,
     capacity: u64,
 ) -> Result<()> {
+    let (op, _) = request.operation()?;
     let spec = replacement(volume, op, capacity, None);
-    match catalog.block_intent(&spec.resource_id)? {
+    let intent = catalog.block_intent(&spec.resource_id)?;
+    match &intent {
         Some((owner, previous, committed)) => {
-            if owner != op || previous != spec {
+            if owner != op || previous != &spec {
                 return Err(Fault::new(
                     "E_IDEMPOTENCY_CONFLICT",
                     "volume growth intent changed",
@@ -509,13 +517,65 @@ fn grow(
                 return Ok(());
             }
         }
-        None => catalog.begin_block(op, &spec)?,
+        None => (),
     }
-    let object = blocks::materialize_with(objects, op, spec, |_, file| {
-        grow_image(catalog, objects, old, file, capacity)
-    })?;
+    let original = catalog.block_closure(old)?.into_iter().next()
+        .ok_or_else(|| Fault::new("E_CATALOG", "missing original volume head"))?;
+    let recovering: bool = catalog.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM root_refs WHERE owner_kind='block_seal'
+          AND owner_id=? AND resource_id=? AND state='active')", params![op, old], |row| row.get(0),
+    )?;
+    let fence = if original.spec.mutable() {
+        Some(blocks::fence_head_for_seal(objects, &original, recovering)?)
+    } else {
+        None
+    };
+    let object = blocks::materialize_with(objects, op, spec.clone(), |_, file| {
+        grow_image(catalog, objects, old, fence.as_ref().map(|(_, writer)| writer), file, capacity)
+    });
+    let object = match object {
+        Ok(object) => object,
+        Err(error) if error.code == "E_HOST_IO" && fence.is_some() && !recovering && intent.is_none() => {
+            return reject_storage(catalog, objects, request, &spec, error);
+        }
+        Err(error) => return Err(error),
+    };
+    drop(fence);
+
+    // Until the replacement bytes are durable, the old head remains writable
+    // and has an unchanged catalog identity. The seal journal owns recovery
+    // from here, including when the old descriptor was only partly sealed.
+    blocks::seal_heads(catalog, objects, request, vec![VolumeHead {
+        volume_id: volume.to_owned(),
+        head_resource_id: old.to_owned(),
+    }])?;
+    if intent.is_none() {
+        catalog.begin_block(op, &spec)?;
+    }
     catalog.commit_block(op, &object)?;
     Ok(())
+}
+
+const STORAGE_NOT_APPLIED: &str = "E_VOLUME_STORAGE_NOT_APPLIED";
+
+fn reject_storage<T>(
+    catalog: &mut Catalog,
+    objects: &File,
+    request: &Request,
+    spec: &BlockSpec,
+    error: Fault,
+) -> Result<T> {
+    let (op, _) = request.operation()?;
+    blocks::abort(catalog, objects, &with_payload(request, json!({"resource_id":spec.resource_id})))?;
+    blocks::discard_staged(objects, op, spec)?;
+    let message = format!("volume backing could not be staged: {}", error.message);
+    catalog.db.execute(
+        "UPDATE product_volume_operations SET result_json=? WHERE operation_id=? AND result_json IS NULL",
+        params![json!({"storage_not_applied":message}).to_string(), op],
+    )?;
+    let operation = catalog.active_operation(request)?;
+    catalog.finish(request, true, operation.revision)?;
+    Err(Fault::new(STORAGE_NOT_APPLIED, message))
 }
 
 pub(crate) fn mutate(catalog: &mut Catalog, objects: &File, request: &Request) -> Result<Value> {
@@ -549,11 +609,16 @@ pub(crate) fn mutate(catalog: &mut Catalog, objects: &File, request: &Request) -
             ));
         }
         if let Some(result) = result {
+            let reply: Value = serde_json::from_str(&result)
+                .map_err(|_| Fault::new("E_CATALOG", "invalid stored volume receipt"))?;
+            let rejected = reply["storage_not_applied"].as_str();
             if operation.phase == "NEW" {
-                catalog.finish(request, false, operation.revision)?;
+                catalog.finish(request, rejected.is_some(), operation.revision)?;
             }
-            return serde_json::from_str(&result)
-                .map_err(|_| Fault::new("E_CATALOG", "invalid stored volume receipt"));
+            return match rejected {
+                Some(message) => Err(Fault::new(STORAGE_NOT_APPLIED, message)),
+                None => Ok(reply),
+            };
         }
         catalog.active_operation(request)?;
         (old, capacity)
@@ -585,6 +650,12 @@ pub(crate) fn mutate(catalog: &mut Catalog, objects: &File, request: &Request) -
                 )
             }
         };
+        if pending_change(catalog, &input.volume_id)? {
+            return Err(Fault::new(
+                "E_OPERATION_IN_PROGRESS",
+                "the volume has a durable operation awaiting reconciliation",
+            ));
+        }
         preflight(catalog, route, bundle, &input, current.as_ref())?;
         let old = current
             .as_ref()
@@ -636,13 +707,21 @@ pub(crate) fn mutate(catalog: &mut Catalog, objects: &File, request: &Request) -
                 .transpose()?
                 .map(|(_, generation, _)| generation);
             let spec = replacement(&input.volume_id, op, *capacity_bytes, parent);
-            blocks::create(
+            let result = blocks::create(
                 catalog,
                 objects,
                 &with_payload(request, json!(spec)),
                 None,
                 false,
-            )?;
+            );
+            if let Err(error) = result {
+                if error.code == "E_HOST_IO" && catalog.block_intent(&spec.resource_id)?
+                    .is_none_or(|(_, _, identity)| identity.is_none())
+                {
+                    return reject_storage(catalog, objects, request, &spec, error);
+                }
+                return Err(error);
+            }
         }
         Action::Snapshot { .. } => {
             let old = old.as_deref().unwrap();
@@ -663,8 +742,7 @@ pub(crate) fn mutate(catalog: &mut Catalog, objects: &File, request: &Request) -
         }
         Action::Grow { capacity_bytes } => {
             let old = old.as_deref().unwrap();
-            seal(catalog, old)?;
-            grow(catalog, objects, op, &input.volume_id, old, *capacity_bytes)?;
+            grow(catalog, objects, request, &input.volume_id, old, *capacity_bytes)?;
         }
         Action::Delete => seal(catalog, old.as_deref().unwrap())?,
         _ => (),
