@@ -166,7 +166,7 @@ def partial_fork(endpoint, root, ref):
 
 
 def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults, lifecycle=False, *,
-           observer=None, stage_bundle=True, worker_binary=None, check_launch_rejections=True):
+           observer=None, stage_bundle=True, worker_binary=None, check_launch_rejections=True, guest_files=()):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
@@ -184,6 +184,8 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
         shutil.copy2(guest, tree / "counter")
     else:
         subprocess.run(["cc", "-static", "-Os", RESOURCES / "kvm-parked-block-guest.c", "-o", tree / "counter"], check=True)
+    for guest_file in guest_files:
+        shutil.copy2(guest_file, tree / guest_file.name)
     shutil.copy2(bundle / "guest/identity-helper", tree / "sbin/smolvm-identity-helper")
     root_disk = root / "root.ext4"
     data_disk = root / "data.raw"

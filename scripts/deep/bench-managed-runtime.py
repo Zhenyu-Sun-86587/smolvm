@@ -57,9 +57,14 @@ class GuestLog:
         return next((tick for tick in self.ticks() if tick[2] == hostname), None)
 
     def first_task(self, hostname):
+        compiled = {}
         for part in self.read():
-            if len(part) == 4 and part[:2] == ["BENCH_TASK", hostname]:
-                return {"runtime_ms": int(part[2]) / 1_000_000, "read_bytes": int(part[3])}
+            if len(part) != 4 or part[1] != hostname:
+                continue
+            if part[0] == "BENCH_COMPILE":
+                compiled = {"compile_ms": int(part[2]) / 1_000_000, "compiled_units": int(part[3])}
+            if part[0] == "BENCH_TASK":
+                return {"runtime_ms": int(part[2]) / 1_000_000, "read_bytes": int(part[3]), **compiled}
         return None
 
 
@@ -281,12 +286,16 @@ def local_case(args):
         root = Path(tmp)
         root.chmod(0o755)
         dirty = 16 if args.mode == "dirty" else 0
+        fixture = ROOT / "tests/fixtures"
+        inputs = [fixture / "bench-arithmetic.c"] if args.compile_workload else []
         if args.guest_dir:
-            guest = args.guest_dir / f"bench-guest-{args.mode}"
+            suffix = "-compile" if args.compile_workload else ""
+            guest = args.guest_dir / f"bench-guest-{args.mode}{suffix}"
         else:
             guest = root / "guest"
+            flags = ["-DBENCH_COMPILE", "-ltcc", "-ldl", "-lm", "-lpthread"] if args.compile_workload else []
             subprocess.run(["cc", "-static", "-O2", "-Wall", "-Wextra", "-Werror", f"-DDIRTY_MIB={dirty}",
-                            ROOT / "tests/fixtures/managed-runtime-bench.c", "-o", guest], check=True)
+                            fixture / "managed-runtime-bench.c", *flags, "-o", guest], check=True)
         output = {}
 
         def measure(endpoint, root, source, inventory, launch):
@@ -317,6 +326,11 @@ def local_case(args):
                 bench.fence(parent_name)
             if args.durable:
                 bench.durable()
+            if args.compile_workload:
+                for row in bench.rows:
+                    for task in row.get("tasks", []):
+                        if task.get("compiled_units") != 32 or task["compile_ms"] <= 0:
+                            raise RuntimeError("Guest did not compile and verify its 32 object files")
             with guest.open("rb") as binary:
                 guest_digest = hashlib.file_digest(binary, "sha256").hexdigest()
             output.update({"workload": args.mode, "dirty_mib_per_tick": dirty, "read_lanes": args.lane,
@@ -325,7 +339,7 @@ def local_case(args):
         try:
             with installed_bundle(args.bundle, root) as measured:
                 verify(measured, root, guest, None, False, False, False, False,
-                       observer=measure, stage_bundle=False, check_launch_rejections=False)
+                       observer=measure, stage_bundle=False, check_launch_rejections=False, guest_files=inputs)
         except BaseException:
             for log in (root / "serve.log", root / "worker.log", *sorted((root / "state/managed").glob("*.log"))):
                 if log.exists():
@@ -346,6 +360,9 @@ def summarize(samples):
                     values.setdefault(name, []).append(row[name])
             for task in row.get("tasks", []):
                 values.setdefault("task_runtime_ms", []).append(task["runtime_ms"])
+                if "compiled_units" in task:
+                    speed = task["compiled_units"] * 1000 / task["compile_ms"]
+                    values.setdefault("guest_compile_units_per_sec", []).append(speed)
                 if "observed_ms" in task:
                     values.setdefault("first_task_observed_upper_bound_ms", []).append(task["observed_ms"])
                 if task["runtime_ms"] > 0:
@@ -354,6 +371,11 @@ def summarize(samples):
                 values.setdefault("threads", []).append(task["process"]["Threads"])
                 values.setdefault("Pss_kib", []).append(task["process"]["Pss"])
                 values.setdefault("VmHWM_kib", []).append(task["process"]["VmHWM"])
+            tasks = row.get("tasks", [])
+            if row.get("fanout") and tasks and all("compiled_units" in task for task in tasks):
+                last_ready = max(task["observed_ms"] for task in tasks)
+                batch_units = sum(task["compiled_units"] for task in tasks)
+                values.setdefault("batch_compile_units_per_sec", []).append(batch_units * 1000 / last_ready)
     return [{"workload": key[0], "read_lanes": key[1], "scenario": key[2],
              "metrics": {name: {"count": len(values), "p50": statistics.median(values),
                                 "p95": sorted(values)[math.ceil(0.95 * len(values)) - 1]}
@@ -367,6 +389,8 @@ def main():
     parser.add_argument("--samples", type=int, default=2)
     parser.add_argument("--modes", nargs="+", choices=("clean", "dirty"), default=["clean", "dirty"])
     parser.add_argument("--read-lanes", nargs="+", type=int, default=[16])
+    parser.add_argument("--compile-workload", action="store_true",
+                        help="Build and verify C object files in each Guest after its random-read task (libtcc-dev)")
     parser.add_argument("--fanout", type=int, default=2)
     parser.add_argument("--depth", type=int, default=3, help="Recursive fork depth, or 0 to skip the depth sweep")
     parser.add_argument("--durable", action="store_true")
@@ -394,6 +418,9 @@ def main():
               "kernel": platform.release(), "machine_arch": platform.machine(),
               "cpu_model": cpu, "cpu_count": len(os.sched_getaffinity(0)),
               "host_load_before": os.getloadavg(), "previous_global_caches_retained": True, "samples": []}
+    if args.compile_workload:
+        source = ROOT / "tests/fixtures/bench-arithmetic.c"
+        report["compile_source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
     for sample in range(args.samples):
         for mode in args.modes:
             counts = args.read_lanes if sample % 2 == 0 else list(reversed(args.read_lanes))
@@ -403,6 +430,8 @@ def main():
                            "--fanout", str(args.fanout), "--depth", str(args.depth), "--work-dir", str(args.work_dir)]
                 if args.trace_vcpus:
                     command.append("--trace-vcpus")
+                if args.compile_workload:
+                    command.append("--compile-workload")
                 if args.durable:
                     command.append("--durable")
                 if args.guest_dir:

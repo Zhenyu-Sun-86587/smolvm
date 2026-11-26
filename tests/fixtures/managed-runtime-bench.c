@@ -10,6 +10,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef BENCH_COMPILE
+#include <elf.h>
+#include <libtcc.h>
+#endif
+
 #ifndef DIRTY_MIB
 #define DIRTY_MIB 0
 #endif
@@ -45,26 +50,72 @@ static int read_workload(unsigned index)
     return close(fd) != 0;
 }
 
-static int first_task(const char *host)
+static int run_workers(int (*work)(unsigned), unsigned count)
 {
-    pid_t readers[READERS];
-    const uint64_t start = monotonic_ns();
-    for (unsigned i = 0; i < READERS; i++) {
-        readers[i] = fork();
-        if (readers[i] < 0)
+    pid_t workers[count];
+    for (unsigned i = 0; i < count; i++) {
+        workers[i] = fork();
+        if (workers[i] < 0)
             return 1;
-        if (!readers[i])
-            _exit(read_workload(i));
+        if (!workers[i])
+            _exit(work(i));
     }
-    for (unsigned i = 0; i < READERS; i++) {
+    for (unsigned i = 0; i < count; i++) {
         int status;
-        if (waitpid(readers[i], &status, 0) != readers[i] ||
+        if (waitpid(workers[i], &status, 0) != workers[i] ||
             !WIFEXITED(status) || WEXITSTATUS(status))
             return 2;
     }
+    return 0;
+}
+
+#ifdef BENCH_COMPILE
+enum { COMPILE_JOBS = 2, UNITS_PER_JOB = 16 };
+
+static int compile_workload(unsigned job)
+{
+    char object[48];
+    snprintf(object, sizeof(object), "/etc/bench-job-%u.o", job);
+    for (unsigned unit = 0; unit < UNITS_PER_JOB; unit++) {
+        char variant[16];
+        snprintf(variant, sizeof(variant), "%u", job * UNITS_PER_JOB + unit);
+        TCCState *compiler = tcc_new();
+        if (!compiler)
+            return 1;
+        tcc_set_options(compiler, "-nostdinc -nostdlib");
+        tcc_define_symbol(compiler, "BENCH_VARIANT", variant);
+        int failed = tcc_set_output_type(compiler, TCC_OUTPUT_OBJ) ||
+                     tcc_add_file(compiler, "/bench-arithmetic.c") ||
+                     tcc_output_file(compiler, object);
+        tcc_delete(compiler);
+        if (failed)
+            return 2;
+        int fd = open(object, O_RDONLY);
+        Elf64_Ehdr header;
+        if (fd < 0 || read(fd, &header, sizeof(header)) != sizeof(header) ||
+            memcmp(header.e_ident, ELFMAG, SELFMAG) || header.e_type != ET_REL ||
+            header.e_machine != EM_X86_64 || header.e_shnum < 3 || close(fd) || unlink(object))
+            return 3;
+    }
+    return 0;
+}
+#endif
+
+static int first_task(const char *host)
+{
+    const uint64_t start = monotonic_ns();
+    if (run_workers(read_workload, READERS))
+        return 1;
+    uint64_t read_ns = monotonic_ns() - start;
+#ifdef BENCH_COMPILE
+    const uint64_t compile_start = monotonic_ns();
+    if (run_workers(compile_workload, COMPILE_JOBS))
+        return 2;
+    dprintf(1, "BENCH_COMPILE %s %llu %u\n", host,
+            (unsigned long long)(monotonic_ns() - compile_start), COMPILE_JOBS * UNITS_PER_JOB);
+#endif
     dprintf(1, "BENCH_TASK %s %llu %u\n", host,
-            (unsigned long long)(monotonic_ns() - start),
-            READERS * READS * BLOCK_BYTES);
+            (unsigned long long)read_ns, READERS * READS * BLOCK_BYTES);
     return 0;
 }
 
