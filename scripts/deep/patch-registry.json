@@ -87,7 +87,8 @@
         "smolvm": [
           "e896c37f43a294ddcb235aa7a527e4b7ff6c734c",
           "63d92cfbf7725ad269e721469a6f6698df80c9da",
-          "731ac65325be79fffe78a13a1b07dc26c6c248cc"
+          "731ac65325be79fffe78a13a1b07dc26c6c248cc",
+          "bb9fb77b0cc942c71eb408aa99047e2b8e506d96"
         ]
       },
       "depends_on": [],
@@ -103,6 +104,7 @@
       "gates": [
         "A04",
         "A05",
+        "A12",
         "A19",
         "A20",
         "A25"
@@ -164,7 +166,10 @@
           "ea1be886a2d980b99b8203dcbc1d4d7d046177e5",
           "37805f09c8a3c2643f9cb66d5d857d6f3b157da4",
           "0efc6e2932effc2c90f8013139aa837b42daff0b",
-          "d3fd761b3806c8107d3c1508149dab872dc34769"
+          "d3fd761b3806c8107d3c1508149dab872dc34769",
+          "695dd571d45b0f3bb403775da8ac04c8298e6475",
+          "010c38ef91f835c1649606c5e4ac5382cc2cea89",
+          "b75b1b743e9fcd6c06cc241a9211cf0f44a97ca2"
         ]
       },
       "depends_on": [
@@ -173,6 +178,7 @@
       "hooks": [
         "src/vmm/src",
         "crates/smolvm-identity-helper",
+        "src/runtime_ext/managed.rs",
         "crates/smolvm-resourced"
       ],
       "profiles": [
