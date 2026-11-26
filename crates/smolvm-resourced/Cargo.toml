@@ -16,6 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 smolvm-network = { path = "../smolvm-network" }
+smolvm-protocol = { path = "../smolvm-protocol" }
 socket2 = { version = "0.6", features = ["all"] }
 smolvm-checkpoint = { path = "../smolvm-checkpoint" }
 smolvm-runtime-protocol = { path = "../smolvm-runtime-protocol" }

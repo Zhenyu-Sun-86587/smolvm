@@ -143,6 +143,12 @@ pub(crate) fn submit(
             "source lacks managed block provenance",
         )
     })?;
+    if template.machine.live_compute_growth {
+        return Err(Fault::new(
+            "E_CAPABILITY_UNSUPPORTED",
+            "the managed StatePoint reader cannot preserve this live CPU and RAM topology",
+        ));
+    }
     if start.phase != "COMPLETED" {
         return Err(conflict("source launch is incomplete"));
     }

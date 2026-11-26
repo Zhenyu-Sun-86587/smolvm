@@ -66,6 +66,8 @@ mod pivots;
 #[cfg(target_os = "linux")]
 mod product_volumes;
 #[cfg(target_os = "linux")]
+mod resource_resize;
+#[cfg(target_os = "linux")]
 mod statepoint_capture;
 #[cfg(target_os = "linux")]
 mod statepoint_catalog;

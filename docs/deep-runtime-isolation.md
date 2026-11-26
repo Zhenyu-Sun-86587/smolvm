@@ -45,6 +45,20 @@ performs bounded cache reclaim before considering Hibernate for an eligible
 idle guest. Set the deep slice budget independently of the official lane
 before deployment.
 
+The managed resource query reports the current execution, created CPU
+slots, the Linux online CPU set when the Guest Agent can read it, and the
+scope's measured CPU bandwidth and resident memory. Linux CPU offlining
+preserves the existing slots and their budget. Balloon receipts separate
+the requested target, the Guest's actual size, and cgroup memory samples.
+
+The x86-64 System launch option `live_compute_growth` enables the existing
+CPU and RAM hot-add devices. The current parked StatePoint reader rejects
+capture of this topology. The default System profile supports parked
+capture and can online or offline its existing CPU slots with a capable
+Guest Agent. The Worker reserves new slots and RAM before dispatch and
+keeps a pending resize on the original execution until it can confirm the
+result. Capture and resize share the same execution lock.
+
 By default, checkpoint scratch uses each Serve's own state directory. To
 supply tmpfs scratch, mount separate, root-owned tmpfs filesystems at
 `/dev/shm/smolvmdeep-capture-ID` (mode `0711`) and

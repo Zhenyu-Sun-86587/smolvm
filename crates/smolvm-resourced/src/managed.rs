@@ -61,6 +61,10 @@ pub struct Machine {
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<Network>,
+    /// Opt into the existing hot-add devices. This execution geometry has no
+    /// compatible managed StatePoint reader in the parked runtime.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live_compute_growth: bool,
 }
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -127,6 +131,10 @@ impl Machine {
             || self.cpus == 0
             || self.memory_mib < 64
             || !matches!(self.boot_profile.as_str(), "oci-v1" | "system-debian-v1")
+            || self.live_compute_growth
+                && (!cfg!(target_arch = "x86_64")
+                    || self.boot_profile != "system-debian-v1"
+                    || self.cpus > 16)
             || !self.init.starts_with('/')
             || self.init.as_bytes().contains(&0)
             || self.init.len() > 1024
