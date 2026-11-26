@@ -4,6 +4,18 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+mod measured_release;
+pub use measured_release::{MANAGED_ACCEPTANCE_PATH, MeasuredRelease, measured_release};
+
+const CONTRACT_PROTOCOLS: [(&str, &str); 6] = [
+    ("worker_resource", "WorkerResource"),
+    ("capture_control", "CaptureControl"),
+    ("statepoint", "StatePoint"),
+    ("guest_identity", "GuestIdentity"),
+    ("block_attachment", "BlockAttachment"),
+    ("network_attachment", "NetworkAttachment"),
+];
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionRef {
     pub instance_id: String,
@@ -11,7 +23,7 @@ pub struct ExecutionRef {
     pub execution_epoch: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Capability {
     pub status: String,
     pub supported: bool,
@@ -22,7 +34,7 @@ pub struct Capability {
     pub verified_profile: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Handshake {
     pub schema: String,
     pub route_id: String,
@@ -63,14 +75,7 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
         .filter(|s| !s.trim().is_empty())
         .ok_or("missing reader ID")?;
     let mut protocols = BTreeMap::new();
-    for (field, name) in [
-        ("worker_resource", "WorkerResource"),
-        ("capture_control", "CaptureControl"),
-        ("statepoint", "StatePoint"),
-        ("guest_identity", "GuestIdentity"),
-        ("block_attachment", "BlockAttachment"),
-        ("network_attachment", "NetworkAttachment"),
-    ] {
+    for (field, name) in CONTRACT_PROTOCOLS {
         if contracts[field].as_u64() != Some(1) {
             return Err("incompatible bundle protocol");
         }
@@ -79,6 +84,7 @@ pub fn handshake(mut manifest: Value, binary_hash: &str) -> Result<Handshake, &'
     protocols.insert("RuntimeBundle".to_owned(), 1);
     let mut capabilities: BTreeMap<String, Capability> = [
         "lifecycle.standby",
+        "lifecycle.standby_wake",
         "state.live_fork",
         "state.independent_fork",
         "state.fork_batch",

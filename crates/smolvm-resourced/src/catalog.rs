@@ -358,6 +358,13 @@ impl Catalog {
     }
 
     pub fn health(&self) -> Result<Value> {
+        static EXECUTABLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let executable_sha256 = EXECUTABLE.get_or_init(|| {
+            let mut file = std::fs::File::open("/proc/self/exe").ok()?;
+            let mut hash = Sha256::new();
+            std::io::copy(&mut file, &mut hash).ok()?;
+            Some(format!("sha256:{:x}", hash.finalize()))
+        });
         let slice = crate::worker_scope::configured_slice()
             .map_err(|error| Fault::invalid(error.to_string()))?;
         let (boot, session, recovering): (String, String, bool) = self.db.query_row(
@@ -366,7 +373,7 @@ impl Catalog {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         Ok(json!({"state":if recovering {"recovering"} else {"ready"},
-            "host_boot_id":boot, "broker_session_id":session, "vm_slice":slice,
+            "host_boot_id":boot, "broker_session_id":session, "vm_slice":slice, "executable_sha256":executable_sha256,
             "writer_authority_supported":true, "writer_authority_mode":"managed_block_full_sync",
             "fd_transfer_supported":true, "fd_transfer_mode":"sealed_memfd"}))
     }

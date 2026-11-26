@@ -95,6 +95,10 @@ pub(super) fn worker_configured() -> bool {
     WORKER.get().is_some()
 }
 
+pub(super) fn worker_socket() -> Option<&'static Path> {
+    WORKER.get().map(PathBuf::as_path)
+}
+
 pub(super) fn verified_client(socket: &Path) -> std::result::Result<Client<'_>, QueryError> {
     let profile = profile().map_err(|e| QueryError {
         code: "E_BUNDLE_UNAVAILABLE".into(),

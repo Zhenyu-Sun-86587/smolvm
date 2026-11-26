@@ -1,10 +1,10 @@
 //! Synchronous one-shot WorkerResource/1 queries for local control processes.
 
 pub use crate::catalog::Operation as OperationReceipt;
-use crate::ipc::{self, valid_digest, valid_id, PROTOCOL};
+use crate::ipc::{self, PROTOCOL, valid_digest, valid_id};
 use serde::Deserialize;
-use serde_json::json;
-use std::{fmt, path::Path};
+use serde_json::{Value, json};
+use std::{fmt, path::Path, time::Duration};
 
 const ROUTE: &str = "deep";
 
@@ -39,32 +39,27 @@ struct Response {
     error: Option<QueryError>,
 }
 
-/// Confirm that the privileged Worker and its Serve place VMMs in the same ancestor.
-pub fn verify_worker_slice(socket_path: &Path) -> Result<(), QueryError> {
+fn trusted_health(socket_path: &Path, timeout: Duration) -> Result<Value, QueryError> {
     let transport =
         |error: std::io::Error| QueryError::new("E_RESOURCED_UNAVAILABLE", error.to_string());
-    let configured = crate::worker_scope::configured_slice()
-        .map_err(|error| QueryError::new("E_INVALID_REQUEST", error.to_string()))?;
     let socket = ipc::connect(socket_path).map_err(transport)?;
     let peer = ipc::peer(&socket).map_err(transport)?;
     if peer.uid != 0 {
         return Err(QueryError::new(
             "E_PERMISSION_DENIED",
-            "Worker slice authority requires a privileged local peer",
+            "Worker Health requires a privileged local peer",
         ));
     }
-    let request_id = "worker-slice";
+    let request_id = "worker-health";
     let request = json!({"protocol":PROTOCOL,"method":"Health","request_id":request_id});
     socket
-        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+        .set_write_timeout(Some(timeout.min(Duration::from_secs(5))))
         .map_err(transport)?;
-    socket
-        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
-        .map_err(transport)?;
+    socket.set_read_timeout(Some(timeout)).map_err(transport)?;
     ipc::send(&socket, request.to_string().as_bytes()).map_err(transport)?;
     let bytes =
         ipc::receive(&socket).map_err(|error| QueryError::new(error.code, error.message))?;
-    let response: serde_json::Value = serde_json::from_slice(&bytes)
+    let mut response: Value = serde_json::from_slice(&bytes)
         .map_err(|error| QueryError::new("E_PROTOCOL_UNSUPPORTED", error.to_string()))?;
     if response["protocol"] != PROTOCOL
         || response["request_id"] != request_id
@@ -73,14 +68,19 @@ pub fn verify_worker_slice(socket_path: &Path) -> Result<(), QueryError> {
     {
         return Err(QueryError::new(
             "E_PROTOCOL_UNSUPPORTED",
-            "Worker slice query did not receive a valid Health reply",
+            "Worker Health reply is invalid",
         ));
     }
+    Ok(response["result"].take())
+}
+
+fn require_worker_slice(health: &Value) -> Result<(), QueryError> {
+    let configured = crate::worker_scope::configured_slice()
+        .map_err(|error| QueryError::new("E_INVALID_REQUEST", error.to_string()))?;
     // Earlier Workers used the fixed default slice and have no override.
-    let observed = response["result"].get("vm_slice").map_or(
-        Some(crate::worker_scope::DEFAULT_SLICE),
-        serde_json::Value::as_str,
-    );
+    let observed = health
+        .get("vm_slice")
+        .map_or(Some(crate::worker_scope::DEFAULT_SLICE), Value::as_str);
     if observed != Some(configured) {
         return Err(QueryError::new(
             "E_STATE_CONFLICT",
@@ -88,6 +88,27 @@ pub fn verify_worker_slice(socket_path: &Path) -> Result<(), QueryError> {
         ));
     }
     Ok(())
+}
+
+/// Confirm that the privileged Worker and its Serve place VMMs in the same ancestor.
+pub fn verify_worker_slice(socket_path: &Path) -> Result<(), QueryError> {
+    require_worker_slice(&trusted_health(socket_path, Duration::from_secs(20))?)
+}
+
+/// Read the executable measurement from the currently connected Worker.
+pub fn worker_executable_release(socket_path: &Path) -> Result<Option<String>, QueryError> {
+    let health = trusted_health(socket_path, Duration::from_secs(1))?;
+    require_worker_slice(&health)?;
+    if health["state"] != "ready" {
+        return Err(QueryError::new(
+            "E_RECOVERING",
+            "Worker Health is not ready",
+        ));
+    }
+    Ok(health["executable_sha256"]
+        .as_str()
+        .filter(|sha| valid_digest(sha))
+        .map(str::to_owned))
 }
 
 /// Query one operation on the downstream Linux route using the caller's configured bundle digest.
