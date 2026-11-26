@@ -59,6 +59,8 @@ impl Peering {
         let Some(path) = &self.policy else { return };
         if catalog.ready().is_err() {
             self.links.clear();
+            self.requested.clear();
+            self.error = None;
             return;
         }
         let result = match read_policy(path) {

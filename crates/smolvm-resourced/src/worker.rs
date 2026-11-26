@@ -1005,7 +1005,10 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
-            "QueryPrivateNetworkPeering" => self.network.peering_status(request),
+            "QueryPrivateNetworkPeering" => {
+                self.catalog.ready()?;
+                self.network.peering_status(request)
+            }
             crate::managed_retirement::METHOD => {
                 Ok(json!(crate::managed_retirement::submit(&mut self.catalog, request)?))
             }
