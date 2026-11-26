@@ -461,6 +461,12 @@ pub(crate) fn receipt(catalog: &Catalog, op: &Operation) -> Result<Option<Value>
     let mut value = json!({"stage":stage,"capture_id":capture,"rescue_capture_id":rescue,"representation_id":representation,
         "manifest_digest":manifest,"target_operation_id":op.operation_id,"volume_map":volume_map,"error_code":code,"error":error,
         "activation_decision":authorization.as_ref().map(|(_, decision)| decision)});
+    if op.phase == "COMPLETED" {
+        let attachments = crate::product_volumes::restore_attachment_receipt(catalog, op)?;
+        if !attachments.is_empty() {
+            value["product_attachments"] = json!(attachments);
+        }
+    }
     if op.phase == "COMPLETED" && crate::backup_import::imported(catalog, &capture)? {
         if let Some(network) = crate::activation_catalog::archived_network_receipt(catalog, op)? {
             value["network_recovery"] = network;
