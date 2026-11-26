@@ -43,6 +43,13 @@ struct Prepare {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Release {
+    capture_id: String,
+    manifest_digest: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Stop {
     pub capture_id: String,
     pub expected_revision: i64,
@@ -269,6 +276,27 @@ impl StatePoints {
 
     pub fn export_in_progress(&self, capture_id: &str) -> bool {
         self.exports.contains_key(capture_id)
+    }
+
+    pub fn release_root(&mut self, catalog: &mut Catalog, request: &Request) -> Result<Value> {
+        catalog.ready()?;
+        let input: Release = request.payload()?;
+        let record = catalog.require_statepoint(&input.capture_id)?;
+        if self.restores.get(&input.capture_id).is_some_and(|job| !job.is_finished()) {
+            return Err(Fault::new("E_RESOURCE_PINNED", "StatePoint is being materialized"));
+        }
+        crate::statepoint_catalog::release_root(
+            catalog,
+            &record,
+            request.route_id.as_deref(),
+            request.bundle_digest.as_deref(),
+            &input.manifest_digest,
+        )?;
+        self.restores.remove(&input.capture_id);
+        if self.prepared.as_ref().is_some_and(|(id, _)| id == &input.capture_id) {
+            self.prepared = None;
+        }
+        Ok(json!({"capture_id": input.capture_id, "manifest_digest": input.manifest_digest, "phase": "released"}))
     }
 
     fn valid_restore(

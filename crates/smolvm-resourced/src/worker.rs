@@ -176,6 +176,7 @@ struct Permit {
 
 struct Worker {
     catalog: Catalog,
+    last_gc_row: i64,
     objects: File,
     boot: String,
     admin_uid: u32,
@@ -379,19 +380,62 @@ pub(crate) fn ofd_lock(file: &File) -> Result<()> {
 }
 
 impl Worker {
+    fn collect_resource(&mut self, resource: &str, revision: i64) -> Result<Value> {
+        let objects = &self.objects;
+        let escrow = &mut self.escrow;
+        let points = self.statepoints.directory();
+        self.catalog.collect_gc(resource, revision, |catalog| {
+            crate::blocks::collect(catalog, objects, resource)?;
+            let statepoint: bool = catalog.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM statepoints WHERE representation_id=? AND manifest_digest IS NOT NULL)",
+                [resource], |row| row.get(0),
+            )?;
+            if statepoint {
+                crate::statepoint_store::collect(points, resource).map_err(broker_error)?;
+            }
+            escrow.collect(resource);
+            Ok(())
+        })
+    }
+
+    fn resume_gc(&mut self) -> Result<()> {
+        if self.catalog.ready().is_err() {
+            return Ok(());
+        }
+        let pending = self.catalog.pending_gc(self.last_gc_row)?;
+        if pending.is_empty() {
+            self.last_gc_row = 0;
+        }
+        for (row, resource, revision, needs_mark) in pending {
+            self.last_gc_row = row;
+            let revision = if needs_mark {
+                match self.catalog.mark_gc(&resource, revision) {
+                    Ok(_) => revision + 1,
+                    Err(error) if error.code == "E_RESOURCE_PINNED" => continue,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                revision
+            };
+            if let Err(error) = self.collect_resource(&resource, revision) {
+                eprintln!("resourced resource collection {resource}: {error}");
+            }
+        }
+        Ok(())
+    }
+
     fn collect_unused_fork_ram(&mut self) -> Result<()> {
         if self.catalog.ready().is_err() {
             return Ok(());
         }
         for (resource, state, revision) in self.catalog.unused_fork_ram()? {
             let revision = if state == "available" {
-                self.catalog.gc(&resource, revision, false)?;
+                self.catalog.mark_gc(&resource, revision)?;
                 revision + 1
             } else {
                 revision
             };
-            self.catalog.gc(&resource, revision, true)?;
-            self.escrow.collect(&resource);
+            self.collect_resource(&resource, revision)?;
         }
         Ok(())
     }
@@ -981,6 +1025,7 @@ impl Worker {
             }
             "QueryWorkerBudget" => crate::admission::status(&self.catalog.db),
             "ReleaseBackupClosure" => crate::backup_closure::release(&mut self.catalog, request),
+            "ReleaseStatePoint" => self.statepoints.release_root(&mut self.catalog, request),
             "QueryProductVolume" => crate::product_volumes::query(&self.catalog, request),
             "ApplyProductVolume" => {
                 crate::product_volumes::mutate(&mut self.catalog, &self.objects, request)
@@ -1411,15 +1456,11 @@ impl Worker {
             }
             "MarkResourceForGC" | "CollectResource" => {
                 let data: Gc = request.payload()?;
-                let collect = request.method == "CollectResource";
-                let result = self
-                    .catalog
-                    .gc(&data.resource_id, data.expected_revision, collect)?;
-                if collect {
-                    self.escrow.collect(&data.resource_id);
-                    crate::blocks::collect(&self.catalog, &self.objects, &data.resource_id)?;
+                if request.method == "CollectResource" {
+                    self.collect_resource(&data.resource_id, data.expected_revision)
+                } else {
+                    self.catalog.mark_gc(&data.resource_id, data.expected_revision)
                 }
-                Ok(result)
             }
             "RegisterVolumeHead" => {
                 self.catalog.ready()?;
@@ -2434,6 +2475,7 @@ fn serve(
     let session = token()?;
     let mut worker = Worker {
         catalog: Catalog::open(&state.join("catalog.sqlite"), &boot, &session)?,
+        last_gc_row: 0,
         native_signal: crate::native_operations::start(&state.join("catalog.sqlite"), &boot)?,
         objects: File::open(objects)?,
         boot,
@@ -2505,6 +2547,9 @@ fn serve(
                 .map_err(|fault| io::Error::other(fault.message))?;
             if let Err(error) = worker.collect_unused_fork_ram() {
                 eprintln!("resourced fork RAM collection: {error}");
+            }
+            if let Err(error) = worker.resume_gc() {
+                eprintln!("resourced resource collection: {error}");
             }
             next_stop_check = Instant::now() + Duration::from_secs(1);
         }

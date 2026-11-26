@@ -83,6 +83,7 @@ pub(crate) fn source(
         || resource["state"] != "available"
         || resource["durability"] != "durable"
         || resource["immutable"] != true
+        || !crate::statepoint_catalog::has_root(&catalog.db, &record)?
     {
         return Err(unavailable("StatePoint representation is unavailable"));
     }

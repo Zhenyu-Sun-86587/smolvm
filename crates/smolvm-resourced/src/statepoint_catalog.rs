@@ -83,6 +83,78 @@ fn root(purpose: Purpose) -> &'static str {
     }
 }
 
+pub(crate) fn has_root(db: &Connection, record: &Record) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM root_refs WHERE owner_kind=?1 AND owner_id=?2
+           AND resource_id=?3 AND state='active') OR EXISTS(
+           SELECT 1 FROM native_backup_imports b JOIN root_refs r ON r.owner_id=b.backup_id
+           WHERE b.capture_id=?2 AND r.owner_kind='backup_import' AND r.resource_id=?3 AND r.state='active')",
+        params![root(record.export.purpose), record.point.capture_id, record.point.representation_id],
+        |row| row.get(0),
+    )?)
+}
+
+pub(crate) fn release_root(
+    catalog: &mut Catalog,
+    record: &Record,
+    route: Option<&str>,
+    bundle: Option<&str>,
+    manifest_digest: &str,
+) -> Result<()> {
+    let original = catalog.operation(&record.operation_id)?;
+    if route != Some(original.route_id.as_str()) || bundle != Some(original.bundle_digest.as_str()) {
+        return Err(Fault::new("E_BUNDLE_UNAVAILABLE", "StatePoint belongs to another runtime reader"));
+    }
+    if record.manifest_digest.as_deref() != Some(manifest_digest) {
+        return Err(changed("StatePoint manifest changed"));
+    }
+    let tx = catalog.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if original.phase != "COMPLETED" || !matches!(
+        (record.export.purpose, record.phase.as_str()),
+        (Purpose::Checkpoint, "durable") | (Purpose::Hibernate, "hibernated")
+    ) {
+        return Err(Fault::new("E_RESOURCE_PINNED", "StatePoint capture has not resolved"));
+    }
+    let state: Option<String> = tx.query_row(
+        "SELECT state FROM root_refs WHERE owner_kind=? AND owner_id=? AND resource_id=?",
+        params![root(record.export.purpose), record.point.capture_id, record.point.representation_id],
+        |row| row.get(0),
+    ).optional()?;
+    match state.as_deref() {
+        Some("active") => {}
+        Some("dropped") => return Ok(()),
+        _ => return Err(Fault::new("E_RESOURCE_UNAVAILABLE", "StatePoint has no local retained root")),
+    }
+    if record.export.purpose == Purpose::Hibernate {
+        let replaced: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM executions e JOIN operations o ON o.operation_id=e.last_operation_id
+              WHERE e.route_id=? AND e.instance_id=? AND e.execution_epoch>?
+                AND o.kind='restore_target' AND o.phase='COMPLETED')",
+            params![original.route_id, original.instance_id, record.point.execution_epoch], |row| row.get(0),
+        )?;
+        if !replaced {
+            return Err(Fault::new("E_RESOURCE_PINNED", "StatePoint retains the sleeping execution"));
+        }
+    }
+    let restoring: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_state_restores s JOIN operations o USING(operation_id)
+           WHERE s.capture_id=?1 AND o.phase='NEW')
+         OR EXISTS(SELECT 1 FROM statepoint_restore_leases s JOIN fd_leases f USING(lease_id)
+           WHERE s.capture_id=?1 AND f.state<>'released')",
+        [&record.point.capture_id], |row| row.get(0),
+    )?;
+    if restoring {
+        return Err(Fault::new("E_RESOURCE_PINNED", "StatePoint has an in-progress restore"));
+    }
+    tx.execute(
+        "UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind=? AND owner_id=?
+          AND resource_id=? AND state='active'",
+        params![root(record.export.purpose), record.point.capture_id, record.point.representation_id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn insert_descriptor(
     tx: &Transaction<'_>,
     op: &str,
