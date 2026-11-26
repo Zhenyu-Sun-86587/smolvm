@@ -36,13 +36,13 @@ fn ensure_fenced(tx: &Transaction<'_>, route: &str, expected: &Expected) -> Resu
             AND (a.state='unknown' OR EXISTS(SELECT 1 FROM network_tap_leases t WHERE t.attachment_id=a.attachment_id AND t.state!='retired')))
          OR EXISTS(SELECT 1 FROM managed_budget_holds WHERE instance_id=?2 AND state!='released')
          OR EXISTS(SELECT 1 FROM statepoints p JOIN executions e ON e.incarnation_id=p.source_incarnation_id
-            WHERE e.route_id=?1 AND e.instance_id=?2 AND e.execution_epoch=?3 AND p.phase IN ('hibernated','stop_committed'))
+            WHERE e.route_id=?1 AND e.instance_id=?2 AND p.phase='stop_committed')
          OR EXISTS(SELECT 1 FROM managed_fork_batches f JOIN operations o USING(operation_id)
             WHERE o.route_id=?1 AND o.instance_id=?2 AND o.phase='NEW' AND f.source_released=0)",
-        params![route, expected.instance_id, expected.execution_epoch],
+        params![route, expected.instance_id],
         |row| row.get(0),
     )?;
-    if unsafe_source {
+    if unsafe_source || crate::statepoint_catalog::retained_statepoint(tx, route, &expected.instance_id, expected.execution_epoch)?.is_some() {
         return Err(state_conflict("source execution, writers, network or saved state are not fenced"));
     }
     let changing_volume: bool = tx.query_row(

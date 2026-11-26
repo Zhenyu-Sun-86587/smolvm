@@ -33,9 +33,12 @@ impl Machine {
             OR incarnation_id=? AND kind='hold' AND state IN ('active','suspect')))",params![self.expected.instance_id,self.expected.incarnation_id],|r|r.get(0))?)
     }
     fn saved(&self, db: &Connection) -> Result<Option<String>> {
-        Ok(db.query_row("SELECT p.capture_id FROM statepoints p JOIN operations o USING(operation_id) JOIN executions e ON e.incarnation_id=p.source_incarnation_id
-            WHERE o.instance_id=? AND e.execution_epoch=? AND p.phase='hibernated' AND json_extract(p.export_json,'$.purpose') IN ('hibernate','rollback_rescue')
-            ORDER BY p.rowid DESC LIMIT 1",params![self.expected.instance_id,self.expected.execution_epoch],|r|r.get(0)).optional()?)
+        crate::statepoint_catalog::retained_statepoint(
+            db,
+            "deep",
+            &self.expected.instance_id,
+            self.expected.execution_epoch,
+        )
     }
     fn name(&self, db: &Connection) -> Result<String> {
         Ok(db.query_row("SELECT l.machine_name FROM managed_launches l JOIN operations o USING(operation_id) WHERE o.instance_id=? AND o.phase='COMPLETED'
@@ -370,7 +373,8 @@ fn step(
                 if ok {
                     None
                 } else {
-                    Some("native transition aborted")
+                    Some(op.statepoint.as_ref().and_then(|point| point["error"].as_str())
+                        .unwrap_or("native transition aborted"))
                 },
                 d.id
             ],
@@ -387,7 +391,7 @@ fn step(
                     id
                 ],
             )?;
-            tx.execute("UPDATE lifecycle_protections SET wake_operation=NULL,revision=revision+1 WHERE wake_operation=? AND kind='wake' AND state='pending'",[&d.id])?;
+            finish_failed_demands(&tx, d, d.kind == "vm_restore")?;
         }
         tx.commit()?;
         return Ok(());
@@ -435,7 +439,7 @@ fn step(
             "hibernate",
             serde_json::from_value(json!({})).map_err(invalid)?,
         ),
-        "vm_restore" => {
+        "vm_restore" => (|| {
             let capture = m
                 .saved(&c.db)?
                 .ok_or_else(|| conflict("wake StatePoint is unavailable"))?;
@@ -446,7 +450,7 @@ fn step(
                 serde_json::from_value(json!({"name":name,"capture_id":capture,"mode":"exact"}))
                     .map_err(invalid)?,
             )
-        }
+        })(),
         "launch" => cold_launch(c, m, d, &r),
         _ => return Err(invalid("unexpected lifecycle decision")),
     };
@@ -471,9 +475,22 @@ fn step(
                     id
                 ],
             )?;
-            tx.execute("UPDATE lifecycle_protections SET wake_operation=NULL,revision=revision+1 WHERE wake_operation=? AND kind='wake' AND state='pending'",[&d.id])?;
+            let retryable = matches!(e.code,
+                "E_RECOVERING" | "E_RESOURCE_LIMIT" | "E_OPERATION_IN_PROGRESS" | "E_BUSY" | "E_HOST_IO" | "E_CATALOG");
+            finish_failed_demands(&tx, d, d.kind == "vm_restore" && !retryable)?;
             tx.commit()?;
         }
+    }
+    Ok(())
+}
+
+fn finish_failed_demands(db: &Connection, d: &Decision, restore_failed: bool) -> Result<()> {
+    if restore_failed {
+        db.execute("UPDATE lifecycle_protections SET state='released',reason='statepoint_restore_failed',revision=revision+1
+            WHERE wake_operation=? AND kind='wake' AND state='pending'", [&d.id])?;
+    } else {
+        db.execute("UPDATE lifecycle_protections SET wake_operation=NULL,revision=revision+1
+            WHERE wake_operation=? AND kind='wake' AND state='pending'", [&d.id])?;
     }
     Ok(())
 }

@@ -413,6 +413,9 @@ pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<O
     if active.is_some() {
         return Err(Fault::new("E_OPERATION_IN_PROGRESS", "this instance already has an active operation"));
     }
+    if crate::statepoint_catalog::retained_statepoint(&c.db, route, &expected.instance_id, epoch)?.is_some() {
+        return Err(Fault::new("E_STATE_CONFLICT", "a saved execution requires StatePoint restore"));
+    }
     let devices = machine.devices(c, id, route, bundle, expected)?;
     if let Some(network) = &machine.network {
         c.register_private_network(&crate::network_catalog::RegisterNetwork {
