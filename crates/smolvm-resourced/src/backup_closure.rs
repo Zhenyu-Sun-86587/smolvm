@@ -183,7 +183,6 @@ pub(crate) fn prepare(
     }
     let requested = selection.capture_ids.len() + selection.generation_ids.len();
     if !valid_id(&selection.backup_id)
-        || !valid_id(&selection.state_reader_id)
         || requested > MAX_CLOSURE
         || requested == 0
         || selection
@@ -411,7 +410,9 @@ fn load(
         || manifest.state_reader_id != reader
         || !valid_digest(bundle)
         || !valid_id(&manifest.backup_id)
-        || !valid_id(reader)
+        // Reader contracts are opaque manifest values. Released readers use
+        // colons between the family and source revisions.
+        || reader.trim().is_empty()
     {
         return Err(io::Error::other(
             "backup closure requires the original reader and bundle",
