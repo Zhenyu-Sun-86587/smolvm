@@ -2271,6 +2271,11 @@ const MAX_CONNECTION_THREADS: usize = 64;
 static WORK_SLOTS: std::sync::LazyLock<ConnectionSemaphore> =
     std::sync::LazyLock::new(|| ConnectionSemaphore::new(MAX_CONCURRENT_WORK));
 
+// Persistent terminals must leave capacity for foreground management, task
+// sampling, and file writes in System mode.
+static SYSTEM_EXEC_SLOTS: std::sync::LazyLock<ConnectionSemaphore> =
+    std::sync::LazyLock::new(|| ConnectionSemaphore::new(MAX_CONCURRENT_WORK / 2));
+
 /// Whether a request waits for a work slot. Liveness pings and shutdown never
 /// queue behind real work.
 fn needs_work_slot(request: &AgentRequest) -> bool {
@@ -2310,6 +2315,17 @@ impl ConnectionSemaphore {
         ConnectionPermit {
             inner: self.inner.clone(),
         }
+    }
+
+    fn try_acquire(&self) -> Option<ConnectionPermit> {
+        let mut count = self.inner.0.lock().unwrap();
+        if *count == 0 {
+            return None;
+        }
+        *count -= 1;
+        Some(ConnectionPermit {
+            inner: self.inner.clone(),
+        })
     }
 }
 
@@ -2566,6 +2582,7 @@ fn handle_connection(
                     capabilities: vec![
                         "system-service-v1".to_owned(),
                         smolvm_protocol::SYSTEM_FILE_WRITE_CAPABILITY.to_owned(),
+                        smolvm_protocol::SYSTEM_EXEC_STREAM_CAPABILITY.to_owned(),
                         smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_owned(),
                         smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY.to_owned(),
                         smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY.to_owned(),
@@ -2576,11 +2593,28 @@ fn handle_connection(
                     interactive: false,
                     tty: false,
                     ..
-                } | AgentRequest::OnlineCpus { .. }
-                  | AgentRequest::OfflineCpus { .. }
-                  | AgentRequest::OnlineMemory { .. }) => {
+                }
+                | AgentRequest::OnlineCpus { .. }
+                | AgentRequest::OfflineCpus { .. }
+                | AgentRequest::OnlineMemory { .. }) => {
                     let _permit = WORK_SLOTS.acquire();
                     handle_request(request, Some(stream.as_raw_fd()))
+                }
+                AgentRequest::VmExecControlled { session }
+                    if session.target.is_none()
+                        && session.user.is_none()
+                        && session.builtin.is_none() =>
+                {
+                    if let Some(_permit) = SYSTEM_EXEC_SLOTS.try_acquire() {
+                        return handle_interactive_vm_exec(
+                            stream,
+                            AgentRequest::VmExecControlled { session },
+                        );
+                    }
+                    AgentResponse::error(
+                        "too many active System Agent exec sessions",
+                        error_codes::RESOURCE_LIMIT,
+                    )
                 }
                 AgentRequest::FileWrite {
                     path,

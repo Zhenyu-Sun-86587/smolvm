@@ -107,6 +107,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The System Agent accepts bounded writes to its own VM filesystem.
 pub const SYSTEM_FILE_WRITE_CAPABILITY: &str = "system-file-write-v1";
+/// The System Agent accepts connection-owned VM commands with streaming I/O.
+pub const SYSTEM_EXEC_STREAM_CAPABILITY: &str = "system-exec-stream-v1";
 
 /// The agent can freeze internal filesystems before acknowledging shutdown.
 pub const QUIESCED_SHUTDOWN_CAPABILITY: &str = "quiesced-shutdown-v1";
@@ -1886,6 +1888,8 @@ pub enum AgentResponse {
 pub mod error_codes {
     /// Request payload was invalid or malformed.
     pub const INVALID_REQUEST: &str = "INVALID_REQUEST";
+    /// The Guest Agent cannot accept another request of this kind.
+    pub const RESOURCE_LIMIT: &str = "RESOURCE_LIMIT";
     /// Requested resource was not found.
     pub const NOT_FOUND: &str = "NOT_FOUND";
     /// Internal error during operation.
