@@ -5,7 +5,7 @@ use crate::catalog::{bundle_executable, Catalog, Execution, Operation};
 use crate::ipc::{Fault, Request, Result};
 use crate::worker_scope;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use smolvm_runtime_protocol::{cpu_quota, managed_scope_name};
 use std::ffi::{CStr, CString};
@@ -19,19 +19,16 @@ const REJECTED: &str = "E_CPU_QUOTA_REJECTED";
 const UNCERTAIN: &str = "E_CPU_QUOTA_UNCERTAIN";
 const UNAVAILABLE: &str = "E_CPU_QUOTA_UNAVAILABLE";
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Input {
-    millicpus: Value,
-}
-
-fn request_millicpus(request: &Request) -> Result<Option<u32>> {
-    let input: Input = request.payload()?;
-    if input.millicpus.is_null() {
+fn request_millicpus(payload: &Value) -> Result<Option<u32>> {
+    let field = payload
+        .as_object()
+        .filter(|fields| fields.len() == 1)
+        .and_then(|fields| fields.get("millicpus"))
+        .ok_or_else(|| Fault::invalid("set requires exactly the millicpus field"))?;
+    if field.is_null() {
         return Ok(None);
     }
-    input
-        .millicpus
+    field
         .as_u64()
         .and_then(|n| u32::try_from(n).ok())
         .filter(|n| *n > 0)
@@ -406,7 +403,7 @@ impl Worker {
             .incarnation_id
             .as_deref()
             .ok_or_else(stale_execution)?;
-        let millicpus = request_millicpus(request)?;
+        let millicpus = request_millicpus(&request.payload)?;
         let (id, _) = request.operation()?;
         let exists: bool = self.catalog.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id=?)",
@@ -631,5 +628,36 @@ impl Worker {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setting_cpu_quota_requires_an_explicit_positive_number_or_null() {
+        for wrong in [
+            json!(null),
+            json!({}),
+            json!({"millicpus": null, "extra": true}),
+            json!({"millicpus": -1}),
+            json!({"millicpus": 0}),
+            json!({"millicpus": 1.5}),
+            json!({"millicpus": u64::from(u32::MAX) + 1}),
+        ] {
+            assert_eq!(
+                request_millicpus(&wrong).unwrap_err().code,
+                "E_INVALID_REQUEST"
+            );
+        }
+        assert_eq!(
+            request_millicpus(&json!({"millicpus": null})).unwrap(),
+            None
+        );
+        assert_eq!(
+            request_millicpus(&json!({"millicpus": 3})).unwrap(),
+            Some(3)
+        );
     }
 }
