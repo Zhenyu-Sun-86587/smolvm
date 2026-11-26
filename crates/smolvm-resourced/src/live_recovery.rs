@@ -228,6 +228,23 @@ impl Worker {
         if health["state"] != "recovering" {
             return Ok(());
         }
+        // A PID from an earlier host boot can never identify a live provider.
+        // Finalization still has to acquire the recorded writer locks and fence
+        // its other resources before dropping the execution's ownership.
+        let previous_boot = {
+            let mut query = self.catalog.db.prepare(
+                "SELECT e.incarnation_id FROM executions e JOIN native_endpoints n USING(incarnation_id)
+                 WHERE e.phase='unknown' AND e.host_boot_id<>?",
+            )?;
+            let rows = query.query_map([&self.boot], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for incarnation in previous_boot {
+            let execution = self.catalog.execution(&incarnation)?;
+            if let Err(error) = self.finalize_scoped_execution(execution) {
+                eprintln!("native recovery of previous-boot execution {incarnation}: {error}");
+            }
+        }
         self.reconnect_native_endpoints()?;
         let writers = pending(&self.catalog.db, "SELECT e.incarnation_id,g.grant_id
             FROM writer_grants g JOIN executions e USING(incarnation_id) JOIN native_endpoints n USING(incarnation_id)
@@ -266,8 +283,9 @@ impl Worker {
         }
         let confirmed_managed: bool = self.catalog.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM executions e
-            JOIN native_endpoints n USING(incarnation_id) WHERE e.phase='registered')",
-            [],
+            JOIN native_endpoints n USING(incarnation_id) WHERE e.phase='registered'
+                OR (e.phase='exited' AND e.host_boot_id<>?))",
+            [&self.boot],
             |row| row.get(0),
         )?;
         if !confirmed_managed {
