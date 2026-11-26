@@ -315,7 +315,7 @@ pub(crate) fn retry(c: &mut Catalog, r: &Request, control: Control) -> Result<Op
             WHERE batch_id=? AND ordinal=? AND attempt=?",params![child,epoch,attempt,id,ordinal,prior_attempt])?;
     }
     tx.execute("INSERT INTO managed_fork_retries VALUES(?,?)",params![id,op.revision])?;
-    tx.execute("UPDATE managed_fork_batches SET stage='children',error=NULL WHERE operation_id=? AND source_released=1",[id])?;
+    tx.execute("UPDATE managed_fork_batches SET stage='children',error=NULL,cancel_requested=0 WHERE operation_id=? AND source_released=1",[id])?;
     tx.execute("UPDATE operations SET phase='NEW',revision=revision+1 WHERE operation_id=?",[id])?;
     tx.commit()?;
     c.operation(id)
@@ -339,7 +339,7 @@ pub(crate) fn cancel(c: &mut Catalog, r: &Request, control: Control) -> Result<O
     tx.execute("UPDATE managed_fork_batches SET cancel_requested=1,
         stage=CASE WHEN stage IN ('arming','parking') THEN 'cancel_gate' WHEN stage='restore_preflight' THEN 'cancel_preflight' ELSE stage END WHERE operation_id=?",[id])?;
     tx.execute("UPDATE managed_fork_children AS ch SET cancelled=1 WHERE batch_id=? AND ch.admission_error IS NULL
-         AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.operation_id=ch.operation_id AND o.phase='COMPLETED')
+         AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.operation_id=ch.operation_id AND o.phase IN ('ABORTED','COMPLETED'))
          AND NOT EXISTS(SELECT 1 FROM target_activations a WHERE a.operation_id=ch.operation_id AND a.decision='commit')", [id])?;
     tx.execute("UPDATE operations SET revision=revision+1 WHERE operation_id=?",[id])?;
     tx.commit()?;
