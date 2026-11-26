@@ -269,7 +269,6 @@ pub(crate) fn independent_restore_products(
         "SELECT capture_id FROM managed_state_restores WHERE operation_id=?",
         [&op.operation_id], |row| row.get(0),
     ).optional()?;
-    let is_fork = restore.is_none();
     let (source, captured): (_, Vec<CapturedProductDisk>) = if let Some(capture) = restore {
         let point = catalog.require_statepoint(&capture)?.point;
         let disks = point.devices.iter().filter_map(|d| d.block()).map(|disk| CapturedProductDisk {
@@ -310,12 +309,11 @@ pub(crate) fn independent_restore_products(
              LEFT JOIN product_machine_volumes m USING(volume_id)
              WHERE v.volume_id=?1 AND v.route_id=?2 AND v.bundle_digest=?3
                AND a.instance_id=?4 AND a.device_key=?5
-               AND (NOT ?8 OR m.volume_id IS NOT NULL)
                AND ( (?6 IS NULL AND a.mode='rw')
                  OR (?6 IS NOT NULL AND a.mode='ro' AND a.generation_id=?6
                      AND (v.state='available' OR m.volume_id IS NOT NULL)) )
              ORDER BY a.attachment_id=?7 DESC, a.state='reserved' DESC, a.attachment_id LIMIT 1",
-            params![old.volume, op.route_id, op.bundle_digest, source.instance_id, old.device, old.generation, old.attachment, is_fork],
+            params![old.volume, op.route_id, op.bundle_digest, source.instance_id, old.device, old.generation, old.attachment],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).optional()?;
         if let Some((owner, lifecycle, fork, capture)) = row {

@@ -48,7 +48,7 @@ pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
              CASE WHEN (ch.cancelled=1 OR ch.admission_error IS NOT NULL) AND o.operation_id IS NULL THEN 'ABORTED' ELSE COALESCE(o.phase,'RESERVED') END,
              m.incarnation_id,ch.prior_epoch,ch.attempt,ch.cancelled,ch.admission_error,
              CASE WHEN o.phase='COMPLETED' THEN EXISTS(
-                SELECT 1 FROM product_volume_attachments a JOIN product_machine_volumes v USING(volume_id)
+                SELECT 1 FROM product_volume_attachments a
                 WHERE a.instance_id=ch.instance_id AND a.declared_epoch=ch.prior_epoch
              ) ELSE 0 END
          FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id
