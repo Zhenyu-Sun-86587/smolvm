@@ -13,6 +13,24 @@ pub(crate) struct RegisterNetwork {
     pub(crate) cidr: String,
 }
 
+pub(crate) struct PeeringNetwork {
+    pub(crate) route_domain_id: String,
+    pub(crate) cidr: String,
+    pub(crate) first: Ipv4Addr,
+    pub(crate) last: Ipv4Addr,
+}
+
+impl PeeringNetwork {
+    pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        self.overlaps_range(u32::from(other.first) - 2, u32::from(other.last) + 1)
+    }
+
+    pub(crate) fn overlaps_range(&self, first: u32, last: u32) -> bool {
+        // Compare the entire prefix, including the reserved network, gateway and broadcast.
+        u32::from(self.first) - 2 <= last && first <= u32::from(self.last) + 1
+    }
+}
+
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Mode {
@@ -168,6 +186,28 @@ fn unallocated_ipv4(db: &Connection, network: &str, first: u32, last: u32) -> Re
 }
 
 impl Catalog {
+    pub(crate) fn peering_network(&self, network_id: &str) -> Result<Option<PeeringNetwork>> {
+        let definition = self
+            .db
+            .query_row(
+                "SELECT route_domain_id,cidr FROM private_networks WHERE network_id=?",
+                [network_id],
+                |row| Ok((row.get(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        definition
+            .map(|(route_domain_id, cidr)| {
+                let prefix = parse_prefix(&cidr)?;
+                Ok(PeeringNetwork {
+                    route_domain_id,
+                    cidr,
+                    first: Ipv4Addr::from(prefix.first),
+                    last: Ipv4Addr::from(prefix.last),
+                })
+            })
+            .transpose()
+    }
+
     pub(crate) fn tap_network_metadata(
         &self,
         lease: &crate::network_lease_catalog::TapLease,

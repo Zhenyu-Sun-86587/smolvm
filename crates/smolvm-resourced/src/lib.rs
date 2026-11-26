@@ -60,6 +60,8 @@ mod conntrack;
 #[cfg(target_os = "linux")]
 mod network_lease_catalog;
 #[cfg(target_os = "linux")]
+mod network_peering;
+#[cfg(target_os = "linux")]
 mod network_runtime;
 #[cfg(target_os = "linux")]
 mod packet_wake;

@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 mod kernel;
 pub(crate) use kernel::{cleanup_pins, published_port_absent, KernelProof};
 
+#[path = "network_peer_link.rs"]
+mod peer_link;
+pub(crate) use peer_link::PeeringLink;
+
 const HOST_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy)]

@@ -7,6 +7,7 @@ use crate::network::topology::{
 use crate::network::{NamespaceIdentity, PreparedTapPort};
 use crate::network_catalog::NetworkReservation;
 use crate::network_lease_catalog::{AttachmentDescriptor, TapLease};
+use crate::network_peering::Peering;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -18,6 +19,7 @@ pub(crate) struct NetworkRuntime {
     routers: HashMap<String, PrivateRouter>,
     ports: HashMap<String, QuarantinedPort>,
     packet_wake: crate::packet_wake::Observer,
+    peering: Peering,
 }
 
 #[derive(Deserialize)]
@@ -60,12 +62,13 @@ enum Transport {
 }
 
 impl NetworkRuntime {
-    pub(crate) fn new(namespaces: PathBuf) -> Self {
+    pub(crate) fn new(namespaces: PathBuf, peering_policy: Option<PathBuf>) -> Self {
         Self {
             namespaces,
             routers: HashMap::new(),
             ports: HashMap::new(),
             packet_wake: Default::default(),
+            peering: Peering::new(peering_policy),
         }
     }
 
@@ -175,8 +178,16 @@ impl NetworkRuntime {
         self.packet_wake.rule(catalog, request, &self.ports)
     }
 
-    pub(crate) fn poll_packet_wake(&mut self, catalog: &mut Catalog) -> Result<()> {
+    pub(crate) fn poll(&mut self, catalog: &mut Catalog) -> Result<()> {
+        self.peering.refresh(catalog, &self.routers, &self.ports);
         self.packet_wake.poll(catalog, &self.ports)
+    }
+
+    pub(crate) fn peering_status(&self, request: &Request) -> Result<serde_json::Value> {
+        if request.payload != serde_json::json!({}) {
+            return Err(Fault::invalid("private network peering query requires an empty payload"));
+        }
+        Ok(self.peering.status())
     }
 
     pub(crate) fn activity(&self,catalog:&Catalog,execution:&Execution)->Result<serde_json::Value> {
@@ -325,6 +336,7 @@ impl NetworkRuntime {
             catalog.record_quarantined_tap(&operation, &hex::encode(lease_id), &descriptor)?;
         self.packet_wake.replaced_port(&data.attachment_id);
         self.ports.insert(data.attachment_id, port);
+        self.peering.refresh(catalog, &self.routers, &self.ports);
         Ok(lease)
     }
 

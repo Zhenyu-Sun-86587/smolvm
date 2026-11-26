@@ -46,6 +46,9 @@ enum Command {
         socket_gid: Option<u32>,
         #[arg(long)]
         admin_uid: Option<u32>,
+        /// Read the operator's optional PrivateNetworkPeering/1 JSON policy.
+        #[arg(long)]
+        private_network_peering_config: Option<PathBuf>,
     },
     Call {
         #[arg(long)]
@@ -1002,6 +1005,7 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            "QueryPrivateNetworkPeering" => self.network.peering_status(request),
             crate::managed_retirement::METHOD => {
                 Ok(json!(crate::managed_retirement::submit(&mut self.catalog, request)?))
             }
@@ -2484,6 +2488,7 @@ fn serve(
     socket_path: &Path,
     socket_gid: Option<u32>,
     admin_uid: Option<u32>,
+    private_network_peering_config: Option<PathBuf>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     crate::worker_scope::configured_slice()?;
     check_socket_parent(socket_path)?;
@@ -2522,7 +2527,10 @@ fn serve(
         executions: HashMap::new(),
         reserved: HashMap::new(),
         escrow: Escrow::default(),
-        network: crate::network_runtime::NetworkRuntime::new(network_namespaces),
+        network: crate::network_runtime::NetworkRuntime::new(
+            network_namespaces,
+            private_network_peering_config,
+        ),
         activation: ActivationRuntime::default(),
         statepoints: StatePoints::new(statepoints),
         forks: Default::default(),
@@ -2562,7 +2570,7 @@ fn serve(
             if let Err(error) = worker.reconcile_managed_cpu_limits() {
                 eprintln!("resourced managed CPU limit recovery: {error}");
             }
-            if let Err(error) = worker.network.poll_packet_wake(&mut worker.catalog) {
+            if let Err(error) = worker.network.poll(&mut worker.catalog) {
                 eprintln!("resourced private packet wake: {error}");
             }
             if let Err(error) = worker.resize.tick(&mut worker.catalog, &worker.boot) {
@@ -2680,7 +2688,14 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             socket,
             socket_gid,
             admin_uid,
-        } => serve(&state_dir, &socket, socket_gid, admin_uid),
+            private_network_peering_config,
+        } => serve(
+            &state_dir,
+            &socket,
+            socket_gid,
+            admin_uid,
+            private_network_peering_config,
+        ),
         Command::RecoverBackupClosure {archive,manifest_digest,bundle_digest,state_reader_id,output,bundle_manifest,executable_sha256} => {
             let registered_bundle=bundle_manifest.as_deref().zip(executable_sha256.as_deref());
             let receipt = crate::backup_closure::restore(&archive, &manifest_digest, &bundle_digest, &state_reader_id, output.as_deref(),registered_bundle)?;
