@@ -406,6 +406,13 @@ pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<O
         }
         return c.begin(r, "launch");
     }
+    let (epoch, incarnation, active) = crate::catalog::binding(&c.db, route, &expected.instance_id)?;
+    if epoch != expected.execution_epoch || incarnation.is_some() {
+        return Err(Fault::new("E_STALE_EXECUTION", "managed launch binding changed"));
+    }
+    if active.is_some() {
+        return Err(Fault::new("E_OPERATION_IN_PROGRESS", "this instance already has an active operation"));
+    }
     let devices = machine.devices(c, id, route, bundle, expected)?;
     if let Some(network) = &machine.network {
         c.register_private_network(&crate::network_catalog::RegisterNetwork {

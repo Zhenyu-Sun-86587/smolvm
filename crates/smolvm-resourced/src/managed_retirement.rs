@@ -172,6 +172,9 @@ fn drive(catalog: &mut Catalog, objects: &File, operation: &Operation) -> Result
         JOIN resources r USING(resource_id) WHERE r.immutable=1 AND r.state IN ('available','deleting')
         AND json_extract(b.spec_json,'$.volume_id') IN (SELECT json_extract(value,'$.volume_id') FROM json_each(?2))",
         params![id, encoded])?;
+    // Sealing pins each converted disk under this operation until the binding
+    // retires. The resource graph still retains every independent consumer.
+    tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='operation' AND owner_id=? AND state='active'", [id])?;
     tx.execute("DELETE FROM instance_bindings WHERE route_id=? AND instance_id=? AND active_operation_id=?",
         params![route, expected.instance_id, id])?;
     tx.execute("UPDATE operations SET phase='COMPLETED',revision=revision+1 WHERE operation_id=? AND phase='NEW'", [id])?;
@@ -224,4 +227,52 @@ pub(crate) fn reconcile(catalog: &mut Catalog, objects: &File) -> Result<()> {
         catalog.db.execute("DELETE FROM retired_instance_blocks WHERE resource_id=?", [&resource])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_retirement_recovers_original_receipt_and_fences_wake() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.sqlite");
+        let objects = File::open(directory.path()).unwrap();
+        let bundle = format!("sha256:{}", "1".repeat(64));
+        let request = Request {
+            protocol: crate::ipc::PROTOCOL.into(),
+            method: METHOD.into(),
+            request_id: "retire-empty".into(),
+            operation_id: Some("retire-empty".into()),
+            request_digest: Some(format!("sha256:{}", "2".repeat(64))),
+            route_id: Some("deep".into()),
+            bundle_digest: Some(bundle.clone()),
+            expected: Some(Expected {
+                instance_id: crate::managed::machine_id(&"a".repeat(32), "empty"),
+                incarnation_id: None,
+                execution_epoch: 0,
+            }),
+            fd_table: Vec::new(),
+            payload: json!({"name":"empty"}),
+        };
+        let mut first = Catalog::open(&path, "boot", "worker-before-restart").unwrap();
+        first.register_bundle(&bundle, &bundle).unwrap();
+        let accepted = submit(&mut first, &request).unwrap();
+        assert_eq!(accepted.phase, "NEW");
+        drop(first);
+
+        let mut recovered = Catalog::open(&path, "boot", "worker-after-restart").unwrap();
+        assert_eq!(recovered.ready().unwrap_err().code, "E_RECOVERING");
+        reconcile(&mut recovered, &objects).unwrap();
+        recovered.complete_recovery("worker-after-restart").unwrap();
+        let receipt = submit(&mut recovered, &request).unwrap();
+        assert_eq!(receipt.operation_id, accepted.operation_id);
+        assert_eq!(receipt.phase, "COMPLETED");
+        assert_eq!(receipt.revision, 2);
+
+        let mut wake = request.derived("RequestWake", json!({}));
+        wake.operation_id = Some("wake-deleted-slot".into());
+        assert_eq!(crate::lifecycle_controller::handle(&mut recovered, &wake).unwrap_err().code, "E_STALE_EXECUTION");
+        assert_eq!(recovered.begin(&wake, "launch").unwrap_err().code, "E_STALE_EXECUTION");
+    }
 }
