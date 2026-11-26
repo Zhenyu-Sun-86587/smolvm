@@ -1,7 +1,9 @@
 //! Bounded transfer methods for the System Agent's VM filesystem.
 
+use std::fs::{File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{fchown, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use smolvm_protocol::{
@@ -23,6 +25,7 @@ static SLOTS: std::sync::LazyLock<ConnectionSemaphore> =
 
 pub(super) struct Upload {
     file: WriteSession,
+    _staging: tempfile::TempDir,
     _permit: ConnectionPermit,
 }
 
@@ -152,9 +155,9 @@ fn download(
     send_data_eof(stream)
 }
 
-fn ensure_regular_destination(path: &Path) -> Result<(), AgentResponse> {
+fn regular_destination(path: &Path) -> Result<Option<Metadata>, AgentResponse> {
     match path.symlink_metadata() {
-        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
         Ok(_) => Err(AgentResponse::error(
             format!(
                 "upload destination is not a regular file: {}",
@@ -162,7 +165,7 @@ fn ensure_regular_destination(path: &Path) -> Result<(), AgentResponse> {
             ),
             error_codes::FILE_IO_FAILED,
         )),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(io_error(
             format!("could not inspect {}", path.display()),
             err,
@@ -178,24 +181,66 @@ fn begin(path: String, total_size: u64) -> Result<Upload, AgentResponse> {
         ));
     }
     let permit = slot()?;
-    let destination = Path::new(&path);
-    ensure_regular_destination(destination)?;
-    // The parent must already exist. Before commit only the staging file is
-    // allowed to change, and closing the stream drops it.
-    let file = WriteSession::open(
-        path.clone(),
-        Some(destination.to_path_buf()),
-        None,
-        None,
-        None,
+    let destination = Path::new(&path).to_path_buf();
+    regular_destination(&destination)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| invalid("System upload destination requires a parent directory"))?;
+    // Keep the staging inode in a private directory on the destination
+    // filesystem. Applying final ownership and mode cannot expose staged data.
+    let staging = tempfile::Builder::new()
+        .prefix(".smolvm-upload.")
+        .permissions(Permissions::from_mode(0o700))
+        .tempdir_in(parent)
+        .map_err(|err| io_error(format!("could not stage upload to {path}"), err))?;
+    let tmp_path = staging.path().join("data");
+    let tmp_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp_path)
+        .map_err(|err| io_error(format!("could not stage upload to {path}"), err))?;
+    let file = WriteSession {
+        guest_path: path,
+        target: Some(destination),
+        tmp_path,
+        tmp_file,
+        mode: None,
+        uid: None,
+        gid: None,
+        bytes_written: 0,
         total_size,
-        io_target::IoRoot::Vm,
-    )
-    .map_err(|err| io_error(format!("could not stage upload to {path}"), err))?;
+        root: io_target::IoRoot::Vm,
+    };
     Ok(Upload {
         file,
+        _staging: staging,
         _permit: permit,
     })
+}
+
+fn prepare_permissions(file: &File, destination: &Path) -> Result<(), AgentResponse> {
+    let metadata_error = |err| {
+        io_error(
+            format!("could not apply permissions for {}", destination.display()),
+            err,
+        )
+    };
+    let mut mode = 0o600;
+    if let Some(target) = regular_destination(destination)? {
+        let staged = file.metadata().map_err(metadata_error)?;
+        let uid = (staged.uid() != target.uid()).then(|| target.uid());
+        let gid = (staged.gid() != target.gid()).then(|| target.gid());
+        if uid.is_some() || gid.is_some() {
+            fchown(file, uid, gid).map_err(metadata_error)?;
+        }
+        // Preserve access and execute bits. A replacement cannot inherit
+        // privileged execution bits from the prior contents.
+        mode = target.mode() & 0o777;
+    }
+    file.set_permissions(Permissions::from_mode(mode))
+        .map_err(metadata_error)?;
+    file.sync_all().map_err(metadata_error)
 }
 
 fn write(
@@ -211,15 +256,15 @@ fn write(
         }
         let client = stream.as_raw_fd();
         return with_keepalive(stream, FILE_FINALIZE_KEEPALIVE, move || {
-            let target = staged.file.guest_path.clone();
-            let response = staged.file.finalize_checked(|| {
+            let response = staged.file.finalize_checked(|file, target| {
+                prepare_permissions(file, target)?;
                 if process::is_peer_closed(client) {
                     return Err(AgentResponse::error(
                         "System file client disconnected before commit",
                         error_codes::FILE_IO_FAILED,
                     ));
                 }
-                ensure_regular_destination(Path::new(&target))
+                Ok(())
             });
             match response {
                 AgentResponse::Ok { .. } => AgentResponse::ok_with_data(
@@ -356,6 +401,81 @@ mod tests {
             }
         }
         assert_eq!(downloaded, data);
+        drop(host);
+        agent.join().unwrap();
+    }
+
+    #[test]
+    fn system_transfer_stages_privately_and_preserves_ordinary_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut host, agent) = connect();
+        for (name, original_mode, final_mode) in [
+            ("private", Some(0o600), 0o600),
+            ("program", Some(0o6751), 0o751),
+            ("new", None, 0o600),
+        ] {
+            let target = directory.path().join(name);
+            let original_owner = original_mode.map(|mode| {
+                std::fs::write(&target, b"old").unwrap();
+                if target.metadata().unwrap().uid() == 0 {
+                    std::os::unix::fs::chown(&target, Some(65534), Some(65534)).unwrap();
+                }
+                std::fs::set_permissions(&target, Permissions::from_mode(mode)).unwrap();
+                let metadata = target.metadata().unwrap();
+                (metadata.uid(), metadata.gid())
+            });
+
+            send(
+                &mut host,
+                &begin_request(target.to_string_lossy().into_owned(), 1),
+            );
+            assert!(matches!(receive(&mut host), AgentResponse::Ok { .. }));
+            send(
+                &mut host,
+                &AgentRequest::FileWriteChunk {
+                    data: vec![42],
+                    done: false,
+                },
+            );
+            assert!(matches!(receive(&mut host), AgentResponse::Ok { .. }));
+
+            let staging = std::fs::read_dir(directory.path())
+                .unwrap()
+                .find_map(|entry| {
+                    let entry = entry.unwrap();
+                    entry.file_type().unwrap().is_dir().then(|| entry.path())
+                })
+                .unwrap();
+            assert_eq!(staging.metadata().unwrap().mode() & 0o777, 0o700);
+            assert_eq!(
+                staging.join("data").metadata().unwrap().mode() & 0o777,
+                0o600
+            );
+            if original_mode.is_some() {
+                assert_eq!(std::fs::read(&target).unwrap(), b"old");
+            } else {
+                assert!(!target.exists());
+            }
+
+            send(
+                &mut host,
+                &AgentRequest::FileWriteChunk {
+                    data: vec![],
+                    done: true,
+                },
+            );
+            assert!(matches!(
+                receive(&mut host),
+                AgentResponse::Ok { data: Some(receipt) } if receipt["bytes_written"] == 1
+            ));
+            assert!(!staging.exists());
+            assert_eq!(std::fs::read(&target).unwrap(), [42]);
+            let metadata = target.metadata().unwrap();
+            assert_eq!(metadata.mode() & 0o7777, final_mode);
+            if let Some(owner) = original_owner {
+                assert_eq!((metadata.uid(), metadata.gid()), owner);
+            }
+        }
         drop(host);
         agent.join().unwrap();
     }

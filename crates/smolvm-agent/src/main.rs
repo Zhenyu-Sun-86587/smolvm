@@ -4017,12 +4017,12 @@ impl WriteSession {
     /// to close the handle first; it drops naturally when this
     /// function returns via the by-value caller pattern.
     fn finalize(&mut self) -> AgentResponse {
-        self.finalize_checked(|| Ok(()))
+        self.finalize_checked(|_, _| Ok(()))
     }
 
     fn finalize_checked(
         &mut self,
-        before_rename: impl FnOnce() -> Result<(), AgentResponse>,
+        before_rename: impl FnOnce(&std::fs::File, &std::path::Path) -> Result<(), AgentResponse>,
     ) -> AgentResponse {
         if self.bytes_written != self.total_size {
             return AgentResponse::error(
@@ -4106,7 +4106,7 @@ impl WriteSession {
                 path
             }
         };
-        if let Err(resp) = before_rename() {
+        if let Err(resp) = before_rename(&self.tmp_file, &target) {
             return resp;
         }
         // Disarm Drop before rename; if the rename fails we'll
