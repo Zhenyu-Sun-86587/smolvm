@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 #[path = "live_recovery.rs"]
 mod live_recovery;
 
+#[path = "managed_cpu_limits.rs"]
+mod managed_cpu_limits;
+pub(crate) use managed_cpu_limits::abort_cpu_limits_for_exit;
+
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -1343,6 +1347,8 @@ impl Worker {
             }
             "IssueLaunchPermit" => self.issue_permit(request),
             "QueryExecution" => Ok(json!(self.scoped_execution(request)?)),
+            "SetManagedCPULimit" => self.set_managed_cpu_limit(request),
+            "QueryManagedCPULimit" => self.query_managed_cpu_limit(request),
             "FinalizeExecutionExit" => self.finalize_execution(request),
             "CompleteRecovery" => {
                 let session: Session = request.payload()?;
@@ -1545,6 +1551,7 @@ impl Worker {
             &self.catalog.bundle(bundle)?,
         )?;
         self.verify_execution_scope(&op.operation_id, peer.pid)?;
+        self.restore_managed_cpu_limit(&op, peer.pid, permit.start, &permit.pidfd)?;
         let execution = self.catalog.register_execution(
             &op,
             NewExecution {
@@ -2415,6 +2422,9 @@ fn serve(
         if Instant::now() >= next_stop_check {
             if let Err(error) = worker.recover_live_descriptors() {
                 eprintln!("resourced native recovery: {error}");
+            }
+            if let Err(error) = worker.reconcile_managed_cpu_limits() {
+                eprintln!("resourced managed CPU limit recovery: {error}");
             }
             if let Err(error) = worker.network.poll_packet_wake(&mut worker.catalog) {
                 eprintln!("resourced private packet wake: {error}");

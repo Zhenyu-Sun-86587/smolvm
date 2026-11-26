@@ -14,6 +14,11 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
+#[cfg(test)]
+use smolvm_runtime_protocol::cpu_quota::cpu_max_quota_us;
+#[cfg(any(target_os = "linux", test))]
+use smolvm_runtime_protocol::cpu_quota::{cpu_max_line, cpu_max_matches};
+
 /// Portable process-id type. On Unix this is `libc::pid_t`; on Windows there is
 /// no POSIX `pid_t`, so we use `i32` (process IDs there are `u32` but `i32`
 /// matches the existing signatures and the sentinel `-1` values used here).
@@ -489,9 +494,6 @@ pub fn set_dumpable(_dumpable: bool) {}
 // tenant), and on Linux they degrade to "uncapped but still booting" whenever
 // cgroup v2 isn't delegated to us, since hardening must never block boot.
 // ============================================================================
-
-/// CPU accounting period for `cpu.max` (cgroup v2 default, 100 ms).
-const CGROUP_CPU_PERIOD_US: u64 = 100_000;
 
 /// Cap on host tasks (threads/processes) a single VMM may spawn. Guest processes
 /// run *inside* the VM and are not host tasks, so the VMM itself needs only a few
@@ -973,35 +975,6 @@ pub fn set_managed_vmm_cpu_count(
     set_managed_vmm_cpu_quota(machine, pid, started, u64::from(cpus) * 1_000_000)
 }
 
-/// The `cpu.max` quota, per `period_us`, that grants `usec_per_sec` of CPU
-/// time per second. The kernel refuses a quota under 1 ms, so it never goes
-/// below that; [`cpu_max_period_us`] picks a period long enough that the floor
-/// does not raise the grant.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn cpu_max_quota_us(usec_per_sec: u64, period_us: u64) -> u64 {
-    (usec_per_sec.saturating_mul(period_us) / 1_000_000).max(1_000)
-}
-
-/// The `cpu.max` period for a grant of `usec_per_sec`: the 100 ms default, or
-/// longer (up to the kernel's 1 s maximum) when 1 ms per 100 ms would grant
-/// more than asked, as systemd stretches it for `CPUQuotaPerSecUSec`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn cpu_max_period_us(usec_per_sec: u64) -> u64 {
-    const DEFAULT: u64 = CGROUP_CPU_PERIOD_US;
-    const MAX: u64 = 1_000_000;
-    if usec_per_sec == 0 || usec_per_sec.saturating_mul(DEFAULT) / 1_000_000 >= 1_000 {
-        return DEFAULT;
-    }
-    (1_000u64 * 1_000_000).div_ceil(usec_per_sec).min(MAX)
-}
-
-/// The `cpu.max` contents granting `usec_per_sec` of CPU per second.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn cpu_max_line(usec_per_sec: u64) -> String {
-    let period = cpu_max_period_us(usec_per_sec);
-    format!("{} {period}", cpu_max_quota_us(usec_per_sec, period))
-}
-
 /// Set a verified VMM's own CPU quota to `usec_per_sec` of CPU time per
 /// second across all its threads (1_000_000 = one CPU), never a shared
 /// enclosing cgroup. The guest is not told: its vCPUs stay online and simply
@@ -1041,22 +1014,6 @@ pub fn set_managed_vmm_cpu_quota(
         ));
     }
     Ok(true)
-}
-
-/// Whether a `cpu.max` line grants exactly `usec_per_sec` per second, at
-/// whatever period it uses.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn cpu_max_matches(cpu_max: &str, usec_per_sec: u64) -> bool {
-    let values: Vec<_> = cpu_max.split_whitespace().collect();
-    match values.as_slice() {
-        [quota, period] => match (quota.parse::<u64>(), period.parse::<u64>()) {
-            (Ok(quota), Ok(period)) if period > 0 => {
-                cpu_max_quota_us(usec_per_sec, period) == quota
-            }
-            _ => false,
-        },
-        _ => false,
-    }
 }
 
 #[cfg(not(target_os = "linux"))]

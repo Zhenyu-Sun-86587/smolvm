@@ -249,9 +249,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_batch_admission.sql"))?;
                 tx.execute_batch(include_str!("schema_packet_datagrams.sql"))?;
                 tx.execute_batch(include_str!("schema_backup_imports.sql"))?;
-                tx.execute_batch("PRAGMA user_version=22")?;
+                tx.execute_batch(include_str!("schema_managed_cpu_limits.sql"))?;
+                tx.execute_batch("PRAGMA user_version=23")?;
             }
-            1..=22 => {
+            1..=23 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -316,7 +317,10 @@ impl Catalog {
                 }
                 if version < 22 {
                     tx.execute_batch(include_str!("schema_backup_imports.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=22")?;
+                }
+                if version < 23 {
+                    tx.execute_batch(include_str!("schema_managed_cpu_limits.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=23")?;
                 }
                 crate::packet_wake::recover(&tx)?;
                 crate::lifecycle_controller::recover(&tx)?;
@@ -595,6 +599,12 @@ impl Catalog {
             ));
         }
         let mut operation = self.matching_operation(r)?;
+        if operation.kind == "managed_cpu_limit" {
+            return Err(conflict(
+                "E_OPERATION_HAS_EFFECTS",
+                "the Worker owns the managed CPU limit outcome",
+            ));
+        }
         if matches!(operation.kind.as_str(), "independent_fork" | "fork_batch" | "vm_snapshot" | "hibernate" | "vm_rollback") {
             return Err(conflict(
                 "E_OPERATION_HAS_EFFECTS",
@@ -875,6 +885,7 @@ impl Catalog {
             [id],
         )?;
         crate::managed_fork::source_exited(&tx,id)?;
+        crate::worker::abort_cpu_limits_for_exit(&tx, id)?;
         tx.execute("UPDATE lifecycle_protections SET state='released',reason='execution fenced',revision=revision+1
             WHERE incarnation_id=? AND kind IN ('hold','lease') AND state IN ('suspect','active')",[id])?;
         tx.execute("UPDATE managed_budget_holds SET state='released' WHERE incarnation_id=? AND state='running'",[id])?;

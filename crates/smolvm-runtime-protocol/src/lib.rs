@@ -4,6 +4,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+pub mod cpu_quota;
+
 /// Systemd scope shared by the Serve that launches a managed VMM and the
 /// Worker that verifies its process and accounts for its resources.
 pub fn managed_scope_name(serve: &str, machine: &str) -> String {
