@@ -167,6 +167,10 @@ pub fn worker_operations_router(socket: std::path::PathBuf) -> axum::Router {
             axum::routing::get(inventory),
         )
         .route(
+            "/api/v1/runtime-ext/v1/instances/{id}/resources",
+            axum::routing::post(native_resources),
+        )
+        .route(
             "/api/v1/runtime-ext/v1/machines/{name}/execution",
             axum::routing::get(machine_execution),
         )
@@ -354,6 +358,9 @@ async fn submit(
             launch::ensure_binding(client, &input.expected.instance_id)?;
             return client.submit_state_restore(&input);
         }
+        if input.kind == "resize_resources" {
+            return client.submit_resize(&input);
+        }
         client.submit(&input)
     })
     .await
@@ -391,6 +398,31 @@ async fn inventory(
         client.inventory(&client.binding(&id)?.expected())
     })
     .await
+}
+
+#[cfg(feature = "deep-runtime")]
+async fn native_resources(
+    axum::extract::State(socket): axum::extract::State<std::path::PathBuf>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(input): Json<NativeResources>,
+) -> axum::response::Response {
+    native(socket, move |client| {
+        if input.expected.instance_id != id {
+            return Err(smolvm_resourced::client::QueryError {
+                code: "E_INVALID_REQUEST".into(),
+                message: "resource query refers to another instance".into(),
+            });
+        }
+        launch::require_own(&id)?;
+        client.native_resources(&input.expected)
+    }).await
+}
+
+#[cfg(feature = "deep-runtime")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeResources {
+    expected: smolvm_resourced::native_client::ExecutionRef,
 }
 
 #[cfg(all(target_os = "linux", feature = "deep-runtime"))]

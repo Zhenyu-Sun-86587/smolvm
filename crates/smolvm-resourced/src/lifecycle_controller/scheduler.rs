@@ -65,7 +65,8 @@ fn idle_deadlines(m: &Machine, observed: &Observation, since: i64) -> (Option<i6
 fn can_save(db: &Connection, expected: &Expected, unreserved_bytes: u64) -> Result<bool> {
     let memory: Option<u32> = db
         .query_row(
-            "SELECT memory_mib FROM managed_launches WHERE incarnation_id=?",
+            "SELECT memory_mib FROM managed_launches WHERE incarnation_id=?
+             AND coalesce(json_extract(spec_json,'$.live_compute_growth'),0)=0",
             [&expected.incarnation_id],
             |r| r.get(0),
         )
@@ -221,6 +222,7 @@ pub(super) fn status(c: &Catalog, expected: &Expected) -> Result<Value> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
+    let balloon = crate::resource_resize::pressure_hint::latest(&c.db)?;
     let collectors = {
         let mut query=c.db.prepare("SELECT collector,session,seq,valid_until FROM lifecycle_reports WHERE instance_id=? AND incarnation_id=?")?;
         let rows=query.query_map(params![expected.instance_id,expected.incarnation_id],|r|Ok((r.get::<_,String>(0)?,json!({"session":r.get::<_,String>(1)?,"seq":r.get::<_,i64>(2)?,"fresh":r.get::<_,i64>(3)?>=now}))))?.collect::<rusqlite::Result<BTreeMap<_,_>>>()?;
@@ -230,7 +232,7 @@ pub(super) fn status(c: &Catalog, expected: &Expected) -> Result<Value> {
         json!({"collectors":collectors,"instance_id":expected.instance_id,"incarnation_id":expected.incarnation_id,"execution_epoch":expected.execution_epoch,
         "binding_revision":protections::revision(expected)?,"power":o.power,"statepoint":m.saved(&c.db)?,"applied_revision":m.rev,"effective_policy":m.policy,"activity_seq":m.seq,
         "blockers":o.blockers,"controlled_suspended":o.gate.is_some() && o.gate==m.freeze_session && m.freeze==Some(m.seq),"idle_ms":m.idle.map(|v|now.saturating_sub(v)),
-        "last_decision":decision,"next_action":next,"pressure":pressure.map(|(held,raw)|json!({"admission_throttled":held,"sample":serde_json::from_str::<Value>(&raw).ok()}))}),
+        "last_decision":decision,"next_action":next,"pressure":pressure.map(|(held,raw)|json!({"admission_throttled":held,"sample":serde_json::from_str::<Value>(&raw).ok(),"last_balloon":balloon}))}),
     )
 }
 struct Decision {
@@ -404,6 +406,11 @@ fn step(
     if invalidated {
         c.db.execute("UPDATE lifecycle_decisions SET stage='cancelled',finished_at=?,error='evidence changed before dispatch' WHERE id=?",params![wall()?,d.id])?;
         c.db.execute("UPDATE lifecycle_protections SET wake_operation=NULL,revision=revision+1 WHERE wake_operation=? AND kind='wake' AND state='pending'",[&d.id])?;
+        return Ok(());
+    }
+    if d.origin == "pressure" && d.kind == "hibernate"
+        && crate::resource_resize::pressure_hint::before_hibernate(c, boot, &d.expected, &d.id)?
+    {
         return Ok(());
     }
     if d.stage == "queued" {

@@ -189,6 +189,7 @@ struct Worker {
     statepoints: StatePoints,
     forks: crate::managed_fork::Actor,
     lifecycle:crate::lifecycle_controller::Controller,
+    resize: crate::resource_resize::Controller,
 }
 
 struct Reply {
@@ -957,6 +958,14 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            "QueryNativeResources" => {
+                if request.payload != json!({}) {
+                    return Err(Fault::invalid("native resource query requires an empty payload"));
+                }
+                crate::resource_resize::query(&self.catalog, &self.boot, request)
+            }
+            "SubmitNativeResize" => crate::resource_resize::submit(&mut self.catalog, &self.boot, request)
+                .map(|receipt| json!(receipt)),
             "ApplyPrivatePacketWakeRule" | "QueryPrivatePacketWakeRule" | "QueryPrivatePacketWakeEndpoint" =>
                 self.network.packet_rule(&mut self.catalog, request),
             "QueryLifecycleEvents"|"ApplyLifecyclePolicy"|"GetLifecycleStatus"|"ReportActivity"|"AcquireActivityHold"|"ReleaseActivityHold"|"AcquireRunningLease"|"RenewRunningLease"|
@@ -2396,6 +2405,7 @@ fn serve(
         statepoints: StatePoints::new(statepoints),
         forks: Default::default(),
         lifecycle: Default::default(),
+        resize: Default::default(),
     };
     worker
         .reconnect_native_endpoints()
@@ -2428,6 +2438,9 @@ fn serve(
             }
             if let Err(error) = worker.network.poll_packet_wake(&mut worker.catalog) {
                 eprintln!("resourced private packet wake: {error}");
+            }
+            if let Err(error) = worker.resize.tick(&mut worker.catalog, &worker.boot) {
+                eprintln!("resourced live resize: {error}");
             }
             if let Err(e)=worker.lifecycle.tick(&mut worker.catalog,&worker.boot) {
                 eprintln!("resourced lifecycle controller: {} {}",e.code,e.message);

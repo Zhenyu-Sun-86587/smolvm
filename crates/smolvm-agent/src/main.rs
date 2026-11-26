@@ -2566,14 +2566,19 @@ fn handle_connection(
                     capabilities: vec![
                         "system-service-v1".to_owned(),
                         smolvm_protocol::SYSTEM_FILE_WRITE_CAPABILITY.to_owned(),
+                        smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_owned(),
+                        smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY.to_owned(),
+                        smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY.to_owned(),
                     ],
                 },
-                request @ AgentRequest::VmExec {
+                request @ (AgentRequest::VmExec {
                     background: false,
                     interactive: false,
                     tty: false,
                     ..
-                } => {
+                } | AgentRequest::OnlineCpus { .. }
+                  | AgentRequest::OfflineCpus { .. }
+                  | AgentRequest::OnlineMemory { .. }) => {
                     let _permit = WORK_SLOTS.acquire();
                     handle_request(request, Some(stream.as_raw_fd()))
                 }

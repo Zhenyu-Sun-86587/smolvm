@@ -305,6 +305,13 @@ impl Client<'_> {
             _ => Err(fault("E_PROTOCOL_UNSUPPORTED", "invalid Worker result")),
         }
     }
+    pub fn native_resources(&self, expected: &ExecutionRef) -> Result<Value, QueryError> {
+        self.call("QueryNativeResources", Some(expected), None, empty())
+    }
+    pub fn submit_resize(&self, input: &Submission) -> Result<OperationReceipt, QueryError> {
+        self.recover_and_retry(|| self.receipt("SubmitNativeResize", &input.operation_id,
+            &input.request_digest, &input.expected, input.parameters.clone()))
+    }
     pub fn submit_fork(&self, input: &Submission) -> Result<OperationReceipt, QueryError> {
         self.recover_and_retry(|| {
             self.receipt(

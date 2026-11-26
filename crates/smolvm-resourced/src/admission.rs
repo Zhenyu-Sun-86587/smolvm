@@ -107,13 +107,7 @@ pub(crate) fn require_capture_space(db: &Connection, memory_mib: u64) -> Result<
     Ok(())
 }
 
-/// The caller owns the immediate admission transaction, including all batch children.
-pub(crate) fn reserve(
-    db: &rusqlite::Transaction<'_>,
-    operation: &str,
-    instance: &str,
-    request: Capacity,
-) -> Result<()> {
+fn check_room(db: &rusqlite::Transaction<'_>, request: Capacity) -> Result<()> {
     crate::lifecycle_controller::check_admission(db,request.memory_mib)?;
     let limit = limits(db)?;
     let allocated = used(db)?;
@@ -138,7 +132,50 @@ pub(crate) fn reserve(
             )));
         }
     }
+    Ok(())
+}
+
+/// The caller owns the immediate admission transaction, including all batch children.
+pub(crate) fn reserve(
+    db: &rusqlite::Transaction<'_>,
+    operation: &str,
+    instance: &str,
+    request: Capacity,
+) -> Result<()> {
+    check_room(db, request)?;
     db.execute("INSERT INTO managed_budget_holds(operation_id,instance_id,vcpus,memory_mib,storage_bytes,state)VALUES(?,?,?,?,?,'reserved')",
         params![operation,instance,i64::try_from(request.vcpus).map_err(unavailable)?,i64::try_from(request.memory_mib).map_err(unavailable)?,i64::try_from(request.storage_bytes).map_err(unavailable)?])?;
+    Ok(())
+}
+
+pub(crate) fn reserve_live_growth(
+    tx: &rusqlite::Transaction<'_>,
+    execution: &crate::catalog::Execution,
+    target_cpus: u64,
+    target_memory: u64,
+) -> Result<()> {
+    if target_cpus == 0 && target_memory == 0 {
+        return Ok(());
+    }
+    let (held_cpus, held_memory): (u32, u32) = tx.query_row(
+        "SELECT vcpus,memory_mib FROM managed_budget_holds
+         WHERE incarnation_id=? AND instance_id=? AND state='running'",
+        params![execution.incarnation_id,execution.instance_id],
+        |row| Ok((row.get(0)?,row.get(1)?)),
+    )?;
+    let request = Capacity {
+        vcpus: target_cpus.saturating_sub(u64::from(held_cpus)),
+        memory_mib: target_memory.saturating_sub(u64::from(held_memory)),
+        storage_bytes: 0,
+    };
+    if request.vcpus == 0 && request.memory_mib == 0 {
+        return Ok(());
+    }
+    check_room(tx, request)?;
+    tx.execute(
+        "UPDATE managed_budget_holds SET vcpus=max(vcpus,?),memory_mib=max(memory_mib,?)
+         WHERE incarnation_id=? AND instance_id=? AND state='running'",
+        params![target_cpus as i64,target_memory as i64,execution.incarnation_id,execution.instance_id],
+    )?;
     Ok(())
 }

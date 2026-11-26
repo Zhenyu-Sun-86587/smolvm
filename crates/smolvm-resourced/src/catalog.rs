@@ -32,6 +32,8 @@ pub struct Operation {
     pub statepoint: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resize: Option<Value>,
     pub phase: String,
     pub decision: String,
     pub revision: i64,
@@ -51,6 +53,7 @@ fn operation_row(row: &Row<'_>) -> rusqlite::Result<Operation> {
         execution: None,
         statepoint: None,
         fork: None,
+        resize: None,
         phase: row.get(8)?,
         decision: row.get(9)?,
         revision: row.get(10)?,
@@ -260,9 +263,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_packet_datagrams.sql"))?;
                 tx.execute_batch(include_str!("schema_backup_imports.sql"))?;
                 tx.execute_batch(include_str!("schema_managed_cpu_limits.sql"))?;
-                tx.execute_batch("PRAGMA user_version=23")?;
+                tx.execute_batch(include_str!("schema_native_resize.sql"))?;
+                tx.execute_batch("PRAGMA user_version=24")?;
             }
-            1..=23 => {
+            1..=24 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -331,6 +335,10 @@ impl Catalog {
                 if version < 23 {
                     tx.execute_batch(include_str!("schema_managed_cpu_limits.sql"))?;
                     tx.execute_batch("PRAGMA user_version=23")?;
+                }
+                if version < 24 {
+                    tx.execute_batch(include_str!("schema_native_resize.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=24")?;
                 }
                 crate::packet_wake::recover(&tx)?;
                 crate::lifecycle_controller::recover(&tx)?;
@@ -477,6 +485,9 @@ impl Catalog {
         }
         if operation.kind == "restore_target" {
             operation.statepoint = crate::managed_state_restore::receipt(self, &operation)?;
+        }
+        if operation.kind == crate::resource_resize::KIND {
+            operation.resize = crate::resource_resize::progress(&self.db, id)?;
         }
         Ok(operation)
     }
@@ -884,6 +895,7 @@ impl Catalog {
         )?;
         crate::managed_fork::source_exited(&tx,id)?;
         crate::worker::abort_cpu_limits_for_exit(&tx, id)?;
+        crate::resource_resize::execution_exited(&tx,id)?;
         tx.execute("UPDATE lifecycle_protections SET state='released',reason='execution fenced',revision=revision+1
             WHERE incarnation_id=? AND kind IN ('hold','lease') AND state IN ('suspect','active')",[id])?;
         tx.execute("UPDATE managed_budget_holds SET state='released' WHERE incarnation_id=? AND state='running'",[id])?;

@@ -184,6 +184,12 @@ impl KrunFunctions {
                 ._handle
                 .get::<Config>(b"krun_configure_worker_block_pivot_v1\0")
                 .map_err(|e| e.to_string())?;
+            if plan.machine.live_compute_growth && plan.restore.is_none() {
+                let resize = self
+                    .set_live_resize
+                    .ok_or("the installed VMM lacks the requested live compute geometry")?;
+                check("managed CPU and RAM hot-add", resize(ctx, 3))?;
+            }
             check("block set", attach(ctx, blocks.as_ptr(), blocks.len()))?;
             check(
                 "VM resources",
