@@ -641,7 +641,8 @@ pub(crate) fn exact_successors(
     id: &str,
     new_operation: Option<&str>,
 ) -> Result<Vec<VolumeHead>> {
-    if catalog.operation(id)?.kind == "statepoint" {
+    let source = catalog.operation(id)?;
+    if source.kind == "statepoint" {
         return Ok(Vec::new());
     }
     let pivot = catalog.writer_pivot(id)?.ok_or_else(missing)?;
@@ -657,12 +658,36 @@ pub(crate) fn exact_successors(
         catalog
             .volume_identity(&next)
             .map_err(|_| generation_mismatch())?;
+        // A restore can obtain its writers before the target Guest runs. BEGIN is
+        // recorded before the identity helper can write to the restored disk.
+        // Ignore a previous grant only after fencing that exact pre-BEGIN attempt.
         let advanced: bool = catalog.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM writer_sets s
             JOIN writer_grants g USING(operation_id) JOIN json_each(s.heads_json) h
             WHERE s.operation_id<>?1 AND (?2 IS NULL OR s.operation_id<>?2)
-                AND json_extract(h.value, '$.head_resource_id')=?3)",
-            params![id, new_operation, next.head_resource_id],
+                AND json_extract(h.value, '$.head_resource_id')=?3
+                AND NOT (
+                    s.state='released' AND g.state='released' AND EXISTS(
+                        SELECT 1 FROM managed_state_restores r
+                        JOIN statepoints p USING(capture_id)
+                        JOIN operations o ON o.operation_id=r.operation_id
+                        JOIN executions e ON e.incarnation_id=g.incarnation_id
+                            AND e.execution_epoch=g.execution_epoch AND e.last_operation_id=o.operation_id
+                        LEFT JOIN target_activations a ON a.operation_id=o.operation_id
+                        WHERE r.operation_id=s.operation_id AND p.operation_id=?1 AND r.mode='exact'
+                            AND o.kind='restore_target' AND o.phase='ABORTED' AND o.decision='ABORT'
+                            AND o.instance_id=?4 AND o.route_id=?5 AND o.bundle_digest=?6
+                            AND e.phase='exited' AND e.instance_id=o.instance_id
+                            AND e.route_id=o.route_id AND e.bundle_digest=o.bundle_digest
+                            AND (a.operation_id IS NULL OR (
+                                a.incarnation_id=e.incarnation_id AND a.execution_epoch=e.execution_epoch
+                                AND a.phase IN ('authority_prepared','offered','failed_held')
+                                AND a.decision='none' AND a.begin_revision IS NULL
+                                AND a.wire_digest IS NULL AND a.commit_revision IS NULL
+                            ))
+                    )
+                ))",
+            params![id, new_operation, next.head_resource_id, source.instance_id, source.route_id, source.bundle_digest],
             |row| row.get(0),
         )?;
         if advanced {
@@ -671,6 +696,68 @@ pub(crate) fn exact_successors(
         heads.push(next);
     }
     Ok(heads)
+}
+
+#[cfg(test)]
+#[test]
+fn exact_restore_retries_only_a_fenced_writer_that_never_entered_identity() {
+    let temporary = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(&temporary.path().join("catalog.sqlite"), "boot", "session").unwrap();
+    catalog.db.execute_batch(r#"
+        INSERT INTO runtime_bundles VALUES('bundle','reader',1);
+        INSERT INTO operations VALUES
+            ('launch','launch','digest','deep','machine','bundle',0,NULL,'COMPLETED','NONE',1),
+            ('hibernate','hibernate','digest','deep','machine','bundle',1,'source','COMPLETED','NONE',1),
+            ('restore','restore_target','digest','deep','machine','bundle',1,NULL,'ABORTED','ABORT',1);
+        INSERT INTO executions(incarnation_id,route_id,instance_id,execution_epoch,bundle_digest,host_boot_id,
+            pid,pid_start_time,uid,phase,last_operation_id) VALUES
+            ('source','deep','machine',1,'bundle','boot',10,10,1000,'exited','launch'),
+            ('target','deep','machine',2,'bundle','boot',20,20,1000,'exited','restore');
+        INSERT INTO resources VALUES
+            ('volatile','descriptor','lost','volatile',1,'{}','digest','hibernate',1),
+            ('head','block_head','available','durable',0,'{}','digest','hibernate',1);
+        INSERT INTO volume_heads VALUES('volume','head','inode:1:1');
+        INSERT INTO writer_sets VALUES
+            ('launch','[]','released',1),
+            ('restore','[{"volume_id":"volume","head_resource_id":"head"}]','released',1);
+        INSERT INTO writer_grants VALUES
+            ('old-grant','launch','source',1,'released',1),
+            ('target-grant','restore','target',2,'released',1);
+        INSERT INTO writer_pivots VALUES(
+            'hibernate','source',1,'old-grant','next-grant','token',
+            '{"previous_grant_id":"old-grant","previous_grant_revision":1,"next_grant_id":"next-grant",
+              "hold_token":"token","heads":[{"volume_id":"volume","head_resource_id":"captured","next_resource_id":"head"}]}',
+            'complete',1);
+        INSERT INTO statepoints VALUES(
+            'capture','representation','volatile','hibernate','source','{}','{}','hibernated','manifest',NULL,NULL,1);
+        INSERT INTO managed_state_restores(operation_id,capture_id,mode,volume_map_json)
+            VALUES('restore','capture','exact','{"volume":"volume"}');
+    "#).unwrap();
+
+    assert_eq!(exact_successors(&catalog, "hibernate", None).unwrap()[0].head_resource_id, "head");
+    catalog.db.execute_batch(
+        "INSERT INTO target_activations VALUES(
+         'restore','bundle','machine','target',2,'session','boot',printf('%064d',1),printf('%032d',1),
+         '{}',NULL,NULL,NULL,'failed_held','none',1,2)",
+    ).unwrap();
+    assert_eq!(exact_successors(&catalog, "hibernate", None).unwrap()[0].head_resource_id, "head");
+
+    for transition in [
+        "UPDATE executions SET phase='unknown' WHERE incarnation_id='target'",
+        "UPDATE writer_grants SET state='unknown' WHERE grant_id='target-grant'",
+        "UPDATE operations SET phase='COMPLETED',decision='NONE' WHERE operation_id='restore'",
+        "UPDATE target_activations SET begin_revision=1,wire_digest='frame'",
+        "UPDATE target_activations SET commit_revision=1,decision='commit'",
+    ] {
+        catalog.db.execute_batch("SAVEPOINT failure_case").unwrap();
+        catalog.db.execute_batch(transition).unwrap();
+        assert_eq!(
+            exact_successors(&catalog, "hibernate", None).err().unwrap().code,
+            "E_VOLUME_GENERATION_MISMATCH",
+            "{transition}"
+        );
+        catalog.db.execute_batch("ROLLBACK TO failure_case; RELEASE failure_case").unwrap();
+    }
 }
 
 pub(crate) fn require_capture_pivot(
