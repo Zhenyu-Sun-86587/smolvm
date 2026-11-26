@@ -838,9 +838,36 @@ impl Catalog {
         let grant = self
             .writer_grant(&plan.previous_grant_id)?
             .ok_or_else(missing)?;
+        // A broker restart changes the grant revision even when the source
+        // re-exports every original locked OFD. The native actor still holds the
+        // admitted command and must replay it unchanged.
+        let revision_matches = if grant.revision == plan.previous_grant_revision {
+            true
+        } else {
+            let destinations: Option<String> = self.db.query_row(
+                "SELECT json_extract(pivot_json,'$.destinations') FROM managed_fork_batches
+                 WHERE operation_id=? AND source_incarnation=? AND token=? AND stage='pivoting'
+                   AND source_released=0 AND json_extract(pivot_json,'$.next_grant_id')=?
+                   AND json_extract(pivot_json,'$.previous_grant_revision')=?
+                   AND json_extract(pivot_json,'$.reconciled_writer.id')=?
+                   AND json_extract(pivot_json,'$.reconciled_writer.revision')=?",
+                params![id, execution.incarnation_id, plan.hold_token, plan.next_grant_id,
+                        plan.previous_grant_revision, grant.grant_id, grant.revision],
+                |row| row.get(0),
+            ).optional()?;
+            destinations
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(raw).ok())
+                .is_some_and(|targets| {
+                    targets.len() == plan.heads.len()
+                        && plan.heads.iter().all(|head| {
+                            targets.get(&head.volume_id) == Some(&head.next_resource_id)
+                        })
+                })
+        };
         if !grant.belongs_to(&grant.operation_id, execution)
             || grant.state != "attached"
-            || grant.revision != plan.previous_grant_revision
+            || !revision_matches
         {
             return Err(fence_unproven(
                 "writer pivot does not hold the exact current writer grant",

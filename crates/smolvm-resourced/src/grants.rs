@@ -375,10 +375,35 @@ impl Catalog {
                 "writer grant revision changed",
             ));
         }
-        self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
             "UPDATE writer_grants SET state='attached',revision=revision+1 WHERE grant_id=?",
             [&grant.grant_id],
         )?;
+        if reconcile {
+            // ReconcileWriterSet proved the exact live OFD of every head before
+            // calling us. Preserve that proof only for a capture which admitted
+            // this writer before the broker restart and has yet to start its pivot.
+            tx.execute(
+                "UPDATE managed_fork_batches AS b
+                 SET pivot_json=json_set(pivot_json,'$.reconciled_writer',
+                     json_object('id',?1,'revision',?2+1))
+                 WHERE source_incarnation=?3 AND source_released=0 AND pivot_json IS NOT NULL
+                   AND coalesce(json_extract(pivot_json,'$.admitted_grant_id'),?1)=?1
+                   AND coalesce(json_extract(pivot_json,'$.reconciled_writer.id'),?1)=?1
+                   AND coalesce(json_extract(pivot_json,'$.reconciled_writer.revision'),
+                                json_extract(pivot_json,'$.previous_grant_revision'))=?2-1
+                   AND EXISTS (SELECT 1 FROM operations o WHERE o.operation_id=b.operation_id
+                               AND o.phase='NEW' AND o.expected_incarnation_id=?3 AND o.expected_execution_epoch=?4)
+                   AND NOT EXISTS (SELECT 1 FROM writer_pivots p WHERE p.operation_id=b.operation_id)
+                   AND NOT EXISTS (SELECT key FROM json_each(pivot_json,'$.destinations') EXCEPT
+                                   SELECT h.value->>'volume_id' FROM writer_sets s,json_each(s.heads_json) h WHERE s.operation_id=?5)
+                   AND NOT EXISTS (SELECT h.value->>'volume_id' FROM writer_sets s,json_each(s.heads_json) h WHERE s.operation_id=?5
+                                   EXCEPT SELECT key FROM json_each(pivot_json,'$.destinations'))",
+                params![grant.grant_id, grant.revision, grant.incarnation_id, grant.execution_epoch, grant.operation_id],
+            )?;
+        }
+        tx.commit()?;
         self.writer_grant(&grant.grant_id)?
             .ok_or_else(|| Fault::new("E_CATALOG", "writer grant disappeared"))
     }

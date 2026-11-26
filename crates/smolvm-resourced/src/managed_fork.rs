@@ -206,8 +206,9 @@ pub(crate) fn submit(
     }
     let pivot=grants.iter().next().map(|grant|->Result<String>{
         let previous=c.writer_grant(grant)?.ok_or_else(||conflict("missing current writer grant"))?;
-        if previous.incarnation_id!=incarnation || previous.state!="attached"{return Err(conflict("source writer epoch changed"))}
-        Ok(json!({"operation_id":id,"request_digest":r.operation()?.1,"previous_grant_revision":previous.revision,"next_grant_id":key(id,"grant",0),"destinations":dest}).to_string())
+        if previous.incarnation_id!=incarnation || previous.execution_epoch!=source.execution_epoch || previous.state!="attached"{return Err(conflict("source writer epoch changed"))}
+        Ok(json!({"operation_id":id,"request_digest":r.operation()?.1,"previous_grant_revision":previous.revision,
+            "admitted_grant_id":previous.grant_id,"next_grant_id":key(id,"grant",0),"destinations":dest}).to_string())
     }).transpose()?;
     let network = inv.devices.iter().any(|dev| dev["virtio_type"] == 1);
     let initial = if rollback { "restore_preflight" } else if inv.source_disposition == "STANDBY" {
@@ -462,7 +463,10 @@ impl Actor {
             }
         }
         let jobs = {
-            let mut q=c.db.prepare("SELECT operation_id,source_incarnation,capture_id,session,token,anchor,stage,original,network_gate,pivot_json,(SELECT kind FROM operations o WHERE o.operation_id=b.operation_id)
+            // Keep the original command stable across reconnects. The running
+            // VMM may already have accepted it even before the first catalog write.
+            let mut q=c.db.prepare("SELECT operation_id,source_incarnation,capture_id,session,token,anchor,stage,original,network_gate,
+                json_remove(pivot_json,'$.admitted_grant_id','$.reconciled_writer'),(SELECT kind FROM operations o WHERE o.operation_id=b.operation_id)
                 FROM managed_fork_batches b WHERE stage IN ('failure_return','cancel_preflight','children','cancel_gate','arming','parking','standby','holding','pivoting','source_return','waking')
                 OR (stage='exporting' AND EXISTS (SELECT 1 FROM operations o WHERE o.operation_id=b.operation_id AND o.kind IN ('independent_fork','fork_batch'))) ORDER BY rowid")?;
             let result = q

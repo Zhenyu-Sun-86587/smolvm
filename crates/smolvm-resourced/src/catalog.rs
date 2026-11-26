@@ -456,9 +456,39 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The managed Fork actor and its reserved children replay from the
+        // journal. Once the original VMM and its published RAM are accounted
+        // for, waiting for those operations to finish here would deadlock
+        // them on the same recovery barrier when they acquire resources.
         let outstanding: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM executions WHERE phase='unknown')
-                OR EXISTS (SELECT 1 FROM operations WHERE phase='NEW')
+            "WITH replayable_forks AS (
+                 SELECT b.operation_id,o.route_id,o.bundle_digest FROM managed_fork_batches b
+                 JOIN operations o USING(operation_id)
+                 JOIN executions e ON e.incarnation_id=b.source_incarnation
+                 JOIN native_endpoints n ON n.incarnation_id=e.incarnation_id
+                 LEFT JOIN fd_transfers f ON f.resource_id=b.capture_id
+                 LEFT JOIN resources r ON r.resource_id=f.resource_id
+                 WHERE o.kind IN ('independent_fork','fork_batch') AND o.phase='NEW'
+                   AND e.phase='registered' AND e.host_boot_id=(SELECT host_boot_id FROM worker_state)
+                   AND o.route_id=e.route_id AND o.bundle_digest=e.bundle_digest AND o.instance_id=e.instance_id
+                   AND o.expected_incarnation_id=e.incarnation_id AND o.expected_execution_epoch=e.execution_epoch
+                   AND ((b.checkpoint IS NULL AND f.resource_id IS NULL) OR
+                        (f.state='committed' AND r.state='available' AND f.incarnation_id=e.incarnation_id
+                         AND f.operation_id=o.operation_id))
+             ), replayable_operations AS (
+                 SELECT operation_id FROM replayable_forks
+                 UNION ALL
+                 SELECT ch.operation_id FROM managed_fork_children ch
+                 JOIN replayable_forks f ON f.operation_id=ch.batch_id
+                 JOIN managed_launches m ON m.operation_id=ch.operation_id
+                 JOIN operations o ON o.operation_id=ch.operation_id
+                 WHERE o.kind='restore_target' AND o.instance_id=ch.instance_id
+                   AND o.route_id=f.route_id AND o.bundle_digest=f.bundle_digest
+                   AND o.expected_execution_epoch=ch.prior_epoch
+             )
+             SELECT EXISTS (SELECT 1 FROM executions WHERE phase='unknown')
+                OR EXISTS (SELECT 1 FROM operations o WHERE o.phase='NEW'
+                           AND NOT EXISTS (SELECT 1 FROM replayable_operations p WHERE p.operation_id=o.operation_id))
                 OR EXISTS (SELECT 1 FROM writer_reservations r LEFT JOIN writer_grants g USING(operation_id)
                     WHERE g.grant_id IS NULL OR g.state!='attached')
                 OR EXISTS (SELECT 1 FROM fd_leases WHERE state='unknown')

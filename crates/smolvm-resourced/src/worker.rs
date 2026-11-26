@@ -1736,22 +1736,36 @@ impl Worker {
         self.finalize_scoped_execution(execution)
     }
 
+    fn exit_observed(&self, execution: &Execution) -> Result<bool> {
+        if execution.host_boot_id != self.boot {
+            return Ok(true);
+        }
+        if let Some(pidfd) = self.executions.get(&execution.incarnation_id) {
+            return pid_exited(pidfd).map_err(broker_error);
+        }
+        // The restarted Worker may have missed the exit before it could
+        // reconnect. A pidfd also observes a zombie with the same start time.
+        let pidfd = match process_fd(execution.pid) {
+            Ok(fd) => fd,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(true),
+            Err(error) => return Err(broker_error(error)),
+        };
+        if pid_exited(&pidfd).map_err(broker_error)? {
+            return Ok(true);
+        }
+        match pid_start(execution.pid) {
+            Ok(start) => Ok(start != execution.pid_start_time),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(broker_error(error)),
+        }
+    }
+
     fn finalize_scoped_execution(&mut self, execution: Execution) -> Result<Value> {
         if execution.phase == "exited" {
             return Ok(json!(execution));
         }
-        if execution.host_boot_id == self.boot {
-            let dead = match self.executions.get(&execution.incarnation_id) {
-                Some(pidfd) => pid_exited(pidfd).map_err(broker_error)?,
-                None => match pid_start(execution.pid) {
-                    Ok(start) => start != execution.pid_start_time,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-                    Err(error) => return Err(broker_error(error)),
-                },
-            };
-            if !dead {
-                return Err(unsafe_fence());
-            }
+        if !self.exit_observed(&execution)? {
+            return Err(unsafe_fence());
         }
         crate::pivots::reconcile_dead(
             &mut self.catalog,
@@ -1786,6 +1800,28 @@ impl Worker {
         self.escrow.forget_execution(&execution.incarnation_id);
         self.activation.forget(&execution);
         Ok(json!(result))
+    }
+
+    fn reconcile_capture_source_exits(&mut self) -> Result<()> {
+        let sources = {
+            let mut query = self.catalog.db.prepare(
+                "SELECT DISTINCT b.source_incarnation FROM managed_fork_batches b
+                 JOIN operations o USING(operation_id)
+                 JOIN executions e ON e.incarnation_id=b.source_incarnation
+                 WHERE o.phase='NEW' AND e.phase!='exited'",
+            )?;
+            let rows = query.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for incarnation in sources {
+            let execution = self.catalog.execution(&incarnation)?;
+            if self.exit_observed(&execution)? {
+                if let Err(error) = self.finalize_scoped_execution(execution) {
+                    eprintln!("resourced capture source fence {incarnation}: {error}");
+                }
+            }
+        }
+        Ok(())
     }
 
     fn stop_statepoint(&mut self, request: &Request) -> Result<Value> {
@@ -2534,6 +2570,9 @@ fn serve(
             }
             if let Err(e)=worker.lifecycle.tick(&mut worker.catalog,&worker.boot) {
                 eprintln!("resourced lifecycle controller: {} {}",e.code,e.message);
+            }
+            if let Err(error) = worker.reconcile_capture_source_exits() {
+                eprintln!("resourced capture source recovery: {error}");
             }
             worker
                 .forks
