@@ -4,7 +4,7 @@ use crate::catalog::{Catalog, Operation};
 use crate::ipc::{valid_id, Fault, Result};
 use crate::statepoint_capture::{Export, Purpose};
 use crate::statepoint_store::{Manifest, Point};
-use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -21,6 +21,27 @@ pub(crate) struct Record {
     pub revision: i64,
     #[serde(skip)]
     volatile_id: String,
+}
+
+// A failed restore can consume an execution epoch before publishing a new
+// execution. Only a completed successor supersedes the original saved cut.
+pub(crate) fn retained_statepoint(
+    db: &Connection,
+    route: &str,
+    instance: &str,
+    epoch: i64,
+) -> Result<Option<String>> {
+    Ok(db.query_row(
+        "SELECT p.capture_id FROM statepoints p JOIN executions e ON e.incarnation_id=p.source_incarnation_id
+         WHERE e.route_id=?1 AND e.instance_id=?2 AND e.execution_epoch<=?3 AND p.phase='hibernated'
+         AND json_extract(p.export_json,'$.purpose') IN ('hibernate','rollback_rescue')
+         AND NOT EXISTS(SELECT 1 FROM executions successor JOIN operations o ON o.operation_id=successor.last_operation_id
+            WHERE successor.route_id=e.route_id AND successor.instance_id=e.instance_id
+            AND successor.execution_epoch>e.execution_epoch AND successor.execution_epoch<=?3 AND o.phase='COMPLETED')
+         ORDER BY e.execution_epoch DESC,p.rowid DESC LIMIT 1",
+        params![route, instance, epoch],
+        |row| row.get(0),
+    ).optional()?)
 }
 
 fn row(row: &Row<'_>) -> rusqlite::Result<Record> {

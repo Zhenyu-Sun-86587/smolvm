@@ -326,15 +326,23 @@ fn exclusive(catalog: &Catalog, id: &str, route: &str, deleting: bool) -> Result
         OR EXISTS(SELECT 1 FROM product_volume_attachments a
         LEFT JOIN instance_bindings b ON b.instance_id=a.instance_id AND b.route_id=?2
         WHERE a.volume_id=?1 AND a.state='reserved'
-          AND (?3 OR (a.mode='rw' AND (b.incarnation_id IS NOT NULL OR b.active_operation_id IS NOT NULL OR EXISTS
-             (SELECT 1 FROM statepoints p JOIN executions e ON e.incarnation_id=p.source_incarnation_id
-              WHERE e.instance_id=a.instance_id AND e.route_id=?2 AND e.execution_epoch=b.execution_epoch
-              AND p.phase='hibernated' AND json_extract(p.export_json,'$.purpose')='hibernate')))))",
+          AND (?3 OR (a.mode='rw' AND (b.incarnation_id IS NOT NULL OR b.active_operation_id IS NOT NULL))))",
         params![id,route,deleting], |row| row.get(0))?;
     if in_use {
         return Err(busy(
             "volume has an attached, hibernated or unconfirmed writer",
         ));
+    }
+    let writer: Option<(String, i64)> = catalog.db.query_row(
+        "SELECT a.instance_id,b.execution_epoch FROM product_volume_attachments a
+         JOIN instance_bindings b ON b.instance_id=a.instance_id AND b.route_id=?
+         WHERE a.volume_id=? AND a.state='reserved' AND a.mode='rw'",
+        params![route,id], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional()?;
+    if let Some((instance, epoch)) = writer {
+        if crate::statepoint_catalog::retained_statepoint(&catalog.db, route, &instance, epoch)?.is_some() {
+            return Err(busy("volume has a hibernated writer"));
+        }
     }
     Ok(())
 }
@@ -348,11 +356,7 @@ fn stopped(catalog: &Catalog, route: &str, instance: &str, epoch: i64) -> Result
             "attachment changes require the exact stopped execution",
         ));
     }
-    let hibernated: bool = catalog.db.query_row("SELECT EXISTS(SELECT 1 FROM statepoints p
-        JOIN executions e ON e.incarnation_id=p.source_incarnation_id WHERE e.route_id=? AND e.instance_id=?
-        AND e.execution_epoch=? AND p.phase='hibernated' AND json_extract(p.export_json,'$.purpose')='hibernate')",
-        params![route,instance,epoch], |row| row.get(0))?;
-    if hibernated {
+    if crate::statepoint_catalog::retained_statepoint(&catalog.db, route, instance, epoch)?.is_some() {
         return Err(busy("hibernated volume topology is immutable"));
     }
     Ok(())
