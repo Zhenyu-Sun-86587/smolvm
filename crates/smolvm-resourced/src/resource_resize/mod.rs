@@ -124,6 +124,11 @@ pub(crate) fn query(catalog: &Catalog, boot: &str, request: &Request) -> Result<
     let ram = (running && machine.live_compute_growth)
         .then(|| observations::ram(&endpoint).ok())
         .flatten();
+    let memory_mib = if machine.live_compute_growth {
+        ram.map(|shape| u64::from(shape.boot_mib) + shape.plugged / MIB)
+    } else {
+        Some(u64::from(machine.memory_mib))
+    };
     let online_cpu_ids = cpus
         .filter(|_| guest.is_some())
         .and_then(|shape| observations::online_cpu_ids(&endpoint, shape.created).ok());
@@ -182,7 +187,7 @@ pub(crate) fn query(catalog: &Catalog, boot: &str, request: &Request) -> Result<
                 if machine.live_compute_growth {"RAM hot-add driver or Guest management is unavailable"} else {"the parked capture profile has no RAM hot-add device"}),
             "balloon": capability(balloon_installed, balloon.is_some(),"VMM balloon observation unavailable"),
         },
-        "observed":{"cpus":cpus,"online_cpus":online_cpu_ids.as_ref().map(Vec::len),"online_cpu_ids":online_cpu_ids,
+        "observed":{"cpus":cpus,"online_cpus":online_cpu_ids.as_ref().map(Vec::len),"online_cpu_ids":online_cpu_ids,"memory_mib":memory_mib,
                     "last_confirmed_online_cpus":online_cpu_ids.as_ref().map(Vec::len).or(online.map(usize::from)),"ram":ram,"balloon":balloon,
                     "scope_memory_current_bytes":observations::memory_current(&scope).ok(),
                     "scope_cpu_max":std::fs::read_to_string(scope.join("cpu.max")).ok().map(|text|text.trim().to_owned())},

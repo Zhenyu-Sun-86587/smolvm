@@ -1,7 +1,7 @@
 //! Worker-owned product volumes and offline attachment declarations.
 
 use crate::blocks::{self, BlockObject, BlockSpec};
-use crate::catalog::{Catalog, Execution, VolumeHead};
+use crate::catalog::{Catalog, Execution, Operation, VolumeHead};
 use crate::ipc::{valid_id, Fault, Request, Result};
 use crate::managed::{Device, Disk};
 use imago::{file::File as ImageFile, qcow2::Qcow2, raw::Raw, DynStorage, FormatAccess};
@@ -157,7 +157,10 @@ fn describe(catalog: &Catalog, route: &str, bundle: &str, input: &Lookup) -> Res
         a.fork_policy,a.capture_policy,a.revision,CASE WHEN g.state='attached' OR (a.mode='ro'
           AND e.phase='registered' AND m.disks_attached=1 AND EXISTS (
               SELECT 1 FROM json_each(m.devices_json) d
-              WHERE json_extract(d.value,'$.attachment_id')=a.attachment_id
+              WHERE json_extract(d.value,'$.device_id')=a.device_key
+                AND json_extract(d.value,'$.volume_id')=a.volume_id
+                AND json_extract(d.value,'$.generation_id')=a.generation_id
+                AND json_extract(d.value,'$.read_only')=1
           )) THEN 'attached'
         WHEN g.state IS NOT NULL OR (b.incarnation_id IS NOT NULL AND e.phase='unknown') THEN 'unknown'
         ELSE 'reserved' END
@@ -182,6 +185,120 @@ fn describe(catalog: &Catalog, route: &str, bundle: &str, input: &Lookup) -> Res
         "capacity_bytes":object.as_ref().map(|object| object.spec.capacity_bytes),
         "snapshots":snapshots,"attachments":attachments}),
     )
+}
+
+pub(crate) struct RestoredProduct {
+    volume: String,
+    owner: String,
+    lifecycle: String,
+    attachment: String,
+    device: String,
+    generation: Option<String>,
+    fork: String,
+    capture: String,
+}
+
+/// Preserve the captured disk's wire attachment ID for the parked reader. The
+/// independent machine gets a distinct, durable product attachment ID.
+pub(crate) fn independent_restore_products(
+    catalog: &Catalog,
+    op: &Operation,
+) -> Result<Vec<RestoredProduct>> {
+    let restore: Option<(String, String)> = catalog.db.query_row(
+        "SELECT r.capture_id,m.devices_json FROM managed_state_restores r
+         JOIN managed_launches m USING(operation_id) WHERE r.operation_id=?",
+        [&op.operation_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let Some((capture, devices)) = restore else { return Ok(Vec::new()) };
+    let point = catalog.require_statepoint(&capture)?;
+    let source = catalog.execution(&point.point.incarnation_id)?;
+    if source.instance_id == op.instance_id {
+        return Ok(Vec::new());
+    }
+    let restored: Vec<crate::managed::Device> = serde_json::from_str(&devices)
+        .map_err(|err| Fault::new("E_CATALOG", err.to_string()))?;
+    let captured: Vec<_> = point.point.devices.iter().filter_map(|device| device.block()).collect();
+    if captured.len() != restored.len() {
+        return Err(Fault::new("E_CATALOG", "restore volume plan differs from its captured disk set"));
+    }
+    let mut products = Vec::new();
+    for (index, (old, new)) in captured.into_iter().zip(restored).enumerate() {
+        let generation = new.disk.read_only.then_some(&old.generation_id);
+        let row: Option<(String, String, String, String)> = catalog.db.query_row(
+            "SELECT v.owner_id,v.lifecycle,a.fork_policy,a.capture_policy FROM product_volumes v
+             JOIN product_volume_attachments a USING(volume_id)
+             WHERE v.volume_id=?1 AND v.route_id=?2 AND v.bundle_digest=?3
+               AND a.instance_id=?4 AND a.device_key=?5
+               AND ( (?6 IS NULL AND a.mode='rw')
+                 OR (?6 IS NOT NULL AND a.mode='ro' AND a.generation_id=?6 AND v.state='available') )
+             ORDER BY a.attachment_id=?7 DESC, a.state='reserved' DESC, a.attachment_id LIMIT 1",
+            params![old.volume_id, op.route_id, op.bundle_digest, source.instance_id, old.device_id, generation, old.attachment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        if let Some((owner, lifecycle, fork, capture)) = row {
+            if old.device_id != new.disk.device_id
+                || old.attachment_id != new.disk.attachment_id
+                || new.disk.read_only != (old.volume_id == new.volume_id)
+            {
+                return Err(Fault::new("E_CATALOG", "restore product volume has inconsistent disk provenance"));
+            }
+            products.push(RestoredProduct {
+                volume: new.volume_id,
+                owner,
+                lifecycle,
+                attachment: crate::managed::key(&op.operation_id, "product-attachment", index),
+                device: new.disk.device_id,
+                generation: generation.cloned(),
+                fork,
+                capture,
+            });
+        }
+    }
+    Ok(products)
+}
+
+pub(crate) fn publish_restore_products(
+    tx: &Transaction<'_>,
+    op: &Operation,
+    products: Vec<RestoredProduct>,
+) -> Result<()> {
+    for item in products {
+        let mode = if item.generation.is_some() { "ro" } else { "rw" };
+        if mode == "rw" {
+            tx.execute("INSERT INTO product_volumes VALUES(?,?,?,?,?,1,'available')",
+                       params![item.volume, op.route_id, op.bundle_digest, item.owner, item.lifecycle])?;
+        }
+        tx.execute("INSERT INTO product_volume_attachments VALUES(?,?,?,?,?,?,?,?,?,'reserved',1)",
+            params![item.attachment, item.volume, op.instance_id, item.device, mode,
+                item.generation, item.fork, item.capture, op.expected_execution_epoch],
+        )?;
+        if let Some(generation) = item.generation {
+            insert_pin(tx, "product_attachment", &item.attachment, &generation, &op.operation_id)?;
+            tx.execute("UPDATE product_volumes SET revision=revision+1 WHERE volume_id=?", [&item.volume])?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn restore_attachment_receipt(
+    catalog: &Catalog,
+    op: &Operation,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let devices: u32 = catalog.db.query_row(
+        "SELECT json_array_length(devices_json) FROM managed_launches WHERE operation_id=?",
+        [&op.operation_id], |row| row.get(0),
+    )?;
+    let mut attachments = std::collections::BTreeMap::new();
+    let mut query = catalog.db.prepare(
+        "SELECT volume_id FROM product_volume_attachments WHERE instance_id=? AND attachment_id=?",
+    )?;
+    for index in 0..devices {
+        let id = crate::managed::key(&op.operation_id, "product-attachment", index as usize);
+        if let Some(volume) = query.query_row(params![op.instance_id, id], |row| row.get(0)).optional()? {
+            attachments.insert(volume, id);
+        }
+    }
+    Ok(attachments)
 }
 
 fn snapshot(

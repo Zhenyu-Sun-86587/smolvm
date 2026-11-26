@@ -50,7 +50,6 @@ def measured_variant(source, target):
     raw["bundle_digest"] = digest(json.dumps(raw, separators=(",", ":"), sort_keys=True).encode())
     manifest.unlink()
     manifest.write_text(json.dumps(raw))
-    return raw["bundle_digest"]
 
 
 def scope(endpoint, name):
@@ -116,7 +115,7 @@ def default_compatibility(current, historical, root):
 def restart_worker(stack, root, worker):
     bundle = root / "bundle"
     old_session = rpc(worker, "Health")["broker_session_id"]
-    pid = worker_peer(worker)
+    pid = unix_peer(worker)
     with open_pidfd(pid) as pidfd:
         assert (Path(f"/proc/{pid}/exe")).samefile(bundle / "smolvm-resourced")
         assert os.fsencode(worker) in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
@@ -127,9 +126,9 @@ def restart_worker(stack, root, worker):
     assert rpc(worker, "Health")["broker_session_id"] != old_session
 
 
-def worker_peer(worker):
-    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as peer:
-        peer.connect(str(worker))
+def unix_peer(path, socktype=socket.SOCK_SEQPACKET):
+    with socket.socket(socket.AF_UNIX, socktype) as peer:
+        peer.connect(str(path))
         pid, uid, _ = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
     assert uid == os.geteuid()
     return pid
@@ -145,8 +144,8 @@ def memfd_identities(pid):
     return retained
 
 
-def guest_ticks(root, ref):
-    path = root / "state/managed" / (ref["incarnation_id"] + ".log")
+def guest_ticks(root, ref, state="state"):
+    path = root / state / "managed" / (ref["incarnation_id"] + ".log")
     return [line.split() for line in path.read_text(errors="replace").splitlines()
             if line.startswith("PARKED_BLOCK_TICK ")]
 
@@ -175,14 +174,46 @@ def abandon_reply(worker, method, payload, **scope):
         peer.sendall(json.dumps(request).encode())
 
 
-def pressure_proof(primary, root, first, inventory, _started, group):
+def artifact_digest(manifest, path):
+    artifact = next(item for item in manifest["artifacts"] if item["path"] == path)
+    return "sha256:" + artifact["sha256"].removeprefix("sha256:")
+
+
+def serve_identity(endpoint, manifest):
+    handshake = until(lambda: http(endpoint, EXT + "/capabilities"))
+    assert handshake["bundle_digest"] == manifest["bundle_digest"], handshake
+    assert handshake["state_reader_id"] == manifest["contracts"]["state_reader_id"], handshake
+    pid = unix_peer(endpoint, socket.SOCK_STREAM)
+    with Path(f"/proc/{pid}/exe").open("rb") as executable:
+        measured = "sha256:" + hashlib.file_digest(executable, "sha256").hexdigest()
+    assert measured == artifact_digest(manifest, "smolvm-bin")
+    return {"serve_id": handshake["runtime_instance_id"], "bundle": handshake["bundle_digest"],
+            "reader": handshake["state_reader_id"], "serve_sha256": measured}
+
+
+def pressure_proof(primary, root, first, inventory, _started, group, same_bundle, peer_bundle):
     worker = root / "ipc/worker.sock"
     unit = group.name
-    a = http(primary, EXT + "/capabilities")["bundle_digest"]
-    secondary_bundle = root / "bundle-secondary"
-    b = measured_variant(root / "bundle", secondary_bundle)
-    assert a != b
-    assert rpc(worker, "Health")["vm_slice"] == unit
+    manifest = json.loads((root / "bundle/runtime-bundle.json").read_text())
+    primary_identity = serve_identity(primary, manifest)
+    a = primary_identity["bundle"]
+    if peer_bundle:
+        # The VMM runs as an unprivileged UID and must be able to traverse the Bundle path.
+        secondary_bundle = root / "bundle-secondary"
+        shutil.copytree(peer_bundle, secondary_bundle, symlinks=True)
+    elif same_bundle:
+        secondary_bundle = root / "bundle"
+    else:
+        secondary_bundle = root / "bundle-secondary"
+        measured_variant(root / "bundle", secondary_bundle)
+    secondary_manifest = json.loads((secondary_bundle / "runtime-bundle.json").read_text())
+    b = secondary_manifest["bundle_digest"]
+    assert (a == b) == same_bundle
+    expected_worker = artifact_digest(manifest, "smolvm-resourced")
+    health = rpc(worker, "Health")
+    assert health["vm_slice"] == unit
+    if same_bundle or peer_bundle:
+        assert health["executable_sha256"] == expected_worker
     tracked = tuple(
         key for key in ("memory.max", "memory.high", "cpu.max", "cpuset.cpus")
         if (group / key).exists()
@@ -193,13 +224,23 @@ def pressure_proof(primary, root, first, inventory, _started, group):
                     "serve", "start", "--listen", f"unix://{secondary}", "--worker-resource-socket", worker,
                     "--guest-rollout-port", "37228", "--shutdown-grace", "0"]
     env = bundle_env(secondary_bundle, root / "home")
-    mismatch = subprocess.run(base_command, env={**env, "SMOLVM_WORKER_SLICE_NAME": unit.replace("proof", "wrong")},
+    mismatch = subprocess.run([root / "bundle/smolvm-bin", *base_command[1:]],
+                              env={**bundle_env(root / "bundle", root / "home"),
+                                   "SMOLVM_WORKER_SLICE_NAME": "smolvmwrong.slice"},
                               capture_output=True, timeout=30)
     assert mismatch.returncode != 0 and b"VM slice settings differ" in mismatch.stderr, mismatch.stderr
 
     with ExitStack() as stack:
         spawn(stack, base_command, env, root / "serve-second.log")
-        assert until(lambda: http(secondary, EXT + "/capabilities"))["bundle_digest"] == b
+        secondary_identity = serve_identity(secondary, secondary_manifest)
+        assert secondary_identity["bundle"] == b and primary_identity["serve_id"] != secondary_identity["serve_id"]
+        if same_bundle:
+            print(f"Both live Serve routes use verified Bundle {a}, Worker {expected_worker}.", flush=True)
+        if peer_bundle:
+            assert primary_identity["reader"] != secondary_identity["reader"]
+            assert primary_identity["serve_sha256"] != secondary_identity["serve_sha256"]
+            print(json.dumps({"current_serve": primary_identity, "historical_serve": secondary_identity,
+                              "worker_sha256": expected_worker, "slice": unit}), flush=True)
         assert {key: (group / key).read_text() for key in tracked} == original_limits
         assert all((group / path).exists() for path in ("memory.events", "memory.pressure", "io.pressure"))
         assert scope(secondary, "test-second")["execution_epoch"] == 0
@@ -218,8 +259,8 @@ def pressure_proof(primary, root, first, inventory, _started, group):
                     **import_scope)
         rpc(worker, "FinishOperation", {"abort": False, "expected_revision": 1}, **import_scope)
 
-        def launch(endpoint, name, which):
-            disk_ids = ("base-ext4", "empty-data") if which == a else ("second-root", "second-data")
+        def launch(endpoint, name):
+            disk_ids = ("base-ext4", "empty-data") if endpoint == primary else ("second-root", "second-data")
             disks = [dict(attachment_id=f"{name}-{role}", device_id=role, role=role,
                           generation_id=disk_ids[role != "root"], read_only=role == "root")
                      for role in ("root", "storage", "data")]
@@ -234,13 +275,18 @@ def pressure_proof(primary, root, first, inventory, _started, group):
             return rpc(worker, "QueryWorkerBudget")
 
         current_before_second = int((group / "memory.current").read_text())
-        assert launch(secondary, "test-second", b)["phase"] == "NEW"
-        assert settled(secondary, "launch-test-second")["phase"] == "COMPLETED"
+        assert launch(secondary, "test-second")["phase"] == "NEW"
+        launched = settled(secondary, "launch-test-second")
+        assert launched["phase"] == "COMPLETED", launched
         scope_b = scope(secondary, "test-second")
         second_inventory = http(secondary, f"{EXT}/instances/{scope_b['instance_id']}/inventory")
         pids = [record["execution"]["pid"] for record in (inventory, second_inventory)]
         for pid in pids:
             assert f"0::/{unit}/" in Path(f"/proc/{pid}/cgroup").read_text()
+        if peer_bundle:
+            print(json.dumps({"vm_scopes": {
+                role: Path(f"/proc/{pid}/cgroup").read_text().strip()
+                for role, pid in zip(("current", "historical"), pids, strict=True)}}), flush=True)
         current_with_both = int((group / "memory.current").read_text())
         assert current_with_both > current_before_second + 16 * MIB, (current_before_second, current_with_both)
         descriptors = [os.pidfd_open(pid) for pid in pids]
@@ -298,14 +344,13 @@ def pressure_proof(primary, root, first, inventory, _started, group):
             semantics_version=2, ttl_seconds=120, token="pressure-test-lease-token-private"))
         original = budget()["allocated"]
         captures = {}
-        for endpoint, bundle, ref, memory in ((primary, a, scope_a, 512), (secondary, b, scope_b, 384)):
+        for endpoint, ref, memory in ((primary, scope_a, 512), (secondary, scope_b, 384)):
             op = "storm-checkpoint-" + str(memory)
             capture = op + "-capture"
-            captures[bundle] = capture
             assert submit(endpoint, op, ref, "vm_snapshot", {"capture_id": capture})["phase"] == "NEW"
             reserved = budget()["allocated"]
             assert reserved == {**original, "storage_bytes": original["storage_bytes"] + (memory + 68) * MIB}, reserved
-            if bundle == a:
+            if endpoint == primary:
                 try:
                     submit(secondary, "storm-checkpoint-384", scope_b, "vm_snapshot",
                            {"capture_id": "storm-checkpoint-384-capture"})
@@ -316,6 +361,7 @@ def pressure_proof(primary, root, first, inventory, _started, group):
                 assert budget()["allocated"] == reserved
             terminal = settled(endpoint, op)
             assert terminal["phase"] == "COMPLETED" and terminal["statepoint"]["phase"] == "durable", terminal
+            captures[endpoint] = terminal["statepoint"]
             assert budget()["allocated"] == original
         aborted = submit(primary, "aborted-checkpoint", scope_a, "vm_snapshot", {"capture_id": "aborted-checkpoint-capture"})
         assert budget()["allocated"]["storage_bytes"] == original["storage_bytes"] + 580 * MIB
@@ -323,7 +369,25 @@ def pressure_proof(primary, root, first, inventory, _started, group):
              dict(request_digest=digest(b"aborted-checkpoint"), expected=scope_a, expected_revision=aborted["revision"]))
         assert settled(primary, "aborted-checkpoint")["phase"] == "ABORTED"
         assert budget()["allocated"] == original
-        print("NEW exports counted storage once across both bundles. A competing export was refused, and both commit and abort returned their reservation.", flush=True)
+        print("NEW exports counted storage once across both Serve routes. A competing export was refused, and both commit and abort returned their reservation.", flush=True)
+
+        if peer_bundle:
+            for receiving, origin, role in ((primary, secondary, "current"), (secondary, primary, "historical")):
+                point = captures[origin]
+                target = scope(receiving, "wrong-reader")
+                assert target["execution_epoch"] == 0 and target["incarnation_id"] is None
+                try:
+                    submit(receiving, f"wrong-reader-{role}", target, "vm_restore",
+                           {"name": "wrong-reader", "capture_id": point["capture_id"], "mode": "clone_conflicts"})
+                except RuntimeError as error:
+                    assert "E_BUNDLE_UNAVAILABLE" in str(error) and "original StatePoint reader" in str(error), error
+                else:
+                    raise AssertionError("a StatePoint was read by the other installed Bundle")
+                assert scope(receiving, "wrong-reader") == target
+                assert budget()["allocated"] == original
+                assert rpc(worker, "QueryResource", {"resource_id": point["representation_id"]})["state"] == "available"
+                print(f"{role} Serve returned E_BUNDLE_UNAVAILABLE for {point['manifest_digest']}. "
+                      "The retained root and stopped target were unchanged.", flush=True)
 
         facts(a, scope_a)
         facts(b, scope_b, busy=True)
@@ -343,24 +407,24 @@ def pressure_proof(primary, root, first, inventory, _started, group):
         before = budget()["allocated"]
 
         def attempt(item):
-            endpoint, bundle, ref, kind, index = item
+            endpoint, ref, kind, index = item
             name = f"throttled-{kind}-{index}"
             try:
                 if kind == "launch":
-                    launch(endpoint, name, bundle)
+                    launch(endpoint, name)
                 elif kind == "fork":
                     submit(endpoint, name, ref, "fork_batch", {"children": [name + "-a", name + "-b"]})
                 else:
                     submit(endpoint, name, scope(endpoint, name), "vm_restore",
-                           {"name": name, "capture_id": captures[bundle], "mode": "clone_conflicts"})
+                           {"name": name, "capture_id": captures[endpoint]["capture_id"], "mode": "clone_conflicts"})
             except RuntimeError as error:
                 assert "E_RESOURCE_LIMIT" in str(error), error
                 return
             raise AssertionError(f"pressure admitted {kind} while all candidates were protected")
 
         with ThreadPoolExecutor(max_workers=6) as pool:
-            list(pool.map(attempt, [(endpoint, bundle, ref, kind, i)
-                                   for i, (endpoint, bundle, ref) in enumerate(((primary, a, scope_a), (secondary, b, scope_b)))
+            list(pool.map(attempt, [(endpoint, ref, kind, i)
+                                   for i, (endpoint, ref) in enumerate(((primary, scope_a), (secondary, scope_b)))
                                    for kind in ("launch", "fork", "restore")]))
         assert budget()["allocated"] == before
         print(f"Two Serve routes shared the {unit} ledger under pressure. Six launch, fork and restore requests were refused, and both protected VMs remained live.", flush=True)
@@ -437,6 +501,9 @@ def pressure_proof(primary, root, first, inventory, _started, group):
         other_wake = {**wake, "protection_id": "independent-wake"}
         call(b, parked, "RequestWake", other_wake)
         restart_worker(stack, root, worker)
+        if same_bundle or peer_bundle:
+            assert rpc(worker, "Health")["executable_sha256"] == expected_worker
+            print(f"The replacement Worker is the same installed executable {expected_worker}.", flush=True)
         assert not select.select([descriptors[0]], [], [], 0)[0]
         assert http(primary, f"{EXT}/instances/{scope_a['instance_id']}/inventory")["execution"] == inventory["execution"]
         left = status(a, scope_a)
@@ -520,7 +587,7 @@ def pressure_proof(primary, root, first, inventory, _started, group):
         child_inventories = [http(primary, f"{EXT}/instances/{ref['instance_id']}/inventory") for ref in child_refs]
         child_pids = [record["execution"]["pid"] for record in child_inventories]
         child_fds = [stack.enter_context(open_pidfd(pid)) for pid in child_pids]
-        manager = worker_peer(worker)
+        manager = unix_peer(worker)
         shared = memfd_identities(child_pids[0]) & memfd_identities(child_pids[1]) & memfd_identities(manager)
         assert shared, "the two sibling VMMs did not retain a common Worker RAM backing"
         # The platform normally publishes the child's inherited policy to the Worker.
@@ -570,6 +637,29 @@ def pressure_proof(primary, root, first, inventory, _started, group):
         print(json.dumps({"after_last_parent_exit": final,
                           "actual_reclaimed_bytes": initial["memory_current"] - final["memory_current"]}), flush=True)
 
+        if peer_bundle:
+            point = captures[secondary]
+            name = "original-reader"
+            key = "restore-original-reader"
+            target = scope(secondary, name)
+            assert submit(secondary, key, target, "vm_restore",
+                          {"name": name, "capture_id": point["capture_id"], "mode": "clone_conflicts"})["phase"] == "NEW"
+            receipt = settled(secondary, key)
+            assert receipt["phase"] == "COMPLETED" and receipt["statepoint"]["stage"] == "released", receipt
+            assert receipt["statepoint"]["manifest_digest"] == point["manifest_digest"], receipt
+            assert receipt["statepoint"]["activation_decision"] == "commit", receipt
+            restored = scope(secondary, name)
+            assert restored["execution_epoch"] == 1 and restored["incarnation_id"], restored
+            ticks = until(lambda: ticks if len(ticks := guest_ticks(root, restored, "state-second")) >= 2 else None, 20)
+            source_ticks = guest_ticks(root, scope_b, "state-second")
+            first, fresh = ticks[:2]
+            original_tick = next((row for row in source_ticks if row[1] == first[1]), None)
+            assert original_tick, (first, source_ticks[-2:])
+            assert int(first[1]) > 1 and first[2] == fresh[2] == original_tick[2], (first, fresh, original_tick)
+            assert first[5:7] == original_tick[5:7] and fresh[3] == name, (first, fresh, original_tick)
+            print(f"The original installed reader restored {point['manifest_digest']} after the shared Worker restart. "
+                  f"Guest PID {first[2]} continued at tick {first[1]} with both original disk markers {first[5:7]}.", flush=True)
+
 
 
 def main():
@@ -578,18 +668,29 @@ def main():
     parser.add_argument("--guest", type=lambda s: Path(s).resolve(), help="prebuilt static kvm-parked-block-guest executable")
     parser.add_argument("--historical-bundle", type=lambda s: Path(s).resolve(),
                         help="bundle whose Worker predates the vm_slice capability")
+    layout = parser.add_mutually_exclusive_group()
+    layout.add_argument("--same-bundle", action="store_true",
+                        help="use the supplied measured Bundle unchanged on both Serve routes")
+    layout.add_argument("--peer-bundle", type=lambda s: Path(s).resolve(strict=True),
+                        help="use an older installed Bundle unchanged from a nested systemd manager")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("Linux root, KVM, systemd, and cgroup v2 are required")
+    if args.peer_bundle:
+        manager = Path("/proc/1/environ").read_bytes().split(b"\0")
+        if b"container=smolvm-frozen-proof" not in manager:
+            parser.error("an installed peer requires the isolated manager from run_frozen_worker_pressure_in_systemd.sh")
     if os.environ.get("SMOLVM_PRESSURE_TEST_NAMESPACE") != "1":
         os.execvp("unshare", ["unshare", "--mount", "--propagation", "private", "--net", "--",
-                             "/usr/bin/env", "SMOLVM_PRESSURE_TEST_NAMESPACE=1", sys.executable, __file__, *sys.argv[1:]])
+                             "/usr/bin/env", "SMOLVM_PRESSURE_TEST_NAMESPACE=1", "PYTHONDONTWRITEBYTECODE=1",
+                             sys.executable, __file__, *sys.argv[1:]])
     with tempfile.TemporaryDirectory(dir="/var/tmp", prefix="smp-") as directory, ExitStack() as stack:
         root = Path(directory)
         root.chmod(0o755)
         if args.historical_bundle:
             default_compatibility(args.bundle, args.historical_bundle, root)
-        unit = f"smolvmproof{os.getpid()}_{os.urandom(4).hex()}.slice"
+        unit = ("smolvmdeep.slice" if args.peer_bundle else
+                f"smolvmproof{os.getpid()}_{os.urandom(4).hex()}.slice")
         group = create_slice(unit, stack)
         os.environ.update(SMOLVM_WORKER_SLICE_NAME=unit, SMOLVM_WORKER_PRESSURE_HIGH_HEADROOM_MIB="192",
                           SMOLVM_WORKER_PRESSURE_LOW_HEADROOM_MIB="224", SMOLVM_WORKER_CACHE_RECLAIM_MIB="4",
@@ -597,11 +698,14 @@ def main():
         properties(unit, str(3 << 30))
         try:
             verify(args.bundle, root, args.guest, None, False, False, False, False,
-                   observer=lambda *values: pressure_proof(*values, group))
+                   observer=lambda *values: pressure_proof(*values, group, args.same_bundle, args.peer_bundle))
         except BaseException:
-            for log in ("serve.log", "serve-second.log", "worker.log"):
-                path = root / log
+            logs = [root / log for log in ("serve.log", "serve-second.log", "worker.log")]
+            for state in ("state", "state-second"):
+                logs.extend((root / state / "managed").glob("*.log"))
+            for path in logs:
                 if path.exists():
+                    print(path.relative_to(root), file=sys.stderr)
                     print(path.read_text(errors="replace")[-4500:], file=sys.stderr)
             raise
 

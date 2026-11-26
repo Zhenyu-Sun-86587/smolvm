@@ -653,6 +653,11 @@ impl Catalog {
             return Err(conflict("E_STALE_REVISION", "operation revision changed"));
         }
         let id = &operation.operation_id;
+        let restored_products = if !abort && operation.kind == "restore_target" {
+            crate::product_volumes::independent_restore_products(self, &operation)?
+        } else {
+            Vec::new()
+        };
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -749,6 +754,7 @@ impl Catalog {
                 "operation retains a reservation, root pin, or registered execution",
             ));
         }
+        crate::product_volumes::publish_restore_products(&tx, &operation, restored_products)?;
         tx.execute(
             "UPDATE operations SET phase=?,decision=?,revision=revision+1 WHERE operation_id=?",
             params![final_phase, if abort { "ABORT" } else { "NONE" }, id],
