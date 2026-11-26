@@ -582,6 +582,26 @@ fn current_target(db: &Connection, target: &Endpoint) -> Result<Option<Expected>
         .optional()?)
 }
 
+fn fenced_hibernation(
+    db: &Connection,
+    target: &Endpoint,
+    attachment: &str,
+    epoch: i64,
+    incarnation: Option<&str>,
+) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM statepoints p JOIN operations o USING(operation_id)
+         JOIN executions e ON e.incarnation_id=p.source_incarnation_id
+         JOIN network_tap_leases t ON t.incarnation_id=e.incarnation_id
+         WHERE o.instance_id=?1 AND e.execution_epoch=?2 AND e.phase='exited' AND p.phase='hibernated'
+           AND json_extract(p.export_json,'$.purpose') IN ('hibernate','rollback_rescue')
+           AND t.attachment_id=?3 AND t.state='retired'
+           AND (?4 IS NULL OR (e.incarnation_id=?4 AND o.kind='hibernate')))",
+        params![target.instance, epoch, attachment, incarnation],
+        |row| row.get(0),
+    )?)
+}
+
 fn request(method: &str, target: &Endpoint, expected: &Expected, payload: Value) -> Request {
     Request {
         protocol: PROTOCOL.into(),
@@ -615,24 +635,32 @@ fn enqueue(catalog: &mut Catalog, rule: &Rule, target: &Endpoint) -> Result<Opti
         return Ok(None);
     }
     let available: bool = db.query_row("SELECT NOT EXISTS(SELECT 1 FROM private_packet_wake_demands WHERE instance_id=?1)
-        AND NOT EXISTS(SELECT 1 FROM private_packet_wake_limits WHERE instance_id=?1 AND next_request_at>?2)
-        AND EXISTS(SELECT 1 FROM instance_bindings WHERE instance_id=?1 AND route_id='deep' AND active_operation_id IS NULL)",
+        AND NOT EXISTS(SELECT 1 FROM private_packet_wake_limits WHERE instance_id=?1 AND next_request_at>?2)",
         params![expected.instance_id,now], |r|r.get(0))?;
     if !available {
         return Ok(None);
     }
+    let (active, stopping): (Option<String>, bool) = db.query_row(
+        "SELECT b.active_operation_id, coalesce(o.kind='hibernate' AND o.phase='NEW'
+           AND o.expected_execution_epoch=b.execution_epoch AND h.source_incarnation=b.incarnation_id,0)
+         FROM instance_bindings b LEFT JOIN operations o ON o.operation_id=b.active_operation_id
+         LEFT JOIN managed_fork_batches h USING(operation_id)
+         WHERE b.route_id='deep' AND b.instance_id=?",
+        [&expected.instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if active.is_some() && !stopping {
+        return Ok(None);
+    }
     let sleeping: bool = if let Some(incarnation) = &expected.incarnation_id {
-        db.query_row("SELECT EXISTS(SELECT 1 FROM native_standby s JOIN native_transitions n USING(operation_id)
-            JOIN network_tap_leases t ON t.incarnation_id=s.incarnation_id,worker_state w
-            WHERE s.incarnation_id=? AND n.mode='managed' AND n.network_gate=1 AND n.stage='complete'
-            AND t.attachment_id=? AND t.state='attached' AND t.execution_epoch=? AND t.broker_session_id=w.broker_session_id)",
-            params![incarnation,rule.target,expected.execution_epoch], |r|r.get(0))?
+        db.query_row("SELECT EXISTS(SELECT 1 FROM network_tap_leases t,worker_state w
+            WHERE t.incarnation_id=?1 AND t.attachment_id=?2 AND t.state='attached'
+              AND t.execution_epoch=?3 AND t.broker_session_id=w.broker_session_id
+              AND (?4 OR EXISTS(SELECT 1 FROM native_standby s JOIN native_transitions n USING(operation_id)
+                WHERE s.incarnation_id=?1 AND n.mode='managed' AND n.network_gate=1 AND n.stage='complete')))",
+            params![incarnation,rule.target,expected.execution_epoch,stopping], |r|r.get(0))?
     } else {
-        db.query_row("SELECT EXISTS(SELECT 1 FROM statepoints p JOIN operations o USING(operation_id)
-            JOIN executions e ON e.incarnation_id=p.source_incarnation_id JOIN network_tap_leases t ON t.incarnation_id=e.incarnation_id
-            WHERE o.instance_id=? AND e.execution_epoch=? AND e.phase='exited' AND p.phase='hibernated'
-            AND json_extract(p.export_json,'$.purpose') IN ('hibernate','rollback_rescue') AND t.attachment_id=? AND t.state='retired')",
-            params![expected.instance_id,expected.execution_epoch,rule.target], |r|r.get(0))?
+        fenced_hibernation(db, target, &rule.target, expected.execution_epoch, None)?
     };
     if !sleeping {
         return Ok(None);
@@ -751,14 +779,27 @@ fn reconcile(
         let same_epoch = expected.incarnation_id == demand.incarnation
             && expected.execution_epoch == demand.epoch
             && target.revision == demand.endpoint_revision;
+        let fenced = !same_epoch
+            && demand.incarnation.is_some()
+            && fenced_hibernation(
+                &catalog.db,
+                &target,
+                &rule.target,
+                demand.epoch,
+                demand.incarnation.as_deref(),
+            )?;
+        let waiting_after_fence = fenced
+            && expected.incarnation_id.is_none()
+            && expected.execution_epoch == demand.epoch
+            && target.revision == demand.endpoint_revision;
         let restore = demand.kind.as_deref() == Some("vm_restore")
-            && demand.incarnation.is_none()
+            && (demand.incarnation.is_none() || fenced)
             && demand.endpoint_revision.checked_add(1) == Some(target.revision);
         let successor = restore && demand.epoch.checked_add(1) == Some(expected.execution_epoch);
         let reattaching = restore
             && demand.epoch == expected.execution_epoch
             && expected.incarnation_id.is_none();
-        if eligible && !completed && (same_epoch || successor || reattaching) {
+        if eligible && !completed && (same_epoch || waiting_after_fence || successor || reattaching) {
             continue;
         }
         let (method, payload, authorized) = if completed {
@@ -807,7 +848,7 @@ fn reconcile(
             .remove(&demand.id)
             .filter(|held| authorized && held.until > now);
         if let Some(operation) = &operation {
-            let status = (rule.transport == "udp" && demand.incarnation.is_none()).then_some(
+            let status = (rule.transport == "udp" && (demand.incarnation.is_none() || successor)).then_some(
                 if datagram.is_some() {
                     "unknown"
                 } else {
