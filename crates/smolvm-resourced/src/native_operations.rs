@@ -153,6 +153,10 @@ pub fn submit(catalog: &mut Catalog, boot: &str, r: &Request, input: Input) -> R
         ));
     }
     if input.kind == "stop" {
+        let (current, _) = crate::lifecycle_controller::binding(catalog, r)?;
+        if &current != expected {
+            return Err(Fault::new("E_STALE_EXECUTION", "stop source binding changed"));
+        }
         let system: bool = catalog.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM managed_launches WHERE incarnation_id=?
                 AND json_extract(spec_json,'$.boot_profile')='system-debian-v1')",
