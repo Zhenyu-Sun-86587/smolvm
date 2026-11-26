@@ -545,7 +545,7 @@ pub fn seal_heads(
     let op = catalog.matching_operation(request)?;
     let retiring = op.kind == crate::managed_retirement::KIND
         && request.method == crate::managed_retirement::METHOD;
-    if (op.kind != "catalog" && !retiring) || heads.is_empty() || heads.len() > 64 {
+    if (op.kind != "catalog" && !retiring) || heads.is_empty() || (!retiring && heads.len() > 64) {
         return Err(Fault::invalid(
             "block seal requires a catalog operation and 1 to 64 heads",
         ));
@@ -594,15 +594,28 @@ pub fn seal_heads(
     if prior.is_empty() && !retiring {
         catalog.ready()?;
     }
-    let mut handles = Vec::new();
-    for object in &objects {
-        handles.push(fence_head_for_seal(root, object, !prior.is_empty())?);
-    }
-    if prior.is_empty() {
-        catalog.begin_block_seal(&op.operation_id, &heads)?;
-    }
-    for ((directory, handle), object) in handles.iter().zip(&mut objects) {
-        seal_fenced_head(directory, handle, object)?;
+    if retiring && heads.len() > 64 {
+        // Retirement can include disks detached earlier in the machine's life.
+        // Pin the complete plan before changing any inode and bound the open FDs.
+        if prior.is_empty() {
+            for object in &objects {
+                fence_head_for_seal(root, object, false)?;
+            }
+            catalog.begin_block_seal(&op.operation_id, &heads)?;
+        }
+        for object in &mut objects {
+            let (directory, handle) = fence_head_for_seal(root, object, !prior.is_empty())?;
+            seal_fenced_head(&directory, &handle, object)?;
+        }
+    } else {
+        let handles = objects.iter().map(|object| fence_head_for_seal(root, object, !prior.is_empty()))
+            .collect::<Result<Vec<_>>>()?;
+        if prior.is_empty() {
+            catalog.begin_block_seal(&op.operation_id, &heads)?;
+        }
+        for ((directory, handle), object) in handles.iter().zip(&mut objects) {
+            seal_fenced_head(directory, handle, object)?;
+        }
     }
     catalog.commit_block_seal(&op.operation_id, &objects)?;
     Ok(json!({"generations":objects}))

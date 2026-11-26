@@ -48,7 +48,9 @@ fn ensure_fenced(tx: &Transaction<'_>, route: &str, expected: &Expected) -> Resu
     let changing_volume: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM product_volume_attachments a
          JOIN product_volume_operations v USING(volume_id)
-         WHERE a.instance_id=? AND a.state='reserved' AND v.result_json IS NULL)",
+         WHERE a.instance_id=?1 AND a.state='reserved' AND v.result_json IS NULL)
+         OR EXISTS(SELECT 1 FROM product_machine_volumes m JOIN product_volume_operations v USING(volume_id)
+         WHERE m.instance_id=?1 AND v.result_json IS NULL)",
         [&expected.instance_id],
         |row| row.get(0),
     )?;
@@ -66,6 +68,21 @@ fn plan(
     name: &str,
 ) -> Result<(Option<String>, Vec<VolumeHead>)> {
     ensure_fenced(tx, route, expected)?;
+    let mut heads = {
+        let mut query = tx.prepare(
+            "SELECT m.volume_id,h.head_resource_id FROM product_machine_volumes m
+             JOIN product_volumes v USING(volume_id) LEFT JOIN volume_heads h USING(volume_id)
+             WHERE m.instance_id=? AND v.route_id=? AND v.bundle_digest=? AND v.state='available'",
+        )?;
+        let rows = query.query_map(params![expected.instance_id, route, bundle], |row| {
+            Ok((row.get(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        rows.map(|row| {
+            let (volume_id, head) = row?;
+            let head_resource_id = head.ok_or_else(|| state_conflict("machine volume has no current writable head"))?;
+            Ok(VolumeHead { volume_id, head_resource_id })
+        }).collect::<Result<Vec<_>>>()?
+    };
     if expected.execution_epoch == 0 {
         let prior: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM executions WHERE route_id=?1 AND instance_id=?2)
@@ -76,7 +93,7 @@ fn plan(
         if prior {
             return Err(state_conflict("first-start slot no longer belongs to this binding"));
         }
-        return Ok((None, Vec::new()));
+        return Ok((None, heads));
     }
     let (stop, devices): (String, String) = tx.query_row(
         "SELECT s.operation_id,m.devices_json FROM executions e
@@ -97,7 +114,6 @@ fn plan(
          WHERE json_extract(d.value,'$.head_id') IS NOT NULL
          AND NOT EXISTS(SELECT 1 FROM product_volumes v WHERE v.volume_id=json_extract(d.value,'$.volume_id'))",
     )?;
-    let mut heads = Vec::new();
     for row in query.query_map([devices], |row| Ok((row.get(0)?, row.get::<_, Option<String>>(1)?)))? {
         let (volume_id, head) = row?;
         let head_resource_id = head.ok_or_else(|| state_conflict("machine-private disk no longer has its writable head"))?;
@@ -122,8 +138,11 @@ pub(crate) fn submit(catalog: &mut Catalog, request: &Request) -> Result<Operati
     })
 }
 
-fn release_instance_links(tx: &Transaction<'_>, route: &str, instance: &str) -> Result<()> {
-    tx.execute("UPDATE product_volumes SET revision=revision+1 WHERE volume_id IN (
+fn release_instance_links(tx: &Transaction<'_>, route: &str, bundle: &str, instance: &str) -> Result<()> {
+    tx.execute("UPDATE product_volumes SET state='deleted',revision=revision+1
+        WHERE route_id=? AND bundle_digest=? AND state='available' AND volume_id IN (
+            SELECT volume_id FROM product_machine_volumes WHERE instance_id=?)", params![route, bundle, instance])?;
+    tx.execute("UPDATE product_volumes SET revision=revision+1 WHERE state='available' AND volume_id IN (
         SELECT volume_id FROM product_volume_attachments WHERE instance_id=? AND state='reserved')", [instance])?;
     tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='product_attachment' AND state='active'
         AND owner_id IN (SELECT attachment_id FROM product_volume_attachments WHERE instance_id=? AND state='reserved')", [instance])?;
@@ -151,7 +170,7 @@ fn release_instance_links(tx: &Transaction<'_>, route: &str, instance: &str) -> 
 fn drive(catalog: &mut Catalog, objects: &File, operation: &Operation) -> Result<()> {
     let request = crate::managed_statepoint::request(operation, json!({})).derived(METHOD, json!({}));
     catalog.active_operation(&request)?;
-    let (route, _, expected) = request.scope()?;
+    let (route, bundle, expected) = request.scope()?;
     let id = &operation.operation_id;
     let encoded: String = catalog.db.query_row(
         "SELECT private_heads_json FROM managed_retirements WHERE operation_id=?",
@@ -167,11 +186,16 @@ fn drive(catalog: &mut Catalog, objects: &File, operation: &Operation) -> Result
         return Err(Fault::new("E_STALE_EXECUTION", "retiring binding changed before publication"));
     }
     ensure_fenced(&tx, route, expected)?;
-    release_instance_links(&tx, route, &expected.instance_id)?;
+    release_instance_links(&tx, route, bundle, &expected.instance_id)?;
     tx.execute("INSERT OR IGNORE INTO retired_instance_blocks SELECT b.resource_id,?1 FROM managed_blocks b
         JOIN resources r USING(resource_id) WHERE r.immutable=1 AND r.state IN ('available','deleting')
-        AND json_extract(b.spec_json,'$.volume_id') IN (SELECT json_extract(value,'$.volume_id') FROM json_each(?2))",
-        params![id, encoded])?;
+        AND json_extract(b.spec_json,'$.volume_id') IN (
+            SELECT json_extract(value,'$.volume_id') FROM json_each(?2)
+            UNION ALL
+            SELECT m.volume_id FROM product_machine_volumes m JOIN product_volumes v USING(volume_id)
+            WHERE m.instance_id=?3 AND v.route_id=?4 AND v.bundle_digest=?5 AND v.state='deleted'
+        )",
+        params![id, encoded, expected.instance_id, route, bundle])?;
     // Sealing pins each converted disk under this operation until the binding
     // retires. The resource graph still retains every independent consumer.
     tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='operation' AND owner_id=? AND state='active'", [id])?;

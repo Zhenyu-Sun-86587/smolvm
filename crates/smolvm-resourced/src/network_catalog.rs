@@ -679,7 +679,9 @@ mod tests {
                 catalog.db.execute("UPDATE initial_network_activations SET phase='unknown'", []).unwrap();
             }
             if case == "legacy schema" {
-                catalog.db.execute_batch("DROP TABLE network_kernel_receipts; PRAGMA user_version=27;").unwrap();
+                catalog.db.execute_batch(
+                    "DROP TABLE product_machine_volumes; DROP TABLE network_kernel_receipts; PRAGMA user_version=27;"
+                ).unwrap();
             }
             drop(catalog);
 

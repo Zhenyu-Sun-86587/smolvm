@@ -104,7 +104,10 @@ fn head(catalog: &Catalog, volume_id: &str) -> Result<Option<BlockObject>> {
 fn pending_change(catalog: &Catalog, volume: &str) -> Result<bool> {
     Ok(catalog.db.query_row(
         "SELECT EXISTS(SELECT 1 FROM product_volume_operations
-         WHERE volume_id=? AND result_json IS NULL)",
+            WHERE volume_id=?1 AND result_json IS NULL)
+         OR EXISTS(SELECT 1 FROM product_machine_volumes m JOIN product_volumes v USING(volume_id)
+            JOIN operations o ON o.instance_id=m.instance_id AND o.route_id=v.route_id AND o.bundle_digest=v.bundle_digest
+            WHERE m.volume_id=?1 AND o.kind='retire_instance' AND o.phase='NEW')",
         [volume], |row| row.get(0),
     )?)
 }
@@ -114,14 +117,16 @@ fn metadata(
     route: &str,
     bundle: &str,
     volume: &Lookup,
-) -> Result<(String, i64, String)> {
+) -> Result<(String, i64, String, Option<String>)> {
     catalog
         .db
         .query_row(
-            "SELECT lifecycle,revision,state FROM product_volumes
-        WHERE volume_id=? AND route_id=? AND bundle_digest=? AND owner_id=?",
+            "SELECT CASE WHEN m.volume_id IS NULL THEN v.lifecycle ELSE 'machine' END,
+                v.revision,v.state,m.instance_id
+            FROM product_volumes v LEFT JOIN product_machine_volumes m USING(volume_id)
+            WHERE v.volume_id=? AND v.route_id=? AND v.bundle_digest=? AND v.owner_id=?",
             params![volume.volume_id, route, bundle, volume.owner_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?
         .ok_or_else(missing)
@@ -134,7 +139,7 @@ pub(crate) fn query(catalog: &Catalog, request: &Request) -> Result<Value> {
 }
 
 fn describe(catalog: &Catalog, route: &str, bundle: &str, input: &Lookup) -> Result<Value> {
-    let (lifecycle, revision, mut state) = metadata(catalog, route, bundle, input)?;
+    let (lifecycle, revision, mut state, machine) = metadata(catalog, route, bundle, input)?;
     let object = if state == "deleted" {
         None
     } else {
@@ -179,14 +184,37 @@ fn describe(catalog: &Catalog, route: &str, bundle: &str, input: &Lookup) -> Res
         "generation_id":row.get::<_,Option<String>>(4)?,"fork_policy":row.get::<_,String>(5)?,
         "capture_policy":row.get::<_,String>(6)?,"revision":row.get::<_,i64>(7)?,"state":row.get::<_,String>(8)?,
     })))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(
+    let mut observation =
         json!({"schema":"Volume/1","volume_id":input.volume_id,"owner_id":input.owner_id,
         "bundle_digest":bundle,"route_id":route,"lifecycle":lifecycle,"revision":revision,"state":state,
         "head_resource_id":object.as_ref().map(|object| &object.spec.resource_id),
         "generation_id":object.as_ref().and_then(|object| object.spec.backing_id.as_ref()),
         "capacity_bytes":object.as_ref().map(|object| object.spec.capacity_bytes),
-        "snapshots":snapshots,"attachments":attachments}),
-    )
+        "snapshots":snapshots,"attachments":attachments});
+    if let Some(machine) = machine {
+        observation["machine_instance_id"] = json!(machine);
+    }
+    Ok(observation)
+}
+
+fn insert_volume(
+    tx: &Transaction<'_>,
+    volume: &str,
+    route: &str,
+    bundle: &str,
+    owner: &str,
+    lifecycle: &str,
+    machine: Option<&str>,
+) -> Result<()> {
+    // An explicit machine lifetime has an ownership record. Historical ephemeral
+    // volumes retain the lifetime established by their original catalog.
+    let stored = if lifecycle == "machine" { "ephemeral" } else { lifecycle };
+    tx.execute("INSERT INTO product_volumes VALUES(?,?,?,?,?,1,'available')",
+               params![volume, route, bundle, owner, stored])?;
+    if lifecycle == "machine" {
+        tx.execute("INSERT INTO product_machine_volumes VALUES(?,?)", params![volume, machine])?;
+    }
+    Ok(())
 }
 
 pub(crate) struct RestoredProduct {
@@ -227,8 +255,10 @@ pub(crate) fn independent_restore_products(
     for (index, (old, new)) in captured.into_iter().zip(restored).enumerate() {
         let generation = new.disk.read_only.then_some(&old.generation_id);
         let row: Option<(String, String, String, String)> = catalog.db.query_row(
-            "SELECT v.owner_id,v.lifecycle,a.fork_policy,a.capture_policy FROM product_volumes v
+            "SELECT v.owner_id,CASE WHEN m.volume_id IS NULL THEN v.lifecycle ELSE 'machine' END,
+                a.fork_policy,a.capture_policy FROM product_volumes v
              JOIN product_volume_attachments a USING(volume_id)
+             LEFT JOIN product_machine_volumes m USING(volume_id)
              WHERE v.volume_id=?1 AND v.route_id=?2 AND v.bundle_digest=?3
                AND a.instance_id=?4 AND a.device_key=?5
                AND ( (?6 IS NULL AND a.mode='rw')
@@ -267,8 +297,7 @@ pub(crate) fn publish_restore_products(
     for item in products {
         let mode = if item.generation.is_some() { "ro" } else { "rw" };
         if mode == "rw" {
-            tx.execute("INSERT INTO product_volumes VALUES(?,?,?,?,?,1,'available')",
-                       params![item.volume, op.route_id, op.bundle_digest, item.owner, item.lifecycle])?;
+            insert_volume(tx, &item.volume, &op.route_id, &op.bundle_digest, &item.owner, &item.lifecycle, Some(&op.instance_id))?;
         }
         tx.execute("INSERT INTO product_volume_attachments VALUES(?,?,?,?,?,?,?,?,?,'reserved',1)",
             params![item.attachment, item.volume, op.instance_id, item.device, mode,
@@ -635,7 +664,7 @@ pub(crate) fn mutate(catalog: &mut Catalog, objects: &File, request: &Request) -
             }
             None
         } else {
-            let (_, revision, state) = metadata(catalog, route, bundle, &lookup)?;
+            let (_, revision, state, _) = metadata(catalog, route, bundle, &lookup)?;
             if input.expected_revision != revision
                 || (state != "available" && !matches!(input.command, Action::DropSnapshot { .. }))
             {
@@ -791,7 +820,7 @@ fn preflight(
             source_snapshot_id,
         } => {
             check_capacity(*capacity_bytes)?;
-            if !matches!(lifecycle.as_str(), "persistent" | "ephemeral") {
+            if !matches!(lifecycle.as_str(), "persistent" | "ephemeral" | "machine") {
                 return Err(Fault::invalid("invalid volume lifecycle"));
             }
             if let Some(id) = source_snapshot_id.as_deref() {
@@ -820,7 +849,13 @@ fn preflight(
             if *capacity_bytes <= current.unwrap().spec.capacity_bytes {
                 return Err(Fault::invalid("volume capacity can only increase"));
             }
-            exclusive(catalog, &input.volume_id, route, false)?;
+            exclusive(catalog, &input.volume_id, route, false).map_err(|error| {
+                if error.code == "E_VOLUME_BUSY" {
+                    return Fault::new("E_VOLUME_REQUIRES_STOPPED",
+                        "volume growth requires a fenced stopped writer. Wake any saved execution and stop it first");
+                }
+                error
+            })?;
         }
         Action::Delete => exclusive(catalog, &input.volume_id, route, true)?,
         Action::Attach {
@@ -869,6 +904,18 @@ fn preflight(
             if in_use {
                 return Err(busy("device slot or writable volume already reserved"));
             }
+            let machine: Option<Option<String>> = catalog.db.query_row(
+                "SELECT instance_id FROM product_machine_volumes WHERE volume_id=?",
+                [&input.volume_id], |row| row.get(0),
+            ).optional()?;
+            if let Some(machine) = machine {
+                if mode != "rw" {
+                    return Err(Fault::invalid("machine volumes require writable attachment"));
+                }
+                if machine.as_deref().is_some_and(|owner| owner != instance_id) {
+                    return Err(busy("machine volume belongs to a different instance"));
+                }
+            }
         }
         Action::Detach {
             attachment_id,
@@ -908,10 +955,7 @@ fn apply_metadata(
     let id = &input.volume_id;
     match &input.command {
         Action::Create { lifecycle, .. } => {
-            tx.execute(
-                "INSERT INTO product_volumes VALUES(?,?,?,?,?,1,'available')",
-                params![id, route, bundle, input.owner_id, lifecycle],
-            )?;
+            insert_volume(tx, id, route, bundle, &input.owner_id, lifecycle, None)?;
             return Ok(());
         }
         Action::Snapshot { snapshot_id } => {
@@ -978,6 +1022,8 @@ fn apply_metadata(
                     execution_epoch
                 ],
             )?;
+            tx.execute("UPDATE product_machine_volumes SET instance_id=? WHERE volume_id=? AND instance_id IS NULL",
+                params![instance_id, id])?;
             if let Some(generation) = generation {
                 insert_pin(tx, "product_attachment", attachment_id, &generation, op)?;
             }

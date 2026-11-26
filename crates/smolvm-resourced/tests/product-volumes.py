@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -102,6 +103,7 @@ def run(broker):
             call("FinishOperation", FINISH, **writer)
             require(query("user-data")["attachments"][0]["state"] == "attached")
             rejects("E_VOLUME_BUSY", lambda: mutate("user-data", "live-snapshot", 2, "snapshot", snapshot_id="unsafe"))
+            rejects("E_VOLUME_REQUIRES_STOPPED", lambda: mutate("user-data", "live-grow", 2, "grow", capacity_bytes=2 * CAPACITY))
             rejects("E_VOLUME_BUSY", lambda: mutate("user-data", "live-detach", 2, "detach",
                 attachment_id="disk-attachment", execution_epoch=1, instance_id=INSTANCE))
             guest.stdin.write("exit\n")
@@ -130,6 +132,66 @@ def run(broker):
             mutate("user-data", "delete", 4, "delete")
             require(query("user-data")["state"] == "deleted" and query("disk-clone")["capacity_bytes"] == CAPACITY * 2)
             print("PRODUCT_VOLUME_SNAPSHOT_CLONE_GROW_AND_CAPTURE_PIN", flush=True)
+
+            name = "machine-volumes"
+            instance = f"i-{'a' * 32}-{hashlib.sha256(name.encode()).hexdigest()}"
+            machine = {"instance_id": instance, "execution_epoch": 0, "mode": "rw", "fork_policy": "clone"}
+            lifetime = mutate("machine-data", "create", 0, "create", capacity_bytes=CAPACITY, lifecycle="machine")["volume"]
+            require(lifetime["lifecycle"] == "machine" and "machine_instance_id" not in lifetime, lifetime)
+            owned = mutate("machine-data", "attach", 1, "attach", attachment_id="machine-disk",
+                           device_key="data", **machine)["volume"]
+            require(owned["machine_instance_id"] == instance, owned)
+            saved = mutate("machine-data", "snapshot", 2, "snapshot", snapshot_id="machine-disk-snapshot")["volume"]
+            prior = saved["snapshots"][0]["generation_id"]
+            current = saved["head_resource_id"]
+            mutate("machine-data", "detach", saved["revision"], "detach",
+                   attachment_id="machine-disk", instance_id=instance, execution_epoch=0)
+            detached = query("machine-data")
+            require(detached["machine_instance_id"] == instance and not detached["attachments"], detached)
+            rejects("E_VOLUME_BUSY", lambda: mutate("machine-data", "foreign-attach", detached["revision"], "attach",
+                attachment_id="foreign-disk", device_key="data", **{**machine, "instance_id": "other-machine"}))
+            require(query("machine-data") == detached, "foreign attempt changed machine ownership")
+
+            legacy = mutate("old-ephemeral", "create", 0, "create", capacity_bytes=CAPACITY, lifecycle="ephemeral")["volume"]
+            mutate("old-ephemeral", "attach", legacy["revision"], "attach",
+                   attachment_id="legacy-disk", device_key="legacy", **machine)
+            held_machine = mutate("machine-also-attached", "create", 0, "create",
+                capacity_bytes=CAPACITY, lifecycle="machine")["volume"]
+            mutate("machine-also-attached", "attach", held_machine["revision"], "attach",
+                   attachment_id="second-owned-disk", device_key="next", **machine)
+            # A long-lived machine can own more than one packet's worth of
+            # detached volumes while using very few device slots.
+            prior_heads = []
+            for index in range(63):
+                volume = f"retired-disk-{index}"
+                attachment = f"owned-attachment-{index}"
+                item = mutate(volume, "create", 0, "create", capacity_bytes=4096, lifecycle="machine")["volume"]
+                attached = mutate(volume, "attach", item["revision"], "attach",
+                                  attachment_id=attachment, device_key="spare", **machine)["volume"]
+                mutate(volume, "detach", attached["revision"], "detach", attachment_id=attachment,
+                       instance_id=instance, execution_epoch=0)
+                prior_heads.append(item["head_resource_id"])
+            retirement = generation.operation(instance, "retire", 0)
+            accepted = call("RetireStoppedInstance", {"name": name}, **retirement)
+            require(accepted["phase"] == "NEW", accepted)
+            until(lambda: call("QueryOperation", **retirement)["phase"] == "COMPLETED",
+                  process, "machine retirement")
+            require(call("RetireStoppedInstance", {"name": name}, **retirement)["phase"] == "COMPLETED")
+            retired = query("machine-data")
+            require(retired["state"] == "deleted" and retired["revision"] == detached["revision"] + 1, retired)
+            require(query("machine-also-attached")["state"] == "deleted" and not query("machine-also-attached")["attachments"])
+            for head in (current, held_machine["head_resource_id"], *prior_heads):
+                until(lambda: not (state / "objects" / head).exists(), process, "retired machine data file")
+                require(call("QueryResource", {"resource_id": head})["state"] == "deleted", head)
+            require((state / "objects" / prior / "data").is_file(), "pinned immutable generation was collected")
+            require(query("machine-data")["snapshots"] == saved["snapshots"], "retirement discarded a snapshot")
+            survivor = query("old-ephemeral")
+            require(survivor["lifecycle"] == "ephemeral" and survivor["state"] == "available"
+                    and not survivor["attachments"] and "machine_instance_id" not in survivor, survivor)
+            mutate("old-ephemeral", "move-to-another-machine", survivor["revision"], "attach",
+                   attachment_id="legacy-moved", device_key="legacy",
+                   **{**machine, "instance_id": "other-machine"})
+            print("OWNED_MACHINE_VOLUMES_RETIRED_WITH_65_ATTACHED_AND_DETACHED_HEADS", flush=True)
         finally:
             for item in (guest, process):
                 if item is not None and item.poll() is None:
@@ -137,10 +199,83 @@ def run(broker):
                     item.wait(10)
 
 
+def verify_upgrade(old_binary, new_binary):
+    with tempfile.TemporaryDirectory(prefix="volume-upgrade-") as temporary:
+        root = Path(temporary)
+        socket, state = root / "worker.sock", root / "state"
+        catalog = f"file:{state}/catalog.sqlite?mode=ro"
+        name = "legacy-ephemeral-owner"
+        instance = f"i-{'a' * 32}-{hashlib.sha256(name.encode()).hexdigest()}"
+        volume = "legacy-ephemeral"
+        lookup = dict(volume_id=volume, owner_id=OWNER)
+
+        def call(method, payload=None, **scope):
+            return rpc(socket, method, payload, **scope)
+
+        def schema():
+            with sqlite3.connect(catalog, uri=True) as database:
+                return database.execute("PRAGMA user_version").fetchone()[0]
+
+        def start(binary):
+            return subprocess.Popen([Path(binary).resolve(strict=True), "serve", "--socket", socket, "--state-dir", state])
+
+        def health(process):
+            def listen():
+                try:
+                    return call("Health")
+                except (FileNotFoundError, ConnectionRefusedError):
+                    return None
+            return until(listen, process, "Worker health")
+
+        def observation():
+            return call("QueryProductVolume", lookup, **generation.operation(volume, "query", 0))
+
+        old = start(old_binary)
+        try:
+            first = health(old)
+            require(schema() == 28, "fixture requires an actual schema 28 Worker")
+            binary_digest = "sha256:" + hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest()
+            call("RegisterBundle", {"executable_sha256": binary_digest}, bundle_digest=generation.BUNDLE)
+            for revision, label, command in (
+                (0, "create", dict(action="create", capacity_bytes=CAPACITY, lifecycle="ephemeral")),
+                (1, "attach", dict(action="attach", attachment_id="legacy-attachment", device_key="data",
+                                   instance_id=instance, execution_epoch=0, mode="rw", fork_policy="clone")),
+            ):
+                call("ApplyProductVolume", {**lookup, "expected_revision": revision, "command": command},
+                     **generation.operation(volume, label, 0))
+            original = observation()
+            original_data = state / "objects" / original["head_resource_id"] / "data"
+            original_inode = original_data.stat().st_ino
+        finally:
+            old.terminate()
+            old.wait(10)
+        new = start(new_binary)
+        try:
+            second = health(new)
+            require(schema() == 29 and second["state"] == "recovering")
+            require(call("CompleteRecovery", {"broker_session_id": second["broker_session_id"]})["state"] == "ready")
+            require(original == observation(), "upgrade changed the old volume or its existing attachment")
+            retirement = generation.operation(instance, "retire", 0)
+            call("RetireStoppedInstance", {"name": name}, **retirement)
+            until(lambda: call("QueryOperation", **retirement)["phase"] == "COMPLETED", new, "legacy compute retirement")
+            survivor = observation()
+            require(survivor["lifecycle"] == "ephemeral" and survivor["state"] == "available"
+                    and not survivor["attachments"] and "machine_instance_id" not in survivor, survivor)
+            require(original_data.stat().st_ino == original_inode, "legacy data was replaced or removed")
+            print(json.dumps({"case": "volume-schema-28-to-29", "before": first["executable_sha256"],
+                              "after": second["executable_sha256"], "legacy_volume": survivor,
+                              "original_inode": original_inode}, sort_keys=True), flush=True)
+        finally:
+            new.terminate()
+            new.wait(10)
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "writer":
         worker(sys.argv[2])
     elif len(sys.argv) == 2:
         run(sys.argv[1])
+    elif len(sys.argv) == 4 and sys.argv[1] == "--upgrade":
+        verify_upgrade(sys.argv[2], sys.argv[3])
     else:
-        sys.exit(f"usage: {sys.argv[0]} RESOURCED")
+        sys.exit(f"usage: {sys.argv[0]} RESOURCED | --upgrade OLD_SCHEMA_28_WORKER RESOURCED")

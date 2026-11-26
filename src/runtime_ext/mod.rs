@@ -326,6 +326,7 @@ async fn native<T: serde::Serialize + Send + 'static>(
                 | "E_OPERATION_IN_PROGRESS"
                 | "E_STATE_CONFLICT"
                 | "E_VOLUME_BUSY"
+                | "E_VOLUME_REQUIRES_STOPPED"
                 | "E_VOLUME_GENERATION_MISMATCH"
                 | "E_ALREADY_COMMITTED"
                 | "E_STALE_REVISION" => StatusCode::CONFLICT,
