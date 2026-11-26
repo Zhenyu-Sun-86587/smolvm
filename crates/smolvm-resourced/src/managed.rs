@@ -171,7 +171,27 @@ impl Machine {
                 "managed network changes require a separate attachment operation",
             ));
         }
+        let mut disks = self.disks.clone();
         if let Some(previous) = previous.as_ref() {
+            if self.boot_profile == "system-debian-v1" && previous.restore.is_some() {
+                let declared = &disks[0];
+                let captured = previous.machine.disks.first()
+                    .ok_or_else(|| Fault::new("E_CATALOG", "restored System has no root declaration"))?;
+                if declared.device_id == "root" && declared.device_id == captured.device_id
+                    && declared.role == captured.role && declared.read_only == captured.read_only
+                    && declared.volume_id.is_none() && captured.volume_id.is_none()
+                    && valid_id(&declared.attachment_id)
+                {
+                    let closure = c.block_closure(&captured.generation_id)?;
+                    if declared.generation_id == captured.generation_id || closure.last().is_some_and(
+                        |base| base.spec.resource_id == declared.generation_id
+                    ) {
+                        // System's launch template cites the installed base.
+                        // Continue the stopped target's captured root slot and head.
+                        disks[0] = captured.clone();
+                    }
+                }
+            }
             let mut intrinsic = Vec::new();
             for (old, device) in previous.machine.disks.iter().zip(&previous.devices) {
                 if old.volume_id.is_some() {
@@ -190,7 +210,7 @@ impl Machine {
                 }
             }
             if previous.machine.boot_profile != self.boot_profile
-                || intrinsic.into_iter().ne(self.disks.iter().filter(|d| d.volume_id.is_none()))
+                || intrinsic.into_iter().ne(disks.iter().filter(|d| d.volume_id.is_none()))
             {
                 return Err(Fault::new(
                     "E_VOLUME_CONFLICT",
@@ -203,12 +223,21 @@ impl Machine {
         let mut volumes = HashSet::new();
         let mut layers = HashSet::new();
         let mut devices = Vec::new();
-        for (i, disk) in self.disks.iter().enumerate() {
+        for (i, disk) in disks.iter().enumerate() {
+            let prior_root = if i == 0 && self.boot_profile == "system-debian-v1"
+                && disk.device_id == "root" && disk.volume_id.is_none()
+            {
+                previous.as_ref().and_then(|plan| plan.devices.first())
+                    .filter(|device| device.disk.device_id == disk.device_id)
+            } else {
+                None
+            };
+            let attachment_id = prior_root.map_or(&disk.attachment_id, |device| &device.disk.attachment_id);
             if ![&disk.device_id, &disk.attachment_id]
                 .iter()
                 .all(|v| valid_id(v))
                 || !ids.insert(&disk.device_id)
-                || !attachments.insert(&disk.attachment_id)
+                || !attachments.insert(attachment_id)
                 || !(i == 0
                     || matches!(disk.role.as_str(), "data" | "overlay" | "cache" | "storage"))
             {
@@ -247,15 +276,14 @@ impl Machine {
             for layer in &closure {
                 layers.insert(layer.spec.resource_id.clone());
             }
-            let old = previous.as_ref().and_then(|p| {
-                p.devices
-                    .iter()
-                    .find(|d| d.disk.attachment_id == disk.attachment_id)
-            });
+            let old = prior_root.or_else(|| previous.as_ref().and_then(|plan| {
+                plan.devices.iter().find(|device| device.disk.attachment_id == disk.attachment_id)
+            }));
             let volume_id = old
                 .map(|d| d.volume_id.clone())
                 .unwrap_or_else(|| key(op, "volume", i));
             let mut active = disk.clone();
+            active.attachment_id = attachment_id.clone();
             let (head_id, reattach) = if disk.read_only {
                 (None, false)
             } else if old.is_some() {
