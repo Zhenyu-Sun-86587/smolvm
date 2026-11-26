@@ -207,7 +207,7 @@ def change_source_epoch(source, destination):
                                                    + updated + data[end:])
 
 
-def orchestrate(broker, library, guest, helper, durable=False):
+def orchestrate(broker, library, guest, helper, durable=False, mixed_capture=False):
     broker, library, guest, helper = [Path(path).resolve(strict=True) for path in (broker, library, guest, helper)]
     with tempfile.TemporaryDirectory(prefix="parked-block-") as temporary:
         work = Path(temporary)
@@ -584,6 +584,26 @@ def orchestrate(broker, library, guest, helper, durable=False):
 
             call("FinishOperation", FINISH, **scope("child", "writers"))
             _, branch, recursive = park(child, "child", child_heads, 1, "child-next-grant", 2, 2)
+            if mixed_capture:
+                later = [head["head_resource_id"] for head in child_heads]
+                require(point["source_pivot_id"] != recursive["source_pivot_id"] and set(sealed).isdisjoint(later),
+                        "expected two independent captured device inventories")
+                for name, expected, generations in (
+                    ("mixed-original", point, [sealed[0], later[1]]),
+                    ("mixed-recursive", recursive, [sealed[0], later[1]]),
+                ):
+                    target = launch(name, heads_for(name, generations), point=expected)
+                    require(target[0].wait(20) != 0 and not target[1].exists() and not target[2](),
+                            "mixed-capture target became visible", name)
+                    error = (work / (name + ".stderr")).read_text(errors="replace")
+                    require("exact captured block generation" in error or "E_FENCE_UNPROVEN" in error, name, error)
+                    call("FinalizeExecutionExit", **scope(name, "launch"))
+                    print(json.dumps({"case": name, "captured_origin": expected["source_pivot_id"],
+                                      "generations": generations, "original_capture": sealed,
+                                      "recursive_capture": later, "target_control_socket": False,
+                                      "target_guest_output": False, "rejection": error.strip()},
+                                     sort_keys=True), flush=True)
+                require(child[2]() == branch, "rejected targets advanced the held child")
             for ancestor in (source, child):
                 ancestor[0].terminate()
                 ancestor[0].wait(10)
@@ -614,5 +634,7 @@ if __name__ == "__main__":
         orchestrate(*sys.argv[1:])
     elif len(sys.argv) == 6 and sys.argv[1] == "--durable":
         orchestrate(*sys.argv[2:], durable=True)
+    elif len(sys.argv) == 6 and sys.argv[1] == "--mixed-capture":
+        orchestrate(*sys.argv[2:], mixed_capture=True)
     else:
-        sys.exit(f"usage: {sys.argv[0]} [--durable] RESOURCED LIBKRUN STATIC_GUEST IDENTITY_HELPER")
+        sys.exit(f"usage: {sys.argv[0]} [--durable|--mixed-capture] RESOURCED LIBKRUN STATIC_GUEST IDENTITY_HELPER")
