@@ -7,6 +7,7 @@ use crate::statepoint_capture::Purpose;
 use crate::statepoint_catalog::Record as StatePoint;
 use crate::statepoints::{Lookup as StatePointLookup, StatePoints, Stop as StatePointStop};
 use clap::{Parser, Subcommand};
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -1598,16 +1599,22 @@ impl Worker {
     }
 
     fn verify_execution_scope(&self, operation: &str, pid: i32) -> Result<()> {
-        let managed: bool = self.catalog.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM managed_launches WHERE operation_id=?)",
-            [operation],
-            |row| row.get(0),
-        )?;
-        if managed && !crate::worker_scope::contains_process(pid).map_err(broker_error)? {
-            return Err(Fault::new(
-                "E_FENCE_UNPROVEN",
-                "managed VMM is outside the Worker VM slice",
-            ));
+        let managed: Option<(String, String)> = self
+            .catalog
+            .db
+            .query_row(
+                "SELECT serve_instance,machine_name FROM managed_launches WHERE operation_id=?",
+                [operation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((serve, machine)) = managed {
+            if !crate::worker_scope::contains_process(pid, &serve, &machine).map_err(broker_error)? {
+                return Err(Fault::new(
+                    "E_FENCE_UNPROVEN",
+                    "managed VMM is outside the scope of its Serve and machine",
+                ));
+            }
         }
         Ok(())
     }

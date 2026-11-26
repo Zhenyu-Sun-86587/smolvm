@@ -515,11 +515,7 @@ pub fn scope_name(machine_id: &str) -> String {
 }
 
 #[cfg(feature = "deep-runtime")]
-fn deep_scope_name(instance: &str, machine_id: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let machine = hex::encode(&Sha256::digest(machine_id.as_bytes())[..16]);
-    format!("smolvmdeep-vm-{instance}-{machine}.scope")
-}
+use smolvm_runtime_protocol::managed_scope_name as deep_scope_name;
 
 #[cfg(feature = "deep-runtime")]
 pub(crate) fn owns_cgroup(dir: &Path, machine: Option<&str>) -> bool {

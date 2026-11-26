@@ -34,18 +34,32 @@ pub(crate) fn cgroup() -> io::Result<PathBuf> {
     Ok(PathBuf::from("/sys/fs/cgroup").join(configured_slice()?))
 }
 
-pub(crate) fn contains_process(pid: i32) -> io::Result<bool> {
-    let prefix = format!("0::/{}/", configured_slice()?);
+fn in_scope(groups: &str, slice: &str, scope: &str) -> bool {
+    let expected = format!("0::/{slice}/{scope}");
+    groups.lines().any(|group| group == expected)
+}
+
+pub(crate) fn contains_process(pid: i32, serve: &str, machine: &str) -> io::Result<bool> {
+    let scope = smolvm_runtime_protocol::managed_scope_name(serve, machine);
     let groups = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
-    Ok(groups.lines().any(|line| {
-        line.strip_prefix(&prefix)
-            .is_some_and(|child| child.ends_with(".scope") && !child.contains('/'))
-    }))
+    Ok(in_scope(&groups, configured_slice()?, &scope))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sibling_in_the_same_worker_slice_does_not_own_the_execution() {
+        let scope = smolvm_runtime_protocol::managed_scope_name("serve-a", "vm");
+        let groups = format!("1:name=systemd:/a\n0::/smolvmproof42.slice/{scope}\n");
+        assert!(in_scope(&groups, "smolvmproof42.slice", &scope));
+        assert!(!in_scope(&groups, "smolvmdeep.slice", &scope));
+        let sibling = smolvm_runtime_protocol::managed_scope_name("serve-b", "vm");
+        assert!(!in_scope(&groups, "smolvmproof42.slice", &sibling));
+        let other = smolvm_runtime_protocol::managed_scope_name("serve-a", "other");
+        assert!(!in_scope(&groups, "smolvmproof42.slice", &other));
+    }
 
     #[test]
     fn one_dedicated_top_level_slice_is_required() {

@@ -4,6 +4,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+/// Systemd scope shared by the Serve that launches a managed VMM and the
+/// Worker that verifies its process and accounts for its resources.
+pub fn managed_scope_name(serve: &str, machine: &str) -> String {
+    let machine_hash = format!("{:x}", Sha256::digest(machine.as_bytes()));
+    format!("smolvmdeep-vm-{serve}-{}.scope", &machine_hash[..32])
+}
+
 mod measured_release;
 pub use measured_release::{MANAGED_ACCEPTANCE_PATH, MeasuredRelease, measured_release};
 
