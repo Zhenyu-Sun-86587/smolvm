@@ -49,7 +49,7 @@ impl MeasuredRelease {
         let mut publish = |name: &str, profile: &str| {
             let capability = if let Some(reason) = unavailable {
                 Capability {
-                    status: "unavailable".into(),
+                    status: "unknown".into(),
                     supported: false,
                     reason_code: reason.into(),
                     contract_version: None,
@@ -324,6 +324,8 @@ mod tests {
             assert!(!response.capabilities["network.native_reidentity"].supported);
             release.advertise(&mut response, Some("WORKER_RELEASE_MISMATCH"));
             assert!(!response.capabilities["lifecycle.standby"].supported);
+            assert_eq!(response.capabilities["lifecycle.standby"].status, "unknown");
+            assert!(response.capabilities["boot.system"].supported);
         }
     }
 
