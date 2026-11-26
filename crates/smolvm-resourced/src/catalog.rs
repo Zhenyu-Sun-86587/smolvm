@@ -1097,6 +1097,7 @@ impl Catalog {
                     AND o.phase IN ('COMPLETED','ABORTED'))
              AND NOT EXISTS(SELECT 1 FROM root_refs WHERE resource_id=?1 AND state='active')
              AND NOT EXISTS(SELECT 1 FROM resource_edges WHERE child_resource_id=?1)
+             AND NOT EXISTS(SELECT 1 FROM fd_leases WHERE resource_id=?1 AND state<>'released')
              AND NOT EXISTS(SELECT 1 FROM writer_reservations WHERE head_resource_id=?1)",
             params![identifier(id)?, initial, revision], |r| r.get(0))?;
         if !eligible {
@@ -1115,6 +1116,23 @@ impl Catalog {
         }
         tx.commit()?;
         self.resource(id)
+    }
+
+    pub(crate) fn unused_fork_ram(&self) -> Result<Vec<(String, String, i64)>> {
+        let mut query = self.db.prepare(
+            "SELECT r.resource_id,r.state,r.revision FROM resources r
+             JOIN managed_fork_batches b ON b.capture_id=r.resource_id
+             JOIN operations o ON o.operation_id=b.operation_id AND o.operation_id=r.created_by_operation
+             WHERE o.kind IN ('independent_fork','fork_batch') AND o.phase IN ('COMPLETED','ABORTED')
+               AND r.kind='descriptor' AND r.durability='volatile' AND r.state IN ('available','deleting')
+               AND NOT EXISTS(SELECT 1 FROM root_refs WHERE resource_id=r.resource_id AND state='active')
+               AND NOT EXISTS(SELECT 1 FROM resource_edges WHERE child_resource_id=r.resource_id)
+               AND NOT EXISTS(SELECT 1 FROM fd_leases WHERE resource_id=r.resource_id AND state<>'released')
+               AND NOT EXISTS(SELECT 1 FROM writer_reservations WHERE head_resource_id=r.resource_id)
+             ORDER BY r.rowid LIMIT 16",
+        )?;
+        let rows = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn register_volume(

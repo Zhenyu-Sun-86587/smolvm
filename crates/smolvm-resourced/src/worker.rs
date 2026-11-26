@@ -373,6 +373,23 @@ pub(crate) fn ofd_lock(file: &File) -> Result<()> {
 }
 
 impl Worker {
+    fn collect_unused_fork_ram(&mut self) -> Result<()> {
+        if self.catalog.ready().is_err() {
+            return Ok(());
+        }
+        for (resource, state, revision) in self.catalog.unused_fork_ram()? {
+            let revision = if state == "available" {
+                self.catalog.gc(&resource, revision, false)?;
+                revision + 1
+            } else {
+                revision
+            };
+            self.catalog.gc(&resource, revision, true)?;
+            self.escrow.collect(&resource);
+        }
+        Ok(())
+    }
+
     fn managed_devices(&mut self, r: &Request, execution: &Execution) -> Result<Reply> {
         let op = self.catalog.active_operation(r)?;
         let plan = crate::managed::plan(&self.catalog, &op)?
@@ -2408,6 +2425,9 @@ fn serve(
             worker
                 .reconcile_statepoints()
                 .map_err(|fault| io::Error::other(fault.message))?;
+            if let Err(error) = worker.collect_unused_fork_ram() {
+                eprintln!("resourced fork RAM collection: {error}");
+            }
             next_stop_check = Instant::now() + Duration::from_secs(1);
         }
         let mut pending = libc::pollfd {
