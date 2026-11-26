@@ -6,11 +6,14 @@ use crate::escrow_catalog::{self, LeaseRecord};
 use crate::grants::{self, WriterGrant};
 use crate::ipc::{self, Expected, Fault, FdEntry, Request, Result};
 use crate::native_control::Endpoint;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
+
+#[path = "durable_reader_recovery.rs"]
+mod durable_reader_recovery;
 
 type Identity = (u64, u64, u64);
 
@@ -169,8 +172,19 @@ impl Worker {
     }
 
     fn recover_reader(&mut self, execution: &Execution, lease: &LeaseRecord) -> Result<()> {
+        let capture: Option<String> = self.catalog.db.query_row(
+            "SELECT capture_id FROM statepoint_restore_leases WHERE lease_id=?",
+            [&lease.lease_id],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(capture) = capture {
+            return self.recover_statepoint_reader(execution, lease, &capture);
+        }
         if self.catalog.has_managed_block(&lease.resource_id)? {
             return self.recover_block_reader(execution, lease);
+        }
+        if self.catalog.resource(&lease.resource_id)?["durability"] != "volatile" {
+            return Err(grants::fence_unproven("unrecognized durable reader lease"));
         }
         let op = self.catalog.operation(&lease.operation_id)?;
         let r = request(

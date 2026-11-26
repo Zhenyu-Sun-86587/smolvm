@@ -4,7 +4,7 @@ use crate::catalog::Execution;
 use crate::statepoint_capture::{Capture, Device, Export, MAX_CHECKPOINT_BYTES};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use smolvm_checkpoint::{Writer, format::PackManifest, store};
+use smolvm_checkpoint::{Writer, format::PackManifest, store::{self, ChunkedFile}};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
@@ -285,6 +285,37 @@ pub(crate) fn materialize(
     disks: BTreeMap<String, File>,
 ) -> io::Result<(File, File)> {
     materialize_in(directory, manifest, disks, directory)
+}
+
+/// Validate a surviving Restore RAM file against the verified durable index.
+pub(crate) fn verify_retained_ram(
+    directory: &Path,
+    manifest: &Manifest,
+    file: &File,
+) -> io::Result<()> {
+    let ram = ChunkedFile::open(&directory.join(&manifest.statepoint.representation_id), MEMORY)?;
+    let chunk_size = ChunkedFile::chunk_size();
+    let size = ram.size();
+    if size != manifest.statepoint.memory_bytes()?
+        || file.metadata()?.len() != size
+        || ram.chunks() as u64 != size.div_ceil(chunk_size)
+    {
+        return Err(invalid("retained StatePoint RAM has a different layout"));
+    }
+    let mut buffer = vec![0; chunk_size as usize];
+    for index in 0..ram.chunks() {
+        let offset = index as u64 * chunk_size;
+        let current = &mut buffer[..(size - offset).min(chunk_size) as usize];
+        file.read_exact_at(current, offset)?;
+        let matches = match ram.read(index)? {
+            Some(stored) => stored == current,
+            None => current.iter().all(|byte| *byte == 0),
+        };
+        if !matches {
+            return Err(invalid("retained StatePoint RAM differs from the durable image"));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn materialize_in(
