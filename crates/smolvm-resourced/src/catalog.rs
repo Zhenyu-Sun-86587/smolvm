@@ -209,6 +209,16 @@ fn resource_available(db: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn bundle_executable(db: &Connection, digest: &str) -> Result<String> {
+    db.query_row(
+        "SELECT executable_sha256 FROM runtime_bundles WHERE bundle_digest=?",
+        [digest],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| conflict("E_BUNDLE_UNAVAILABLE", "bundle is not registered on this worker"))
+}
+
 impl Catalog {
     pub fn open(path: &Path, boot_id: &str, session_id: &str) -> Result<Self> {
         let mut db = Connection::open_with_flags(
@@ -428,19 +438,7 @@ impl Catalog {
     }
 
     pub fn bundle(&self, digest: &str) -> Result<String> {
-        self.db
-            .query_row(
-                "SELECT executable_sha256 FROM runtime_bundles WHERE bundle_digest=?",
-                [digest],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                conflict(
-                    "E_BUNDLE_UNAVAILABLE",
-                    "bundle is not registered on this worker",
-                )
-            })
+        bundle_executable(&self.db, digest)
     }
 
     pub fn register_bundle(&self, digest: &str, binary: &str) -> Result<Value> {

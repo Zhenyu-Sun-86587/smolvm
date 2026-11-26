@@ -1,10 +1,10 @@
 //! Authoritative bandwidth of a Worker-managed execution's own systemd scope.
 
-use super::{pid_exited, pid_start, stale_execution, Worker};
-use crate::catalog::{Catalog, Execution, Operation};
+use super::{observe_pid, pid_exited, pid_start, stale_execution, verify_executable, Worker};
+use crate::catalog::{bundle_executable, Catalog, Execution, Operation};
 use crate::ipc::{Fault, Request, Result};
 use crate::worker_scope;
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use smolvm_runtime_protocol::{cpu_quota, managed_scope_name};
@@ -114,9 +114,8 @@ struct ManagedScope {
 }
 
 impl ManagedScope {
-    fn from_launch(catalog: &Catalog, operation_id: &str) -> Result<Option<Self>> {
-        Ok(catalog
-            .db
+    fn from_launch(db: &Connection, operation_id: &str) -> Result<Option<Self>> {
+        Ok(db
             .query_row(
                 "SELECT serve_instance,machine_name,vcpus FROM managed_launches WHERE operation_id=?",
                 [operation_id],
@@ -268,15 +267,61 @@ fn uncertain(error: io::Error) -> Fault {
     )
 }
 
-fn desired(catalog: &Catalog, instance_id: &str) -> Result<Option<u32>> {
-    Ok(catalog
-        .db
+fn desired(db: &Connection, instance_id: &str) -> Result<Option<u32>> {
+    Ok(db
         .query_row(
             "SELECT millicpus FROM managed_cpu_limits WHERE instance_id=?",
             [instance_id],
             |r| r.get(0),
         )
         .optional()?)
+}
+
+/// Reapply a managed scope's quota before publishing the VMM-observed CPU
+/// topology from a resize. Online Guest CPUs may be fewer than created slots.
+pub(crate) fn reconcile_cpu_limit_after_resize(
+    db: &Connection,
+    execution: &Execution,
+    allocated_vcpus: u32,
+) -> Result<()> {
+    if execution.phase != "registered" || execution.route_id != "deep" {
+        return Err(stale_execution());
+    }
+    let mut owner = ManagedScope::from_launch(db, &execution.last_operation_id)?
+        .ok_or_else(|| Fault::new(UNAVAILABLE, "CPU resize requires a managed VMM scope"))?;
+    let reserved_vcpus: u32 = db
+        .query_row(
+            "SELECT h.vcpus FROM managed_budget_holds h
+            JOIN instance_bindings b USING (instance_id,incarnation_id)
+            JOIN worker_state w ON w.singleton=1
+            WHERE h.state='running' AND h.instance_id=? AND h.incarnation_id=?
+            AND b.route_id='deep' AND b.execution_epoch=? AND w.host_boot_id=?",
+            params![
+                execution.instance_id,
+                execution.incarnation_id,
+                execution.execution_epoch,
+                execution.host_boot_id
+            ],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(stale_execution)?;
+    if !(owner.vcpus..=reserved_vcpus).contains(&allocated_vcpus) {
+        return Err(Fault::new(
+            UNAVAILABLE,
+            "observed CPU slots differ from the managed reservation",
+        ));
+    }
+    let (start, pidfd) = observe_pid(execution.pid)?;
+    if start != execution.pid_start_time {
+        return Err(stale_execution());
+    }
+    let digest = bundle_executable(db, &execution.bundle_digest)?;
+    verify_executable(execution.pid, start, &pidfd, &digest)?;
+    owner.vcpus = allocated_vcpus;
+    let wanted = owner.effective_millicpus(desired(db, &execution.instance_id)?);
+    PinnedScope::open(&owner, execution.pid, start, &pidfd)?.apply(wanted, None)?;
+    Ok(())
 }
 
 struct Recorded {
@@ -428,7 +473,7 @@ impl Worker {
             &execution.instance_id,
             &execution.incarnation_id,
             execution.execution_epoch,
-            desired(&self.catalog, &execution.instance_id)?,
+            desired(&self.catalog.db, &execution.instance_id)?,
             actual,
         ))
     }
@@ -448,12 +493,14 @@ impl Worker {
     }
 
     fn cpu_scope_owner(&self, execution: &Execution) -> Result<ManagedScope> {
-        ManagedScope::from_launch(&self.catalog, &execution.last_operation_id)?.ok_or_else(|| {
-            Fault::new(
-                "E_CAPABILITY_UNSUPPORTED",
-                "execution has no Worker-managed systemd scope",
-            )
-        })
+        ManagedScope::from_launch(&self.catalog.db, &execution.last_operation_id)?.ok_or_else(
+            || {
+                Fault::new(
+                    "E_CAPABILITY_UNSUPPORTED",
+                    "execution has no Worker-managed systemd scope",
+                )
+            },
+        )
     }
 
     fn pin_cpu_scope<'a>(
@@ -532,16 +579,17 @@ impl Worker {
         if launch.route_id != "deep" {
             return Ok(());
         }
-        let Some(millicpus) = desired(&self.catalog, &launch.instance_id)? else {
+        let Some(millicpus) = desired(&self.catalog.db, &launch.instance_id)? else {
             return Ok(());
         };
-        let owner =
-            ManagedScope::from_launch(&self.catalog, &launch.operation_id)?.ok_or_else(|| {
+        let owner = ManagedScope::from_launch(&self.catalog.db, &launch.operation_id)?.ok_or_else(
+            || {
                 Fault::new(
                     UNAVAILABLE,
                     "stored CPU limit requires a Worker-managed launch",
                 )
-            })?;
+            },
+        )?;
         // RegisterExecution must succeed before the child constructs its VMM.
         PinnedScope::open(&owner, pid, start, pidfd)?
             .apply(owner.effective_millicpus(Some(millicpus)), None)?;

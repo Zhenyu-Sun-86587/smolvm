@@ -26,7 +26,7 @@ mod live_recovery;
 
 #[path = "managed_cpu_limits.rs"]
 mod managed_cpu_limits;
-pub(crate) use managed_cpu_limits::abort_cpu_limits_for_exit;
+pub(crate) use managed_cpu_limits::{abort_cpu_limits_for_exit, reconcile_cpu_limit_after_resize};
 
 #[derive(Parser)]
 #[command(version, about)]
