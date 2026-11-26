@@ -65,9 +65,12 @@ pub(crate) fn confirm_native(db: &Connection, operation: &str, disposition: &str
         db.execute("UPDATE lifecycle_policies SET idle_since=NULL,freeze_seq=NULL,freeze_session=NULL,
             grace_until=?2+1000*json_extract(policy_json,'$.min_running_after_wake_seconds'),activity_seq=activity_seq+1
             WHERE instance_id=(SELECT instance_id FROM operations WHERE operation_id=?1)",params![operation,now])?;
+        // The corresponding sessions remain in lifecycle_sessions as retired
+        // identities. A wake has no fresh reports until new collectors sample.
         db.execute(
-            "UPDATE lifecycle_reports SET valid_until=0 WHERE collector='guest' AND incarnation_id=
-            (SELECT incarnation_id FROM native_transitions WHERE operation_id=?)",
+            "DELETE FROM lifecycle_reports WHERE incarnation_id=(
+                SELECT n.incarnation_id FROM native_transitions n JOIN operations o USING(operation_id)
+                WHERE n.operation_id=? AND o.kind='wake')",
             [operation],
         )?;
     }
@@ -133,8 +136,20 @@ struct Report {
     seq: i64,
     valid_for_ms: i64,
     #[serde(default)]
+    generation: Option<String>,
+    #[serde(default)]
     supersedes: Option<String>,
     counts: BTreeMap<String, Option<i64>>,
+}
+
+fn collector_generation(db: &Connection, incarnation: Option<&str>) -> Result<Option<String>> {
+    Ok(db.query_row(
+        "SELECT n.operation_id FROM native_transitions n JOIN operations o USING(operation_id)
+        WHERE n.incarnation_id=? AND o.kind='wake' AND n.stage='complete' AND n.disposition='RUNNING'
+        ORDER BY n.rowid DESC LIMIT 1",
+        [incarnation],
+        |row| row.get(0),
+    ).optional()?)
 }
 fn apply(tx: &Transaction<'_>, r: &Request, instance: &str, bundle: &str) -> Result<Value> {
     let input: Apply = r.payload()?;
@@ -186,6 +201,9 @@ fn report(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> Result<Valu
         .incarnation_id
         .as_ref()
         .ok_or_else(|| conflict("activity requires a current execution"))?;
+    if input.generation != collector_generation(tx, Some(inc))? {
+        return Err(changed("collector generation changed after wake"));
+    }
     if !COLLECTORS.contains(&input.collector.as_str())
         || !valid_id(&input.session)
         || input.seq < 1

@@ -214,6 +214,7 @@ pub(super) fn status(c: &Catalog, expected: &Expected) -> Result<Value> {
     let now = monotonic()?;
     let o = observe(c, &m, &boot, now)?;
     let next = next_action(c, &m, &o, now)?;
+    let generation = collector_generation(&c.db, expected.incarnation_id.as_deref())?;
     let decision:Option<Value>=c.db.query_row("SELECT id,kind,origin,stage,error,start_memory,end_memory,created_at,finished_at FROM lifecycle_decisions
         WHERE instance_id=? ORDER BY rowid DESC LIMIT 1",[&expected.instance_id],|r|Ok(json!({"operation_id":r.get::<_,String>(0)?,"kind":r.get::<_,String>(1)?,
         "origin":r.get::<_,String>(2)?,"stage":r.get::<_,String>(3)?,"error":r.get::<_,Option<String>>(4)?,"start_worker_memory_bytes":r.get::<_,Option<i64>>(5)?,
@@ -234,7 +235,7 @@ pub(super) fn status(c: &Catalog, expected: &Expected) -> Result<Value> {
     Ok(
         json!({"collectors":collectors,"instance_id":expected.instance_id,"incarnation_id":expected.incarnation_id,"execution_epoch":expected.execution_epoch,
         "binding_revision":protections::revision(expected)?,"power":o.power,"statepoint":m.saved(&c.db)?,"applied_revision":m.rev,"effective_policy":m.policy,"activity_seq":m.seq,
-        "first_launch_supported":true,
+        "first_launch_supported":true,"collector_generation":generation,
         "blockers":o.blockers,"controlled_suspended":o.gate.is_some() && o.gate==m.freeze_session && m.freeze==Some(m.seq),"idle_ms":m.idle.map(|v|now.saturating_sub(v)),
         "last_decision":decision,"next_action":next,"pressure":pressure.map(|(held,raw)|json!({"admission_throttled":held,"sample":serde_json::from_str::<Value>(&raw).ok(),"last_balloon":balloon}))}),
     )
