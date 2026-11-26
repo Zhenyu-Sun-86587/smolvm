@@ -218,7 +218,7 @@ def main():
 
         try:
             verify(bundle, root, args.guest, None, False, False, False, False,
-                   observer=observe, stage_bundle=False, worker_binary=args.worker)
+                   observer=observe, stage_bundle=False, worker_binary=args.worker, check_launch_rejections=False)
         except BaseException:
             for log in ("worker.log", "replacement.log", "serve.log"):
                 if (root / log).exists():

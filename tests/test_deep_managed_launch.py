@@ -166,7 +166,7 @@ def partial_fork(endpoint, root, ref):
 
 
 def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults, lifecycle=False, *,
-           observer=None, stage_bundle=True, worker_binary=None):
+           observer=None, stage_bundle=True, worker_binary=None, check_launch_rejections=True):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
@@ -276,12 +276,13 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
                       expected={k: before[k] for k in ("instance_id","incarnation_id","execution_epoch")},kind="launch",parameters=parameters)
         limits=rpc(worker,"QueryWorkerBudget")
         assert limits["allocated"]=={"vcpus":0,"memory_mib":0,"storage_bytes":0}
-        expensive={**submit,"operation_id":"too-large","parameters":{**parameters,"memory_mib":4294967295}}
-        try:http(endpoint,EXT+"/operations",expensive)
-        except RuntimeError as error:assert "E_RESOURCE_LIMIT" in str(error)
-        else:raise AssertionError("over-budget launch admitted")
-        assert rpc(worker,"QueryWorkerBudget")["allocated"]==limits["allocated"]
-        if product_volumes:
+        if check_launch_rejections:
+            expensive={**submit,"operation_id":"too-large","parameters":{**parameters,"memory_mib":4294967295}}
+            try:http(endpoint,EXT+"/operations",expensive)
+            except RuntimeError as error:assert "E_RESOURCE_LIMIT" in str(error)
+            else:raise AssertionError("over-budget launch admitted")
+            assert rpc(worker,"QueryWorkerBudget")["allocated"]==limits["allocated"]
+        if product_volumes and check_launch_rejections:
             wrong_disks = [disks[0], {**disks[1], "device_id": "foreign-slot"}, disks[2]]
             wrong_slot = {**submit, "operation_id": "wrong-slot", "parameters": {**parameters, "disks": wrong_disks}}
             try:
@@ -329,10 +330,11 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
         ref = http(endpoint,f"{EXT}/machines/{name}/execution")
         assert op["execution"]==ref and ref["execution_epoch"]==1
         assert http(endpoint, EXT+"/operations",submit)==op
-        changed={**submit,"parameters":{**parameters,"memory_mib":768}}
-        try: http(endpoint, EXT+"/operations",changed)
-        except RuntimeError as err: assert "E_IDEMPOTENCY_CONFLICT" in str(err)
-        else: raise AssertionError("mutated launch intent was accepted")
+        if check_launch_rejections:
+            changed={**submit,"parameters":{**parameters,"memory_mib":768}}
+            try: http(endpoint, EXT+"/operations",changed)
+            except RuntimeError as err: assert "E_IDEMPOTENCY_CONFLICT" in str(err)
+            else: raise AssertionError("mutated launch intent was accepted")
         inventory_url=f"{EXT}/instances/{ref['instance_id']}/inventory"
         record=http(endpoint, inventory_url)
         assert record["execution"]["uid"]>0

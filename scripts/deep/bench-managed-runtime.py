@@ -325,7 +325,7 @@ def local_case(args):
         try:
             with installed_bundle(args.bundle, root) as measured:
                 verify(measured, root, guest, None, False, False, False, False,
-                       observer=measure, stage_bundle=False)
+                       observer=measure, stage_bundle=False, check_launch_rejections=False)
         except BaseException:
             for log in (root / "serve.log", root / "worker.log", *sorted((root / "state/managed").glob("*.log"))):
                 if log.exists():
