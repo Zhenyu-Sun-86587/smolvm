@@ -107,6 +107,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The System Agent accepts bounded writes to its own VM filesystem.
 pub const SYSTEM_FILE_WRITE_CAPABILITY: &str = "system-file-write-v1";
+
+/// Bounded VM-targeted listing, reading and staged writing on a System guest.
+pub const SYSTEM_FILE_TRANSFER_CAPABILITY: &str = "system-file-transfer-v1";
 /// The System Agent accepts connection-owned VM commands with streaming I/O.
 pub const SYSTEM_EXEC_STREAM_CAPABILITY: &str = "system-exec-stream-v1";
 

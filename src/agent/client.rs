@@ -1577,7 +1577,7 @@ impl AgentClient {
         self.receive()
     }
 
-    fn ping_info(&mut self) -> Result<(u32, Vec<String>)> {
+    pub(crate) fn ping_info(&mut self) -> Result<(u32, Vec<String>)> {
         let resp = self.request(&AgentRequest::Ping)?;
 
         match resp {

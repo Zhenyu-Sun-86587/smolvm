@@ -112,8 +112,8 @@ async fn ping(
     Json(input): Json<Scoped<Ping>>,
 ) -> Response {
     run(socket, id, input, |agent, _| {
-        let protocol = agent.ping().map_err(unavailable)?;
-        Ok(json!({"protocol": protocol}))
+        let (protocol, capabilities) = agent.ping_info().map_err(unavailable)?;
+        Ok(json!({"protocol": protocol, "capabilities": capabilities}))
     })
     .await
 }
