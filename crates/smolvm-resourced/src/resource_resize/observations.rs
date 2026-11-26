@@ -10,7 +10,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -213,43 +213,30 @@ pub(super) fn balloon(endpoint: &Endpoint) -> Result<Balloon> {
     })
 }
 
-fn scoped_cgroup(execution: &Execution) -> Result<PathBuf> {
-    let name = crate::worker_scope::configured_slice().map_err(native)?;
-    let input = fs::read_to_string(format!("/proc/{}/cgroup", execution.pid)).map_err(native)?;
-    if crate::worker::pid_start(execution.pid).ok() != Some(execution.pid_start_time) {
+pub(super) fn scoped_cgroup(execution: &Execution, machine: &str) -> Result<PathBuf> {
+    let serve = crate::managed::serve_id(&execution.instance_id, machine)?;
+    if !crate::worker_scope::contains_process(execution.pid, &serve, machine).map_err(native)?
+        || crate::worker::pid_start(execution.pid).ok() != Some(execution.pid_start_time)
+    {
         return Err(Fault::new(
             "E_STALE_EXECUTION",
-            "VMM process changed while sampling its cgroup",
+            "VMM is outside its confirmed Serve and machine scope",
         ));
     }
-    let group = input
-        .lines()
-        .find_map(|line| line.strip_prefix("0::/"))
-        .ok_or_else(|| native("VMM cgroup proof unavailable"))?;
-    let (slice, scope) = group
-        .split_once('/')
-        .ok_or_else(|| native("VMM has no dedicated scope"))?;
-    if slice != name || !scope.ends_with(".scope") || scope.contains('/') {
-        return Err(native("VMM is outside the configured Worker slice"));
-    }
-    Ok(PathBuf::from("/sys/fs/cgroup").join(group))
+    let name = smolvm_runtime_protocol::managed_scope_name(&serve, machine);
+    Ok(crate::worker_scope::cgroup().map_err(native)?.join(name))
 }
 
-pub(super) fn memory_current(execution: &Execution) -> Result<u64> {
-    fs::read_to_string(scoped_cgroup(execution)?.join("memory.current"))
+pub(super) fn memory_current(scope: &Path) -> Result<u64> {
+    fs::read_to_string(scope.join("memory.current"))
         .map_err(native)?
         .trim()
         .parse()
         .map_err(native)
 }
 
-pub(super) fn check_memory_budget(
-    execution: &Execution,
-    total_mib: u32,
-    increment: u64,
-) -> Result<()> {
-    let scope = scoped_cgroup(execution)?;
-    let root = std::path::Path::new("/sys/fs/cgroup");
+pub(super) fn check_memory_budget(scope: &Path, total_mib: u32, increment: u64) -> Result<()> {
+    let root = Path::new("/sys/fs/cgroup");
     let planned = u64::from(total_mib) * MIB;
     let high = fs::read_to_string(scope.join("memory.high")).map_err(native)?;
     if high.trim() != "max" && high.trim().parse::<u64>().map_err(native)? < planned {

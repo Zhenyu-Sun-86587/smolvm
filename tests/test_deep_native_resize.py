@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 from test_deep_managed_launch import EXT, digest, http, rpc, settled, until, verify
-from test_deep_worker_pressure import create_slice, open_pidfd, restart_worker
+from test_deep_worker_pressure import MIB, create_slice, open_pidfd, properties, restart_worker
 
 
 def expect_error(code, operation):
@@ -25,8 +25,9 @@ def expect_error(code, operation):
         raise AssertionError(f"expected {code}")
 
 
-def exercise(endpoint, root, original, inventory, _started, legacy):
+def exercise(endpoint, root, original, inventory, _started, legacy, group):
     worker = root / "ipc/worker.sock"
+    bundle = http(endpoint, EXT + "/capabilities")["bundle_digest"]
 
     def resources(ref):
         view = http(endpoint, f"{EXT}/instances/{ref['instance_id']}/resources", {"expected": ref})
@@ -61,6 +62,17 @@ def exercise(endpoint, root, original, inventory, _started, legacy):
 
     def ledger():
         return rpc(worker, "QueryWorkerBudget")["allocated"]
+
+    def cpu_quota(ref):
+        quota, period = (int(item) for item in resources(ref)["observed"]["scope_cpu_max"].split())
+        return quota * 1000 // period
+
+    def control(method, key, ref, payload):
+        return rpc(worker, method, payload, route_id="deep",
+                   bundle_digest=bundle, expected=ref, operation_id=key, request_digest=digest(key.encode()))
+
+    def limit(key, ref, millicpus):
+        return control("SetManagedCPULimit", key, ref, {"millicpus": millicpus})
 
     def online(ref):
         return execute(ref, "/bin/cat", "/sys/devices/system/cpu/online")
@@ -167,6 +179,7 @@ def exercise(endpoint, root, original, inventory, _started, legacy):
         assert shape["profile"] == "live-compute" and not shape["capture_compatible"], shape
         assert shape["observed"]["cpus"] == {"created": 1, "capacity": 16}
         assert shape["observed"]["online_cpu_ids"] == [0]
+        assert cpu_quota(ref) == 1000
         expect_error("E_CAPABILITY_UNSUPPORTED", lambda: operation("hot-capture-refused", ref, "vm_snapshot", capture_id="hot-no-state"))
         held = ledger()
         expect_error("E_RESOURCE_LIMIT", lambda: resize("hot-CPU-cap-refused", ref, change="cpu_online", cpus=5))
@@ -178,9 +191,16 @@ def exercise(endpoint, root, original, inventory, _started, legacy):
         assert ledger()["vcpus"] == held["vcpus"] + 1
         done = complete("hot-create-two")
         assert done["resize"]["observed"]["cpus"] == {"created": 2, "capacity": 16}
+        assert cpu_quota(ref) == 2000
         assert online(ref) == b"0-1\n"
         assert resize("hot-create-two", ref, change="cpu_online", cpus=2) == done
         expect_error("E_IDEMPOTENCY_CONFLICT", lambda: resize("hot-create-two", ref, change="cpu_online", cpus=3))
+        assert limit("cap-grown-vcpu", ref, 1500)["requested_millicpus"] == 1500
+        resize("offline-with-explicit-cap", ref, change="cpu_offline", cpus=1)
+        complete("offline-with-explicit-cap")
+        assert cpu_quota(ref) == 1500 and ledger()["vcpus"] == held["vcpus"] + 1
+        assert limit("reset-grown-vcpu-cap", ref, None)["requested_millicpus"] is None
+        assert cpu_quota(ref) == 2000 and online(ref) == b"0\n"
 
         def memtotal():
             return int(execute(ref, "/bin/cat", "/proc/meminfo").splitlines()[0].split()[1])
@@ -196,6 +216,34 @@ def exercise(endpoint, root, original, inventory, _started, legacy):
         assert binding(name) == ref and resize("hot-add-RAM", ref, change="memory_grow", memory_mib=640) == done
         print(json.dumps({"hot_compute": resources(ref)["observed"], "guest_memtotal_kib": [before, after],
                           "ledger": ledger(), "initial_cpu_operation": resized["phase"]}), flush=True)
+
+        control("ApplyLifecyclePolicy", "pressure-after-resize", restored, {
+            "expected_applied_revision": 0, "new_revision": 1,
+            "effective_policy": {"auto_standby": False, "auto_hibernate": True,
+                                 "hibernate_after_seconds": 600, "min_running_after_wake_seconds": 0},
+        })
+        counts = {"host": {"inbound": 0, "outbound": 0},
+                  "guest": {"inbound": 0, "outbound": 0, "exec": 0, "task": 0},
+                  "platform": {"task": 0, "exec": 0, "stream": 0}}
+        for collector, values in counts.items():
+            control("ReportActivity", "hint-" + collector, restored, {
+                "collector": collector, "session": "resize-pressure-test", "seq": 1,
+                "valid_for_ms": 60000, "counts": values,
+            })
+        properties(group.name, str(int((group / "memory.current").read_text()) + 120 * MIB))
+
+        def hint_result():
+            view = control("GetLifecycleStatus", "hint-status", restored, {})
+            hint = (view["pressure"] or {}).get("last_balloon")
+            if hint and hint["outcome"] != "unknown":
+                return view, hint
+
+        view, hint = until(hint_result, 35)
+        assert hint["decision_id"] == view["last_decision"]["operation_id"]
+        assert hint["worker_memory_before_bytes"] > 0 and hint["worker_memory_after_bytes"] > 0
+        assert hint["outcome"] in ("observed", "timed_out", "unavailable"), hint
+        print(json.dumps({"automatic_balloon_before_hibernate": hint}), flush=True)
+        properties(group.name, "infinity")
 
 
 def main():
@@ -214,11 +262,11 @@ def main():
         root = Path(directory)
         root.chmod(0o755)
         unit = f"smolvmresize{os.getpid()}_{os.urandom(4).hex()}.slice"
-        create_slice(unit, stack)
+        group = create_slice(unit, stack)
         os.environ.update(SMOLVM_WORKER_SLICE_NAME=unit, SMOLVM_WORKER_VCPU_BUDGET="5")
         try:
             verify(args.bundle, root, args.guest, args.system_image, False, False, False, False,
-                   observer=lambda *result: exercise(*result, args.legacy_agent))
+                   observer=lambda *result: exercise(*result, args.legacy_agent, group))
         except BaseException:
             for log in [root / "serve.log", root / "worker.log", *(root / "state/managed").glob("*.log")]:
                 if log.exists():

@@ -16,7 +16,10 @@ use smolvm_protocol::{
     AgentRequest, OFFLINE_CPU_SHRINK_CAPABILITY, ONLINE_CPU_GROWTH_CAPABILITY,
     ONLINE_MEMORY_GROWTH_CAPABILITY,
 };
-use std::thread::{self, JoinHandle};
+use std::{
+    path::Path,
+    thread::{self, JoinHandle},
+};
 
 pub(crate) const KIND: &str = "resize_resources";
 const BALLOON_WAIT_MS: i64 = 12_000;
@@ -33,6 +36,7 @@ pub(crate) enum Change {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Intent {
     change: Change,
+    machine_name: String,
     hot: bool,
     cpus: Cpus,
     ram: Option<Ram>,
@@ -96,6 +100,7 @@ fn resources(
 
 pub(crate) fn query(catalog: &Catalog, boot: &str, request: &Request) -> Result<Value> {
     let (execution, endpoint, machine, active) = resources(catalog, boot, request)?;
+    let scope = observations::scoped_cgroup(&execution, &machine.name)?;
     let inventory = endpoint.inventory()?;
     let running = inventory.source_disposition == "RUNNING";
     let guest = running
@@ -179,7 +184,8 @@ pub(crate) fn query(catalog: &Catalog, boot: &str, request: &Request) -> Result<
         },
         "observed":{"cpus":cpus,"online_cpus":online_cpu_ids.as_ref().map(Vec::len),"online_cpu_ids":online_cpu_ids,
                     "last_confirmed_online_cpus":online_cpu_ids.as_ref().map(Vec::len).or(online.map(usize::from)),"ram":ram,"balloon":balloon,
-                    "scope_memory_current_bytes":observations::memory_current(&execution).ok()},
+                    "scope_memory_current_bytes":observations::memory_current(&scope).ok(),
+                    "scope_cpu_max":std::fs::read_to_string(scope.join("cpu.max")).ok().map(|text|text.trim().to_owned())},
         "pending":current,
     }))
 }
@@ -222,6 +228,7 @@ pub(crate) fn submit(catalog: &mut Catalog, boot: &str, request: &Request) -> Re
         return catalog.begin(request, KIND);
     }
     let (execution, endpoint, machine, active) = resources(catalog, boot, request)?;
+    let scope = observations::scoped_cgroup(&execution, &machine.name)?;
     if active.is_some() || endpoint.inventory()?.source_disposition != "RUNNING" {
         return Err(Fault::new(
             "E_STATE_CONFLICT",
@@ -239,6 +246,7 @@ pub(crate) fn submit(catalog: &mut Catalog, boot: &str, request: &Request) -> Re
     let (mut cpu_budget, mut memory_budget) = (0, 0);
     let mut intent = Intent {
         change,
+        machine_name: machine.name,
         hot: machine.live_compute_growth,
         cpus,
         ram: None,
@@ -283,7 +291,7 @@ pub(crate) fn submit(catalog: &mut Catalog, boot: &str, request: &Request) -> Re
                 ));
             }
             let target = ram_target(ram, memory_mib)?;
-            observations::check_memory_budget(&execution, memory_mib, target - ram.mapped)?;
+            observations::check_memory_budget(&scope, memory_mib, target - ram.mapped)?;
             memory_budget = u64::from(memory_mib);
             intent.ram = Some(ram);
         }
@@ -302,7 +310,7 @@ pub(crate) fn submit(catalog: &mut Catalog, boot: &str, request: &Request) -> Re
                 return Err(invalid("balloon target must fit within active Guest RAM"));
             }
             intent.balloon = Some(previous);
-            intent.memory_current_before = observations::memory_current(&execution).ok();
+            intent.memory_current_before = observations::memory_current(&scope).ok();
         }
     }
     let data = serde_json::to_string(&intent).map_err(invalid)?;
@@ -375,6 +383,7 @@ fn apply_change(
     deadline: i64,
     restoring: bool,
 ) -> Result<Update> {
+    let scope = observations::scoped_cgroup(execution, &intent.machine_name)?;
     if endpoint.inventory()?.source_disposition != "RUNNING" {
         return Err(pending(
             "waiting for the originating execution to be running",
@@ -424,8 +433,10 @@ fn apply_change(
                     pending("Guest online CPU set still differs from the requested set"),
                 ));
             }
-            Ok(Update::ok("completed",
-                json!({"cpus":cpus,"online_cpus":target,"online_cpu_ids":online})))
+            Ok(Update::ok(
+                "completed",
+                json!({"cpus":cpus,"online_cpus":target,"online_cpu_ids":online}),
+            ))
         }
         Change::MemoryGrow { memory_mib } => {
             let original = intent
@@ -443,7 +454,7 @@ fn apply_change(
             }
             let target = ram_target(current, memory_mib)?;
             if target > current.mapped {
-                observations::check_memory_budget(execution, memory_mib, target - current.mapped)?;
+                observations::check_memory_budget(&scope, memory_mib, target - current.mapped)?;
                 endpoint.command_with_timeout(
                     &format!("PROTOTYPE_GROW_MEMORY {}", target / MIB),
                     std::time::Duration::from_secs(10),
@@ -498,7 +509,7 @@ fn apply_change(
             if !restoring && current.target_mib == target_mib && current.actual_mib == target_mib {
                 return Ok(Update::ok(
                     "completed",
-                    balloon_sample(execution, intent, current),
+                    balloon_sample(&scope, intent, current),
                 ));
             }
             if !restoring && now < deadline {
@@ -507,7 +518,7 @@ fn apply_change(
                 }
                 return Ok(Update::ok(
                     "waiting",
-                    balloon_sample(execution, intent, observations::balloon(endpoint)?),
+                    balloon_sample(&scope, intent, observations::balloon(endpoint)?),
                 ));
             }
             // Persist the recovery choice before reverting the target so a
@@ -515,7 +526,7 @@ fn apply_change(
             if !restoring {
                 return Ok(Update::failed(
                     "restoring",
-                    Some(balloon_sample(execution, intent, current)),
+                    Some(balloon_sample(&scope, intent, current)),
                     Fault::new(
                         "E_BALLOON_UNRESPONSIVE",
                         "Guest balloon did not reach the requested target",
@@ -531,7 +542,7 @@ fn apply_change(
             {
                 return Ok(Update::failed(
                     "aborted",
-                    Some(balloon_sample(execution, intent, recovered)),
+                    Some(balloon_sample(&scope, intent, recovered)),
                     Fault::new(
                         "E_BALLOON_UNRESPONSIVE",
                         "Guest balloon did not respond and the previous target was restored",
@@ -540,7 +551,7 @@ fn apply_change(
             }
             Ok(Update::failed(
                 "restoring",
-                Some(balloon_sample(execution, intent, recovered)),
+                Some(balloon_sample(&scope, intent, recovered)),
                 Fault::new(
                     "E_BALLOON_UNRESPONSIVE",
                     "waiting for the Guest balloon to return to the previous target",
@@ -550,9 +561,9 @@ fn apply_change(
     }
 }
 
-fn balloon_sample(execution: &Execution, intent: &Intent, state: Balloon) -> Value {
+fn balloon_sample(scope: &Path, intent: &Intent, state: Balloon) -> Value {
     json!({"balloon":state,"scope_memory_before_bytes":intent.memory_current_before,
-        "scope_memory_current_bytes":observations::memory_current(execution).ok()})
+        "scope_memory_current_bytes":observations::memory_current(scope).ok()})
 }
 
 #[derive(Default)]
@@ -613,6 +624,22 @@ impl Controller {
 }
 
 fn commit_update(catalog: &mut Catalog, id: &str, update: Result<Update>) -> Result<()> {
+    let quota = update
+        .as_ref()
+        .ok()
+        .filter(|update| update.stage == "completed")
+        .and_then(|update| update.observed.as_ref())
+        .and_then(|reading| reading["cpus"]["created"].as_u64())
+        .and_then(|count| u32::try_from(count).ok())
+        .map(|created| {
+            let op = catalog.operation(id)?;
+            let incarnation = op
+                .expected_incarnation_id
+                .as_deref()
+                .ok_or_else(|| invalid("confirmed CPU resize has no source execution"))?;
+            Ok::<_, Fault>((catalog.execution(incarnation)?, created))
+        })
+        .transpose()?;
     let tx = catalog.db.transaction()?;
     let stage:Option<String>=tx.query_row(
         "SELECT r.stage FROM native_resource_changes r JOIN operations o USING(operation_id)
@@ -621,7 +648,7 @@ fn commit_update(catalog: &mut Catalog, id: &str, update: Result<Update>) -> Res
         [id],|r|r.get(0)
     ).optional()?;
     let Some(stage) = stage else { return Ok(()) };
-    let outcome = update.unwrap_or_else(|fault| {
+    let mut outcome = update.unwrap_or_else(|fault| {
         Update::failed(
             if stage == "restoring" {
                 "restoring"
@@ -632,6 +659,13 @@ fn commit_update(catalog: &mut Catalog, id: &str, update: Result<Update>) -> Res
             fault,
         )
     });
+    if let Some((execution, created)) = quota {
+        if let Err(error) =
+            crate::worker::reconcile_cpu_limit_after_resize(&tx, &execution, created)
+        {
+            outcome = Update::failed("waiting", outcome.observed, error);
+        }
+    }
     let data = outcome
         .observed
         .as_ref()
