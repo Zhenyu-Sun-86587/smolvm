@@ -172,18 +172,31 @@ impl Catalog {
         &self,
         lease: &crate::network_lease_catalog::TapLease,
     ) -> Result<(String, Option<String>)> {
-        let reservation = lookup(&self.db, &lease.attachment.attachment_id)?
+        let reservation = self.tap_network_reservation(lease)?;
+        Ok((reservation.network_id, reservation.dns_name))
+    }
+
+    pub(crate) fn tap_network_reservation(
+        &self,
+        lease: &crate::network_lease_catalog::TapLease,
+    ) -> Result<NetworkReservation> {
+        lookup(&self.db, &lease.attachment.attachment_id)?
             .filter(|entry| {
                 entry.operation_id == lease.operation_id
+                    && entry.instance_id == lease.instance_id
+                    && entry.state == "reserved"
+                    && entry.route_domain_id == lease.attachment.route_domain_id
+                    && entry.device_id == lease.attachment.device_id
+                    && entry.mode == lease.attachment.mode
                     && entry.private_ipv4 == lease.attachment.private_ipv4
+                    && entry.guest_ipv4 == lease.attachment.guest_ipv4
             })
             .ok_or_else(|| {
                 Fault::new(
                     "E_FENCE_UNPROVEN",
                     "TAP has no corresponding network reservation",
                 )
-            })?;
-        Ok((reservation.network_id, reservation.dns_name))
+            })
     }
 
     pub(crate) fn reserve_managed_network(
@@ -603,6 +616,97 @@ mod tests {
             guest_ipv4: None,
             rebind_revision: None,
             dns_name: None,
+        }
+    }
+
+    #[test]
+    fn live_tap_recovery_requires_the_original_committed_publication() {
+        use crate::catalog::NewExecution;
+        use crate::network::{topology::KernelProof, NamespaceIdentity};
+        use crate::network_lease_catalog::AttachmentDescriptor;
+
+        for case in ["committed", "active", "unknown gate", "legacy schema"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("catalog.sqlite");
+            let mut catalog = Catalog::open(&path, "boot", "original").unwrap();
+            let bundle = format!("sha256:{}", "a".repeat(64));
+            catalog.register_bundle(&bundle, &"c".repeat(64)).unwrap();
+            catalog.register_private_network(&RegisterNetwork {
+                network_id: "home".into(),
+                route_domain_id: "router-home".into(),
+                cidr: "10.20.0.0/29".into(),
+            }).unwrap();
+            let mut request = operation(&mut catalog, "launch-vm", "vm", "launch");
+            let launch = catalog.operation("launch-vm").unwrap();
+            let reservation = catalog.reserve_network(&request, &reserve("attachment", "home")).unwrap();
+            let descriptor = AttachmentDescriptor {
+                schema: "NetworkAttachment/1".into(),
+                attachment_id: reservation.attachment_id,
+                route_domain_id: reservation.route_domain_id,
+                private_ipv4: reservation.private_ipv4,
+                guest_ipv4: reservation.guest_ipv4,
+                guest_prefix: 32,
+                gateway_ipv4: reservation.gateway_ipv4,
+                device_id: reservation.device_id,
+                mac: [2, 0x53, 10, 20, 0, 2],
+                mode: reservation.mode,
+            };
+            catalog.record_quarantined_tap(&launch, "lease", &descriptor).unwrap();
+            let expected = Expected {
+                instance_id: "vm".into(),
+                incarnation_id: Some("execution".into()),
+                execution_epoch: 1,
+            };
+            let execution = catalog.register_execution(&launch, NewExecution {
+                route: "deep", bundle: &bundle, expected: &expected, boot: "boot",
+                pid: 123, start: 456, uid: 1000, permit_digest: &"d".repeat(64),
+            }).unwrap();
+            let offered = catalog.offer_tap(&execution, "attachment").unwrap();
+            let attached = catalog.acknowledge_tap(&execution, "attachment", "lease", offered.revision).unwrap();
+            catalog.record_initial_network_activation(&attached).unwrap();
+            let proof = KernelProof {
+                router: NamespaceIdentity { device: 4, inode: 101 },
+                port: NamespaceIdentity { device: 4, inode: 102 },
+                fingerprint: "a".repeat(64),
+            };
+            catalog.record_network_kernel_proof(&attached, &proof).unwrap();
+            catalog.finish_initial_network_activation(&attached, "open").unwrap();
+            if case != "active" {
+                request.expected = Some(expected);
+                catalog.finish(&request, false, 1).unwrap();
+            }
+            if case == "unknown gate" {
+                catalog.db.execute("UPDATE initial_network_activations SET phase='unknown'", []).unwrap();
+            }
+            if case == "legacy schema" {
+                catalog.db.execute_batch("DROP TABLE network_kernel_receipts; PRAGMA user_version=27;").unwrap();
+            }
+            drop(catalog);
+
+            let mut catalog = Catalog::open(&path, "boot", "replacement").unwrap();
+            let execution = catalog.reconcile_execution("execution").unwrap();
+            let unknown = catalog.tap_lease("attachment").unwrap();
+            assert_eq!((unknown.state.as_str(), unknown.gate.as_str()), ("unknown", "unknown"));
+            if case == "committed" {
+                assert_eq!(catalog.recoverable_network_proof(&unknown, &execution).unwrap(), proof);
+                assert!(catalog.router_pin_in_use(proof.router).unwrap());
+                catalog.adopt_published_tap(&unknown).unwrap();
+                let recovered = catalog.tap_lease("attachment").unwrap();
+                assert_eq!((recovered.state.as_str(), recovered.gate.as_str()), ("attached", "open"));
+                assert_eq!(recovered.attachment_digest().unwrap(), attached.attachment_digest().unwrap());
+                assert!(recovered.revision > attached.revision);
+                assert_eq!(catalog.complete_recovery("replacement").unwrap()["state"], "ready");
+                catalog.retire_fenced_tap(&recovered).unwrap();
+                assert!(!catalog.router_pin_in_use(proof.router).unwrap());
+            } else {
+                assert_eq!(catalog.recoverable_network_proof(&unknown, &execution).unwrap_err().code,
+                           "E_FENCE_UNPROVEN", "{case}");
+                assert_eq!(catalog.adopt_published_tap(&unknown).unwrap_err().code,
+                           "E_FENCE_UNPROVEN", "{case}");
+                assert_eq!(catalog.complete_recovery("replacement").unwrap_err().code,
+                           "E_RECOVERING", "{case}");
+                assert_eq!(catalog.tap_lease("attachment").unwrap(), unknown);
+            }
         }
     }
 

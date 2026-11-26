@@ -295,7 +295,7 @@ impl ActivationRuntime {
                 catalog.transition_activation(record, "released", "commit", None)
             }
             Some(binding) if record.phase == "policy_armed" => {
-                let published = network.publish_target(binding).and_then(|()| {
+                let published = network.publish_target(catalog, binding).and_then(|()| {
                     verify_process()?;
                     catalog.transition_activation(record, "released", "commit", None)
                 });

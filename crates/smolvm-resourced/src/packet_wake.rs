@@ -202,10 +202,12 @@ fn current_tap(
         Err(error) => return Err(error),
     };
     let process: Option<(i32, i64)> = catalog.db.query_row("SELECT e.pid,e.pid_start_time FROM executions e
-        JOIN instance_bindings b USING(route_id,instance_id,incarnation_id,execution_epoch),worker_state w
-        WHERE e.incarnation_id=? AND e.execution_epoch=? AND e.phase='registered' AND e.host_boot_id=w.host_boot_id
-        AND w.recovering=0 AND w.broker_session_id=? AND e.route_id='deep' AND e.instance_id=? AND e.bundle_digest=?
-        AND e.last_operation_id=? AND e.host_boot_id=?", params![lease.incarnation_id,lease.execution_epoch,lease.broker_session_id,
+        JOIN instance_bindings b USING(route_id,instance_id,incarnation_id,execution_epoch)
+        LEFT JOIN network_kernel_receipts proof ON proof.lease_id=?3,worker_state w
+        WHERE e.incarnation_id=?1 AND e.execution_epoch=?2 AND e.phase='registered' AND e.host_boot_id=w.host_boot_id
+        AND w.recovering=0 AND w.broker_session_id=coalesce(proof.adopted_session_id,?4)
+        AND e.route_id='deep' AND e.instance_id=?5 AND e.bundle_digest=?6
+        AND e.last_operation_id=?7 AND e.host_boot_id=?8", params![lease.incarnation_id,lease.execution_epoch,lease.lease_id,lease.broker_session_id,
         lease.instance_id,lease.bundle_digest,lease.operation_id,lease.host_boot_id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
     let alive = process.is_some_and(|(pid, start)| {
         crate::worker::observe_pid(pid).is_ok_and(|(now, _)| start == now)
@@ -653,9 +655,10 @@ fn enqueue(catalog: &mut Catalog, rule: &Rule, target: &Endpoint) -> Result<Opti
         return Ok(None);
     }
     let sleeping: bool = if let Some(incarnation) = &expected.incarnation_id {
-        db.query_row("SELECT EXISTS(SELECT 1 FROM network_tap_leases t,worker_state w
+        db.query_row("SELECT EXISTS(SELECT 1 FROM network_tap_leases t
+            LEFT JOIN network_kernel_receipts proof USING(lease_id),worker_state w
             WHERE t.incarnation_id=?1 AND t.attachment_id=?2 AND t.state='attached'
-              AND t.execution_epoch=?3 AND t.broker_session_id=w.broker_session_id
+              AND t.execution_epoch=?3 AND coalesce(proof.adopted_session_id,t.broker_session_id)=w.broker_session_id
               AND (?4 OR EXISTS(SELECT 1 FROM native_standby s JOIN native_transitions n USING(operation_id)
                 WHERE s.incarnation_id=?1 AND n.mode='managed' AND n.network_gate=1 AND n.stage='complete')))",
             params![incarnation,rule.target,expected.execution_epoch,stopping], |r|r.get(0))?
@@ -922,6 +925,7 @@ pub(crate) fn sleeping_address(
         JOIN network_attachments source ON source.attachment_id=rule.source_attachment AND source.network_id=dns.network_id
         JOIN network_tap_leases tap ON tap.lease_id=rule.source_lease AND tap.attachment_id=source.attachment_id
             AND tap.operation_id=source.operation_id AND tap.revision=rule.source_lease_revision
+        LEFT JOIN network_kernel_receipts proof ON proof.lease_id=tap.lease_id
         JOIN executions source_vm ON source_vm.incarnation_id=rule.source_incarnation AND source_vm.execution_epoch=rule.source_epoch
             AND source_vm.incarnation_id=tap.incarnation_id AND source_vm.execution_epoch=tap.execution_epoch
         JOIN instance_bindings live ON live.route_id=source_vm.route_id AND live.instance_id=source_vm.instance_id
@@ -930,7 +934,8 @@ pub(crate) fn sleeping_address(
         JOIN lifecycle_policies policy ON policy.instance_id=asleep.instance_id, worker_state worker
         WHERE dns.network_id=?1 AND dns.name=?2 AND source.private_ipv4=?3 AND rule.enabled=1
             AND source.state='reserved' AND destination.state='reserved' AND tap.state='attached'
-            AND source_vm.phase='registered' AND worker.recovering=0 AND worker.broker_session_id=tap.broker_session_id
+            AND source_vm.phase='registered' AND worker.recovering=0
+            AND worker.broker_session_id=coalesce(proof.adopted_session_id,tap.broker_session_id)
             AND worker.host_boot_id=source_vm.host_boot_id AND asleep.incarnation_id IS NULL
             AND coalesce(json_extract(policy.policy_json,'$.wake_conditions.private_network_packet'),1)=1
             AND (EXISTS(SELECT 1 FROM initial_network_activations i WHERE i.lease_id=tap.lease_id AND i.phase='open')

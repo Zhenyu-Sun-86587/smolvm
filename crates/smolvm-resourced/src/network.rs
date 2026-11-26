@@ -5,6 +5,7 @@ use std::io;
 use std::mem::zeroed;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::thread;
 
 #[path = "network_topology.rs"]
@@ -13,6 +14,30 @@ pub mod topology;
 pub const TAP_PORT_NAME: &str = "port0";
 pub const TAP_MTU: u16 = 1500;
 pub const TAP_VNET_HEADER_SIZE: u16 = 12;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct NamespaceIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+impl NamespaceIdentity {
+    pub(crate) fn read(fd: BorrowedFd<'_>) -> io::Result<Self> {
+        let mut status = unsafe { zeroed::<libc::statfs>() };
+        errno(unsafe { libc::fstatfs(fd.as_raw_fd(), &mut status) })?;
+        if status.f_type as u64 != libc::NSFS_MAGIC as u64 {
+            return Err(io::Error::other(
+                "network descriptor is not an nsfs namespace",
+            ));
+        }
+        let mut identity = unsafe { zeroed::<libc::stat>() };
+        errno(unsafe { libc::fstat(fd.as_raw_fd(), &mut identity) })?;
+        Ok(Self {
+            device: identity.st_dev,
+            inode: identity.st_ino,
+        })
+    }
+}
 
 /// A prepared TAP and its private namespace. The link starts down and has
 /// no router link. Dropping the owner releases both kernel references.
@@ -28,6 +53,96 @@ impl PreparedTapPort {
 
     pub fn tap(&self) -> BorrowedFd<'_> {
         self.tap.as_fd()
+    }
+
+    pub(crate) fn recover(
+        pid: i32,
+        process: BorrowedFd<'_>,
+        expected: NamespaceIdentity,
+    ) -> io::Result<Self> {
+        let mut tap = None;
+        for entry in fs::read_dir(format!("/proc/{pid}/fd"))? {
+            let entry = entry?;
+            let target = match fs::read_link(entry.path()) {
+                Ok(target) => target,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if target != Path::new("/dev/net/tun") {
+                continue;
+            }
+            let number: libc::c_int = entry
+                .file_name()
+                .to_string_lossy()
+                .parse()
+                .map_err(|_| io::Error::other("invalid VMM TAP descriptor number"))?;
+            // pidfd_getfd duplicates the live open file description. Opening
+            // /proc/<pid>/fd/<n> would create a new, unrelated TUN queue.
+            let duplicate =
+                unsafe { libc::syscall(libc::SYS_pidfd_getfd, process.as_raw_fd(), number, 0) };
+            if duplicate < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let duplicate = unsafe { File::from_raw_fd(duplicate as libc::c_int) };
+            let namespace = tap_network_namespace(duplicate.as_fd())?;
+            if NamespaceIdentity::read(namespace.as_fd())? != expected {
+                continue;
+            }
+            if tap.is_some() {
+                return Err(io::Error::other(
+                    "VMM has ambiguous descriptors for the recorded TAP",
+                ));
+            }
+            tap = Some(Self {
+                namespace,
+                tap: duplicate,
+            });
+        }
+        tap.ok_or_else(|| io::Error::other("VMM lacks the original published TAP"))
+    }
+}
+
+fn tap_network_namespace(tap: BorrowedFd<'_>) -> io::Result<File> {
+    let mut request = port_request();
+    let mut header = 0_i32;
+    let mut big_endian = 0_i32;
+    // Check that the actual live descriptor is attached to the named,
+    // nonpersistent, single-queue TAP with the negotiated virtio header.
+    unsafe {
+        let fd = tap.as_raw_fd();
+        let status = libc::fcntl(fd, libc::F_GETFL);
+        errno(status)?;
+        errno(libc::ioctl(fd, libc::TUNGETIFF, &mut request))?;
+        errno(libc::ioctl(fd, libc::TUNGETVNETHDRSZ, &mut header))?;
+        if let Err(error) = errno(libc::ioctl(fd, libc::TUNGETVNETBE, &mut big_endian)) {
+            if error.raw_os_error() != Some(libc::EINVAL) {
+                return Err(error);
+            }
+        }
+        let name = request
+            .ifr_name
+            .iter()
+            .copied()
+            .take_while(|byte| *byte != 0);
+        let flags = request.ifr_ifru.ifru_flags as u16;
+        let required = (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as u16;
+        let excluded =
+            (libc::IFF_TUN | libc::IFF_MULTI_QUEUE | libc::IFF_DETACH_QUEUE | libc::IFF_PERSIST)
+                as u16;
+        if !name.map(|byte| byte as u8).eq(TAP_PORT_NAME.bytes())
+            || flags & required != required
+            || flags & excluded != 0
+            || header != i32::from(TAP_VNET_HEADER_SIZE)
+            || big_endian != 0
+            || status & (libc::O_ACCMODE | libc::O_NONBLOCK) != (libc::O_RDWR | libc::O_NONBLOCK)
+        {
+            return Err(io::Error::other(
+                "live TAP framing or queue ownership changed",
+            ));
+        }
+        let nsfd = libc::ioctl(fd, libc::TUNGETDEVNETNS);
+        errno(nsfd)?;
+        Ok(File::from_raw_fd(nsfd))
     }
 }
 

@@ -1,16 +1,20 @@
 use crate::activation_catalog::NetworkBinding;
 use crate::catalog::{Catalog, Execution};
 use crate::ipc::{valid_id, Fault, Request, Result};
-use crate::network::topology::{AttachmentMode, PortPolicy, PrivateRouter, QuarantinedPort};
+use crate::network::topology::{
+    self, AttachmentMode, KernelProof, PortPolicy, PrivateRouter, QuarantinedPort,
+};
+use crate::network::{NamespaceIdentity, PreparedTapPort};
 use crate::network_catalog::NetworkReservation;
 use crate::network_lease_catalog::{AttachmentDescriptor, TapLease};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::os::fd::OwnedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
+use std::path::{Path, PathBuf};
 
-#[derive(Default)]
 pub(crate) struct NetworkRuntime {
+    namespaces: PathBuf,
     routers: HashMap<String, PrivateRouter>,
     ports: HashMap<String, QuarantinedPort>,
     packet_wake: crate::packet_wake::Observer,
@@ -56,6 +60,117 @@ enum Transport {
 }
 
 impl NetworkRuntime {
+    pub(crate) fn new(namespaces: PathBuf) -> Self {
+        Self {
+            namespaces,
+            routers: HashMap::new(),
+            ports: HashMap::new(),
+            packet_wake: Default::default(),
+        }
+    }
+
+    pub(crate) fn cleanup_namespace_pins(&self, catalog: &Catalog) -> Result<()> {
+        topology::cleanup_pins(&self.namespaces, |identity| {
+            if self.routers.values().any(|router| {
+                NamespaceIdentity::read(router.namespace()).is_ok_and(|value| value == identity)
+            }) {
+                return Ok(true);
+            }
+            catalog.router_pin_in_use(identity).map_err(std::io::Error::other)
+        })
+        .map_err(host_error)
+    }
+
+    pub(crate) fn recover_port(
+        &self,
+        catalog: &Catalog,
+        execution: &Execution,
+        lease: &TapLease,
+        evidence: &KernelProof,
+        pidfd: BorrowedFd<'_>,
+    ) -> Result<(PrivateRouter, QuarantinedPort)> {
+        let reservation = catalog.tap_network_reservation(lease)?;
+        let attachment = &lease.attachment;
+        let mode = match attachment.mode.as_str() {
+            "native"
+                if attachment.guest_ipv4 == attachment.private_ipv4
+                    && attachment.guest_prefix == 32
+                    && attachment.gateway_ipv4 == reservation.gateway_ipv4 =>
+            {
+                AttachmentMode::Native
+            }
+            "fixed_internal" => AttachmentMode::FixedInternal {
+                guest: attachment.guest_ipv4,
+                gateway: attachment.gateway_ipv4,
+                prefix: attachment.guest_prefix,
+            },
+            _ => return Err(unknown_attachment()),
+        };
+        if attachment.mac != attachment_mac(attachment.private_ipv4) {
+            return Err(unknown_attachment());
+        }
+        let mut router = match self.routers.get(&attachment.route_domain_id) {
+            Some(router)
+                if NamespaceIdentity::read(router.namespace()).map_err(host_error)?
+                    == evidence.router =>
+            {
+                router.clone()
+            }
+            Some(_) => return Err(unknown_attachment()),
+            None => PrivateRouter::recover(
+                &self.namespaces,
+                evidence.router,
+                reservation.gateway_ipv4,
+                catalog.private_network_prefix(&reservation.network_id)?,
+            )
+            .map_err(host_error)?,
+        };
+        let tap = PreparedTapPort::recover(execution.pid, pidfd, evidence.port).map_err(host_error)?;
+        let port = QuarantinedPort::recover(
+            router.clone(),
+            tap,
+            PortPolicy {
+                private_ipv4: attachment.private_ipv4,
+                mac: attachment.mac,
+                mode,
+            },
+        );
+        if &port.kernel_proof().map_err(host_error)? != evidence {
+            return Err(Fault::new(
+                "E_FENCE_UNPROVEN",
+                "published TAP topology or policy has changed",
+            ));
+        }
+        if reservation.dns_name.is_some() {
+            let path = catalog
+                .db
+                .path()
+                .ok_or_else(|| Fault::new("E_CATALOG", "private DNS requires the Worker database"))?;
+            router
+                .ensure_dns(Path::new(path), &reservation.network_id)
+                .map_err(host_error)?;
+        }
+        Ok((router, port))
+    }
+
+    pub(crate) fn adopt_recovered_port(
+        &mut self,
+        catalog: &mut Catalog,
+        lease: &TapLease,
+        router: PrivateRouter,
+        mut port: QuarantinedPort,
+    ) -> Result<()> {
+        if self.ports.contains_key(&lease.attachment.attachment_id) {
+            return Err(unknown_attachment());
+        }
+        catalog.adopt_published_tap(lease)?;
+        port.adopt_published(router.clone());
+        self.routers
+            .insert(lease.attachment.route_domain_id.clone(), router);
+        self.ports.insert(lease.attachment.attachment_id.clone(), port);
+        Ok(())
+    }
+
     pub(crate) fn packet_rule(&mut self, catalog: &mut Catalog, request: &Request) -> Result<serde_json::Value> {
         self.packet_wake.rule(catalog, request, &self.ports)
     }
@@ -320,6 +435,8 @@ impl NetworkRuntime {
             verify_process()?;
             port.publish_identity().map_err(host_error)?;
             verify_process()?;
+            let proof = port.record_kernel_proof(&self.namespaces).map_err(host_error)?;
+            catalog.record_network_kernel_proof(&lease, &proof)?;
             catalog.finish_initial_network_activation(&lease, "open")
         });
         if published.is_err() && port.close_identity().is_err() {
@@ -335,10 +452,17 @@ impl NetworkRuntime {
             .map_err(host_error)
     }
 
-    pub(crate) fn publish_target(&self, binding: &NetworkBinding) -> Result<()> {
-        self.target_port(binding)?
-            .publish_identity()
-            .map_err(host_error)
+    pub(crate) fn publish_target(&self, catalog: &Catalog, binding: &NetworkBinding) -> Result<()> {
+        let lease = catalog.tap_lease(&binding.target.attachment.attachment_id)?;
+        if lease.lease_id != binding.target.lease_id
+            || lease.revision != binding.target.lease_revision
+        {
+            return Err(unknown_attachment());
+        }
+        let port = self.target_port(binding)?;
+        port.publish_identity().map_err(host_error)?;
+        let proof = port.record_kernel_proof(&self.namespaces).map_err(host_error)?;
+        catalog.record_network_kernel_proof(&lease, &proof)
     }
 
     pub(crate) fn close_target(&self, binding: &NetworkBinding) -> Result<()> {
@@ -399,7 +523,7 @@ impl NetworkRuntime {
         let lease = match catalog.tap_lease(&data.attachment_id) {
             Ok(lease) => lease,
             Err(error) if error.code == "E_NOT_FOUND" && reservation.state != "unknown" => {
-                return Ok(())
+                return self.cleanup_namespace_pins(catalog)
             }
             Err(error) => return Err(error),
         };
@@ -421,6 +545,24 @@ impl NetworkRuntime {
                 catalog.retire_fenced_tap(&lease)?;
             } else if lease.state != "unknown" {
                 self.retire_port(catalog, &lease)?;
+            } else {
+                self.retire_absent_port(catalog, &lease)?;
+            }
+        }
+        self.cleanup_namespace_pins(catalog)
+    }
+
+    /// Only for an execution whose exit and write fence have been established.
+    pub(crate) fn retire_absent_port(&self, catalog: &Catalog, lease: &TapLease) -> Result<()> {
+        if let Some(proof) = catalog.network_kernel_proof(lease)? {
+            if topology::published_port_absent(
+                &self.namespaces,
+                proof.router,
+                lease.attachment.private_ipv4,
+            )
+            .map_err(host_error)?
+            {
+                catalog.retire_fenced_tap(lease)?;
             }
         }
         Ok(())
@@ -442,7 +584,7 @@ impl NetworkRuntime {
         if self.routers.get(domain).is_some_and(PrivateRouter::idle) {
             self.routers.remove(domain);
         }
-        Ok(())
+        self.cleanup_namespace_pins(catalog)
     }
 }
 

@@ -9,7 +9,7 @@ use crate::native_control::Endpoint;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::fs::File;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 
 #[path = "durable_reader_recovery.rs"]
@@ -61,6 +61,44 @@ fn pending(db: &Connection, sql: &str) -> Result<Vec<(String, String)>> {
 }
 
 impl Worker {
+    fn recover_network(&mut self, execution: &Execution, attachment: &str) -> Result<()> {
+        let lease = self.catalog.tap_lease(attachment)?;
+        let evidence = self.catalog.recoverable_network_proof(&lease, execution)?;
+        self.verify_live_execution(execution)?;
+        let endpoint = Endpoint::load(&self.catalog.db, &execution.incarnation_id, &self.boot)?;
+        let inventory = endpoint.inventory()?;
+        let mut devices = inventory.devices.iter().filter(|dev| dev["virtio_type"] == 1);
+        let uplink = json!({
+            "device_id": lease.attachment.device_id,
+            "attachment": lease.attachment_digest()?,
+            "mac": lease.attachment.mac,
+        });
+        let original_guest = devices.next().is_some_and(|device| {
+            device["device_id"] == lease.attachment.device_id && device["tap"][0] == uplink
+        }) && devices.next().is_none();
+        let settled = match inventory.source_disposition.as_str() {
+            "RUNNING" => matches!(
+                inventory.guest_gate.as_str(),
+                "idle" | "released" | "aborted" | "expired_thawed" | "failed_thawed"
+            ),
+            "STANDBY" => inventory.guest_gate == "parked",
+            _ => false,
+        };
+        if !original_guest || !settled {
+            return Err(grants::fence_unproven(
+                "live VMM did not attest the published TAP and guest gate",
+            ));
+        }
+        let pidfd = self.executions.get(&execution.incarnation_id).ok_or_else(|| {
+            grants::fence_unproven("live VMM has no verified process handle")
+        })?;
+        let (router, port) =
+            self.network
+                .recover_port(&self.catalog, execution, &lease, &evidence, pidfd.as_fd())?;
+        self.verify_live_execution(execution)?;
+        self.network.adopt_recovered_port(&mut self.catalog, &lease, router, port)
+    }
+
     fn recover_writer(&mut self, execution: &Execution, grant: &WriterGrant) -> Result<()> {
         let endpoint = Endpoint::load(&self.catalog.db, &execution.incarnation_id, &self.boot)?;
         let set = self
@@ -280,6 +318,29 @@ impl Worker {
             if let Err(error) = self.recover_publisher(&e, &transfer) {
                 eprintln!("native recovery of transfer {transfer}: {error}");
             }
+        }
+        let attachments = pending(&self.catalog.db, "SELECT e.incarnation_id,t.attachment_id
+            FROM network_tap_leases t JOIN executions e USING(incarnation_id)
+            JOIN network_kernel_receipts k USING(lease_id)
+            WHERE t.state='unknown' AND t.host_boot_id=e.host_boot_id AND t.execution_epoch=e.execution_epoch
+              AND t.host_boot_id=(SELECT host_boot_id FROM worker_state)
+              AND e.phase IN ('registered','exited')")?;
+        let mut retired = false;
+        for (incarnation, attachment) in attachments {
+            let execution = self.catalog.execution(&incarnation)?;
+            let attempt = if execution.phase == "exited" {
+                let lease = self.catalog.tap_lease(&attachment)?;
+                retired = true;
+                self.network.retire_absent_port(&self.catalog, &lease)
+            } else {
+                self.recover_network(&execution, &attachment)
+            };
+            if let Err(error) = attempt {
+                eprintln!("native network recovery of attachment {attachment}: {error}");
+            }
+        }
+        if retired {
+            self.network.cleanup_namespace_pins(&self.catalog)?;
         }
         let confirmed_managed: bool = self.catalog.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM executions e

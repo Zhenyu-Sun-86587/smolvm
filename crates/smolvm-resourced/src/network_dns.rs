@@ -126,11 +126,13 @@ fn lookup(db: &Connection, network: &str, name: &str) -> rusqlite::Result<Option
         "SELECT address.private_ipv4,e.pid,e.pid_start_time FROM network_dns_names dns
          JOIN network_attachments address USING(attachment_id)
          JOIN network_tap_leases tap ON tap.attachment_id=address.attachment_id AND tap.operation_id=address.operation_id
+         LEFT JOIN network_kernel_receipts proof ON proof.lease_id=tap.lease_id
          JOIN executions e ON e.incarnation_id=tap.incarnation_id AND e.execution_epoch=tap.execution_epoch
          JOIN instance_bindings b ON b.route_id=tap.route_id AND b.instance_id=tap.instance_id
               AND b.incarnation_id=tap.incarnation_id AND b.execution_epoch=tap.execution_epoch
          JOIN operations o ON o.operation_id=tap.operation_id
-         JOIN worker_state w ON w.singleton=1 AND w.host_boot_id=tap.host_boot_id AND w.broker_session_id=tap.broker_session_id
+         JOIN worker_state w ON w.singleton=1 AND w.host_boot_id=tap.host_boot_id
+              AND w.broker_session_id=coalesce(proof.adopted_session_id,tap.broker_session_id)
          WHERE dns.network_id=? AND dns.name=? AND address.state='reserved' AND e.phase='registered'
            AND tap.state='attached' AND w.recovering=0 AND o.phase='COMPLETED'
            AND (EXISTS(SELECT 1 FROM initial_network_activations i WHERE i.lease_id=tap.lease_id AND i.phase='open')

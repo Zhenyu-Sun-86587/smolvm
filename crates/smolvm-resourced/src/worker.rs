@@ -2464,6 +2464,8 @@ fn serve(
     private_dir(&objects)?;
     let statepoints = state.join("statepoints");
     private_dir(&statepoints)?;
+    let network_namespaces = state.join("network-namespaces");
+    private_dir(&network_namespaces)?;
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
         .trim()
         .to_owned();
@@ -2484,13 +2486,17 @@ fn serve(
         executions: HashMap::new(),
         reserved: HashMap::new(),
         escrow: Escrow::default(),
-        network: crate::network_runtime::NetworkRuntime::default(),
+        network: crate::network_runtime::NetworkRuntime::new(network_namespaces),
         activation: ActivationRuntime::default(),
         statepoints: StatePoints::new(statepoints),
         forks: Default::default(),
         lifecycle: Default::default(),
         resize: Default::default(),
     };
+    worker
+        .network
+        .cleanup_namespace_pins(&worker.catalog)
+        .map_err(|fault| io::Error::other(fault.message))?;
     worker
         .reconnect_native_endpoints()
         .map_err(|f| io::Error::other(f.message))?;

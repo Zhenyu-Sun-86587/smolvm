@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "network_kernel.rs"]
+mod kernel;
+pub(crate) use kernel::{cleanup_pins, published_port_absent, KernelProof};
+
 const HOST_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy)]
@@ -420,6 +424,16 @@ fn command(
     args: &[&str],
     input: Option<&str>,
 ) -> io::Result<()> {
+    run_command(namespace, program, args, input, Stdio::null())
+}
+
+fn run_command(
+    namespace: BorrowedFd<'_>,
+    program: &str,
+    args: &[&str],
+    input: Option<&str>,
+    stdout: Stdio,
+) -> io::Result<()> {
     let mut child = Command::new("nsenter")
         .arg(format!("--net={}", namespace_path(namespace)))
         .arg("--")
@@ -430,7 +444,7 @@ fn command(
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .stderr(Stdio::piped())
         .spawn()?;
     let result = (|| {
