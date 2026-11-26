@@ -171,18 +171,32 @@ impl Machine {
                 "managed network changes require a separate attachment operation",
             ));
         }
-        if previous.as_ref().is_some_and(|p| {
-            p.machine.boot_profile != self.boot_profile
-                || p.machine
-                    .disks
-                    .iter()
-                    .filter(|d| d.volume_id.is_none())
-                    .ne(self.disks.iter().filter(|d| d.volume_id.is_none()))
-        }) {
-            return Err(Fault::new(
-                "E_VOLUME_CONFLICT",
-                "different block attachments require a separate volume operation",
-            ));
+        if let Some(previous) = previous.as_ref() {
+            let mut intrinsic = Vec::new();
+            for (old, device) in previous.machine.disks.iter().zip(&previous.devices) {
+                if old.volume_id.is_some() {
+                    continue;
+                }
+                // An independent restore keeps the capture's wire slot IDs.
+                // Its product attachment can be edited after a fenced stop.
+                let product: bool = c.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM product_volume_attachments
+                     WHERE volume_id=? AND instance_id=? AND device_key=?)",
+                    params![device.volume_id, expected.instance_id, old.device_id],
+                    |row| row.get(0),
+                )?;
+                if !product {
+                    intrinsic.push(old);
+                }
+            }
+            if previous.machine.boot_profile != self.boot_profile
+                || intrinsic.into_iter().ne(self.disks.iter().filter(|d| d.volume_id.is_none()))
+            {
+                return Err(Fault::new(
+                    "E_VOLUME_CONFLICT",
+                    "different block attachments require a separate volume operation",
+                ));
+            }
         }
         let mut attachments = HashSet::new();
         let mut ids = HashSet::new();
