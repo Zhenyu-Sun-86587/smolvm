@@ -104,6 +104,26 @@ class WorkerResource(unittest.TestCase):
         self.assertIn("result", response, response)
         return response["result"]
 
+    def test_replacement_policy_initializes_once_at_the_machine_revision(self):
+        target = fence("replacement")
+        policy = {"keep_running": True, "auto_hibernate": False}
+
+        def apply(key, prior, desired, *, replacement=False, error=None):
+            payload = {"expected_applied_revision": prior, "new_revision": desired, "effective_policy": policy}
+            if replacement:
+                payload["initialize_replacement"] = True
+            return self.call("ApplyLifecyclePolicy", payload, error=error, **operation(self.bundle_a, key, target))
+
+        apply("ordinary-skip", 0, 7, error="E_STALE_REVISION")
+        installed = apply("initialize", 0, 7, replacement=True)
+        self.assertEqual((installed["instance_id"], installed["applied_revision"]), ("replacement", 7))
+        self.assertTrue(installed["effective_policy"]["keep_running"])
+        self.assertFalse(installed["effective_policy"]["auto_hibernate"])
+        self.assertEqual(apply("initialize", 0, 7, replacement=True), installed)
+        apply("initialize-again", 7, 12, replacement=True, error="E_STALE_REVISION")
+        apply("ordinary-skip-later", 7, 9, error="E_STALE_REVISION")
+        self.assertEqual(apply("ordinary-next", 7, 8)["applied_revision"], 8)
+
     def test_private_network_reservation_is_scoped_and_unpublished(self):
         for network_id in ("home", "alternate"):
             self.call("RegisterPrivateNetwork", {

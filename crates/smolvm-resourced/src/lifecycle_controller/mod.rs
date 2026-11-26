@@ -122,6 +122,8 @@ struct Apply {
     expected_applied_revision: i64,
     new_revision: i64,
     effective_policy: Policy,
+    #[serde(default)]
+    initialize_replacement: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,12 +147,16 @@ fn apply(tx: &Transaction<'_>, r: &Request, instance: &str, bundle: &str) -> Res
         )
         .optional()?;
     let revision = previous.as_ref().map_or(0, |p| p.0);
+    // A replacement instance starts with the machine's current full policy.
+    // Subsequent changes on that instance still compare and advance by one.
+    let valid_revision = if input.initialize_replacement {
+        previous.is_none() && input.new_revision > 0
+    } else {
+        revision.checked_add(1) == Some(input.new_revision)
+    };
     if previous.as_ref().is_some_and(|p| p.1 != bundle)
         || revision != input.expected_applied_revision
-        || input.new_revision
-            != revision
-                .checked_add(1)
-                .ok_or_else(|| invalid("policy revision exhausted"))?
+        || !valid_revision
     {
         return Err(changed("applied lifecycle revision changed"));
     }
