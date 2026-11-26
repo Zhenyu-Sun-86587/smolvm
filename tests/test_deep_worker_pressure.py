@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 
-from test_deep_managed_launch import EXT, digest, http, rpc, settled, until, verify
+from test_deep_managed_launch import EXT, digest, http, installed_bundle, rpc, settled, until, verify
 from test_deep_native_standby import worker_ready
 
 
@@ -191,13 +191,29 @@ def serve_identity(endpoint, manifest):
             "reader": handshake["state_reader_id"], "serve_sha256": measured}
 
 
-def pressure_proof(primary, root, first, inventory, _started, group, same_bundle, peer_bundle):
+def process_memory(pid):
+    wanted = {"Rss", "Pss", "Private_Clean", "Private_Dirty", "Shared_Clean", "Shared_Dirty"}
+    memory = {}
+    for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
+        name, _, value = line.partition(":")
+        if name in wanted:
+            count, unit = value.split()
+            assert unit == "kB"
+            memory[name] = int(count) * 1024
+    assert memory.keys() == wanted and 0 < memory["Pss"] <= memory["Rss"], memory
+    return memory
+
+
+def pressure_proof(primary, root, first, inventory, _started, group, same_bundle, peer_bundle,
+                   admission_worker_digest=None):
     worker = root / "ipc/worker.sock"
     unit = group.name
     manifest = json.loads((root / "bundle/runtime-bundle.json").read_text())
     primary_identity = serve_identity(primary, manifest)
     a = primary_identity["bundle"]
-    if peer_bundle:
+    if admission_worker_digest:
+        secondary_bundle = peer_bundle
+    elif peer_bundle:
         # The VMM runs as an unprivileged UID and must be able to traverse the Bundle path.
         secondary_bundle = root / "bundle-secondary"
         shutil.copytree(peer_bundle, secondary_bundle, symlinks=True)
@@ -209,7 +225,7 @@ def pressure_proof(primary, root, first, inventory, _started, group, same_bundle
     secondary_manifest = json.loads((secondary_bundle / "runtime-bundle.json").read_text())
     b = secondary_manifest["bundle_digest"]
     assert (a == b) == same_bundle
-    expected_worker = artifact_digest(manifest, "smolvm-resourced")
+    expected_worker = admission_worker_digest or artifact_digest(manifest, "smolvm-resourced")
     health = rpc(worker, "Health")
     assert health["vm_slice"] == unit
     if same_bundle or peer_bundle:
@@ -224,11 +240,12 @@ def pressure_proof(primary, root, first, inventory, _started, group, same_bundle
                     "serve", "start", "--listen", f"unix://{secondary}", "--worker-resource-socket", worker,
                     "--guest-rollout-port", "37228", "--shutdown-grace", "0"]
     env = bundle_env(secondary_bundle, root / "home")
-    mismatch = subprocess.run([root / "bundle/smolvm-bin", *base_command[1:]],
-                              env={**bundle_env(root / "bundle", root / "home"),
-                                   "SMOLVM_WORKER_SLICE_NAME": "smolvmwrong.slice"},
-                              capture_output=True, timeout=30)
-    assert mismatch.returncode != 0 and b"VM slice settings differ" in mismatch.stderr, mismatch.stderr
+    if not admission_worker_digest:
+        mismatch = subprocess.run([root / "bundle/smolvm-bin", *base_command[1:]],
+                                  env={**bundle_env(root / "bundle", root / "home"),
+                                       "SMOLVM_WORKER_SLICE_NAME": "smolvmwrong.slice"},
+                                  capture_output=True, timeout=30)
+        assert mismatch.returncode != 0 and b"VM slice settings differ" in mismatch.stderr, mismatch.stderr
 
     with ExitStack() as stack:
         spawn(stack, base_command, env, root / "serve-second.log")
@@ -239,8 +256,9 @@ def pressure_proof(primary, root, first, inventory, _started, group, same_bundle
         if peer_bundle:
             assert primary_identity["reader"] != secondary_identity["reader"]
             assert primary_identity["serve_sha256"] != secondary_identity["serve_sha256"]
-            print(json.dumps({"current_serve": primary_identity, "historical_serve": secondary_identity,
-                              "worker_sha256": expected_worker, "slice": unit}), flush=True)
+            identities = ({"first_serve": primary_identity, "second_serve": secondary_identity} if admission_worker_digest
+                          else {"current_serve": primary_identity, "historical_serve": secondary_identity})
+            print(json.dumps({**identities, "worker_sha256": expected_worker, "slice": unit}), flush=True)
         assert {key: (group / key).read_text() for key in tracked} == original_limits
         assert all((group / path).exists() for path in ("memory.events", "memory.pressure", "io.pressure"))
         assert scope(secondary, "test-second")["execution_epoch"] == 0
@@ -371,7 +389,7 @@ def pressure_proof(primary, root, first, inventory, _started, group, same_bundle
         assert budget()["allocated"] == original
         print("NEW exports counted storage once across both Serve routes. A competing export was refused, and both commit and abort returned their reservation.", flush=True)
 
-        if peer_bundle:
+        if peer_bundle and not admission_worker_digest:
             for receiving, origin, role in ((primary, secondary, "current"), (secondary, primary, "historical")):
                 point = captures[origin]
                 target = scope(receiving, "wrong-reader")
@@ -428,6 +446,12 @@ def pressure_proof(primary, root, first, inventory, _started, group, same_bundle
                                    for kind in ("launch", "fork", "restore")]))
         assert budget()["allocated"] == before
         print(f"Two Serve routes shared the {unit} ledger under pressure. Six launch, fork and restore requests were refused, and both protected VMs remained live.", flush=True)
+        if admission_worker_digest:
+            assert not select.select(descriptors, [], [], 0)[0]
+            memory = {bundle: {"pid": pid, "bytes": process_memory(pid)} for bundle, pid in zip((a, b), pids)}
+            print(json.dumps({"memory_by_bundle": memory, "worker_budget": before, "slice_bytes": slice_bytes(group),
+                              "registered_source_pids": pids, "launch_order": [a, b]}), flush=True)
+            return
 
         call(b, scope_b, "ReleaseRunningLease", dict(protection_id="protected-second", principal="pressure-test",
             expected_revision=lease["revision"], token="pressure-test-lease-token-private"))
@@ -668,12 +692,21 @@ def main():
     parser.add_argument("--guest", type=lambda s: Path(s).resolve(), help="prebuilt static kvm-parked-block-guest executable")
     parser.add_argument("--historical-bundle", type=lambda s: Path(s).resolve(),
                         help="bundle whose Worker predates the vm_slice capability")
+    parser.add_argument("--admission-only", action="store_true",
+                        help="measure two authorized routes, their protected VMs and bounded concurrent admission")
+    parser.add_argument("--reverse", action="store_true",
+                        help="start the peer Serve first, keeping the same installed Worker")
+    parser.add_argument("--work-dir", type=Path, default=Path("/var/tmp"))
     layout = parser.add_mutually_exclusive_group()
     layout.add_argument("--same-bundle", action="store_true",
                         help="use the supplied measured Bundle unchanged on both Serve routes")
     layout.add_argument("--peer-bundle", type=lambda s: Path(s).resolve(strict=True),
                         help="use an older installed Bundle unchanged from a nested systemd manager")
     args = parser.parse_args()
+    if args.admission_only and not args.peer_bundle:
+        parser.error("--admission-only requires two installed bundles")
+    if args.reverse and not args.admission_only:
+        parser.error("--reverse requires --admission-only")
     if os.geteuid() != 0:
         parser.error("Linux root, KVM, systemd, and cgroup v2 are required")
     if args.peer_bundle:
@@ -684,7 +717,7 @@ def main():
         os.execvp("unshare", ["unshare", "--mount", "--propagation", "private", "--net", "--",
                              "/usr/bin/env", "SMOLVM_PRESSURE_TEST_NAMESPACE=1", "PYTHONDONTWRITEBYTECODE=1",
                              sys.executable, __file__, *sys.argv[1:]])
-    with tempfile.TemporaryDirectory(dir="/var/tmp", prefix="smp-") as directory, ExitStack() as stack:
+    with tempfile.TemporaryDirectory(dir=args.work_dir, prefix="smp-") as directory, ExitStack() as stack:
         root = Path(directory)
         root.chmod(0o755)
         if args.historical_bundle:
@@ -697,6 +730,16 @@ def main():
                           SMOLVM_WORKER_STORAGE_BUDGET_BYTES=str(768 * MIB))
         properties(unit, str(3 << 30))
         try:
+            if args.admission_only:
+                first, second = (args.peer_bundle, args.bundle) if args.reverse else (args.bundle, args.peer_bundle)
+                first = stack.enter_context(installed_bundle(first, root, "bundle"))
+                second = stack.enter_context(installed_bundle(second, root, "bundle-secondary"))
+                manifest = json.loads((args.bundle / "runtime-bundle.json").read_text())
+                worker_digest = artifact_digest(manifest, "smolvm-resourced")
+                verify(first, root, args.guest, None, False, False, False, False, stage_bundle=False,
+                       worker_binary=args.bundle / "smolvm-resourced",
+                       observer=lambda *values: pressure_proof(*values, group, False, second, worker_digest))
+                return
             verify(args.bundle, root, args.guest, None, False, False, False, False,
                    observer=lambda *values: pressure_proof(*values, group, args.same_bundle, args.peer_bundle))
         except BaseException:

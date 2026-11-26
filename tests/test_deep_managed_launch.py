@@ -35,9 +35,9 @@ def digest(data):
 
 
 @contextmanager
-def installed_bundle(source, root):
+def installed_bundle(source, root, name="measured"):
     """Expose an immutable installation to the VM UID inside the private test namespace."""
-    target = root / "measured"
+    target = root / name
     target.mkdir()
     subprocess.run(["mount", "--bind", source, target], check=True)
     try:
@@ -165,7 +165,8 @@ def partial_fork(endpoint, root, ref):
     print("One of two targets was killed before activation. Retry kept the successful execution and original capture, and advanced only the failed child's epoch.",flush=True)
 
 
-def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults, lifecycle=False, *, observer=None, stage_bundle=True):
+def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults, lifecycle=False, *,
+           observer=None, stage_bundle=True, worker_binary=None):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
@@ -208,7 +209,7 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
             stack.callback(stop)
             return proc
 
-        broker = spawn([bundle / "smolvm-resourced", "serve", "--socket", worker, "--state-dir", root / "catalog",
+        broker = spawn([worker_binary or bundle / "smolvm-resourced", "serve", "--socket", worker, "--state-dir", root / "catalog",
                         "--socket-gid", str(grp.getgrnam("kvm").gr_gid)], "worker.log")
         until(lambda: worker_ready(worker))
         serve_command = [binary, "--state-dir", root / "state", "serve", "start", "--listen", f"unix://{endpoint}",
