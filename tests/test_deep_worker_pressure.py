@@ -175,14 +175,25 @@ def abandon_reply(worker, method, payload, **scope):
         peer.sendall(json.dumps(request).encode())
 
 
-def pressure_proof(primary, root, first, inventory, _started, group):
+def pressure_proof(primary, root, first, inventory, _started, group, same_bundle):
     worker = root / "ipc/worker.sock"
     unit = group.name
     a = http(primary, EXT + "/capabilities")["bundle_digest"]
-    secondary_bundle = root / "bundle-secondary"
-    b = measured_variant(root / "bundle", secondary_bundle)
-    assert a != b
-    assert rpc(worker, "Health")["vm_slice"] == unit
+    manifest = json.loads((root / "bundle/runtime-bundle.json").read_text())
+    assert a == manifest["bundle_digest"]
+    if same_bundle:
+        secondary_bundle = root / "bundle"
+        b = a
+    else:
+        secondary_bundle = root / "bundle-secondary"
+        b = measured_variant(root / "bundle", secondary_bundle)
+        assert a != b
+    worker_artifact = next(item for item in manifest["artifacts"] if item["path"] == "smolvm-resourced")
+    expected_worker = "sha256:" + worker_artifact["sha256"].removeprefix("sha256:")
+    health = rpc(worker, "Health")
+    assert health["vm_slice"] == unit
+    if same_bundle:
+        assert health["executable_sha256"] == expected_worker
     tracked = tuple(
         key for key in ("memory.max", "memory.high", "cpu.max", "cpuset.cpus")
         if (group / key).exists()
@@ -200,6 +211,8 @@ def pressure_proof(primary, root, first, inventory, _started, group):
     with ExitStack() as stack:
         spawn(stack, base_command, env, root / "serve-second.log")
         assert until(lambda: http(secondary, EXT + "/capabilities"))["bundle_digest"] == b
+        if same_bundle:
+            print(f"Both live Serve routes use verified Bundle {a}, Worker {expected_worker}.", flush=True)
         assert {key: (group / key).read_text() for key in tracked} == original_limits
         assert all((group / path).exists() for path in ("memory.events", "memory.pressure", "io.pressure"))
         assert scope(secondary, "test-second")["execution_epoch"] == 0
@@ -218,8 +231,8 @@ def pressure_proof(primary, root, first, inventory, _started, group):
                     **import_scope)
         rpc(worker, "FinishOperation", {"abort": False, "expected_revision": 1}, **import_scope)
 
-        def launch(endpoint, name, which):
-            disk_ids = ("base-ext4", "empty-data") if which == a else ("second-root", "second-data")
+        def launch(endpoint, name):
+            disk_ids = ("base-ext4", "empty-data") if endpoint == primary else ("second-root", "second-data")
             disks = [dict(attachment_id=f"{name}-{role}", device_id=role, role=role,
                           generation_id=disk_ids[role != "root"], read_only=role == "root")
                      for role in ("root", "storage", "data")]
@@ -234,7 +247,7 @@ def pressure_proof(primary, root, first, inventory, _started, group):
             return rpc(worker, "QueryWorkerBudget")
 
         current_before_second = int((group / "memory.current").read_text())
-        assert launch(secondary, "test-second", b)["phase"] == "NEW"
+        assert launch(secondary, "test-second")["phase"] == "NEW"
         assert settled(secondary, "launch-test-second")["phase"] == "COMPLETED"
         scope_b = scope(secondary, "test-second")
         second_inventory = http(secondary, f"{EXT}/instances/{scope_b['instance_id']}/inventory")
@@ -298,14 +311,14 @@ def pressure_proof(primary, root, first, inventory, _started, group):
             semantics_version=2, ttl_seconds=120, token="pressure-test-lease-token-private"))
         original = budget()["allocated"]
         captures = {}
-        for endpoint, bundle, ref, memory in ((primary, a, scope_a, 512), (secondary, b, scope_b, 384)):
+        for endpoint, ref, memory in ((primary, scope_a, 512), (secondary, scope_b, 384)):
             op = "storm-checkpoint-" + str(memory)
             capture = op + "-capture"
-            captures[bundle] = capture
+            captures[endpoint] = capture
             assert submit(endpoint, op, ref, "vm_snapshot", {"capture_id": capture})["phase"] == "NEW"
             reserved = budget()["allocated"]
             assert reserved == {**original, "storage_bytes": original["storage_bytes"] + (memory + 68) * MIB}, reserved
-            if bundle == a:
+            if endpoint == primary:
                 try:
                     submit(secondary, "storm-checkpoint-384", scope_b, "vm_snapshot",
                            {"capture_id": "storm-checkpoint-384-capture"})
@@ -323,7 +336,7 @@ def pressure_proof(primary, root, first, inventory, _started, group):
              dict(request_digest=digest(b"aborted-checkpoint"), expected=scope_a, expected_revision=aborted["revision"]))
         assert settled(primary, "aborted-checkpoint")["phase"] == "ABORTED"
         assert budget()["allocated"] == original
-        print("NEW exports counted storage once across both bundles. A competing export was refused, and both commit and abort returned their reservation.", flush=True)
+        print("NEW exports counted storage once across both Serve routes. A competing export was refused, and both commit and abort returned their reservation.", flush=True)
 
         facts(a, scope_a)
         facts(b, scope_b, busy=True)
@@ -343,24 +356,24 @@ def pressure_proof(primary, root, first, inventory, _started, group):
         before = budget()["allocated"]
 
         def attempt(item):
-            endpoint, bundle, ref, kind, index = item
+            endpoint, ref, kind, index = item
             name = f"throttled-{kind}-{index}"
             try:
                 if kind == "launch":
-                    launch(endpoint, name, bundle)
+                    launch(endpoint, name)
                 elif kind == "fork":
                     submit(endpoint, name, ref, "fork_batch", {"children": [name + "-a", name + "-b"]})
                 else:
                     submit(endpoint, name, scope(endpoint, name), "vm_restore",
-                           {"name": name, "capture_id": captures[bundle], "mode": "clone_conflicts"})
+                           {"name": name, "capture_id": captures[endpoint], "mode": "clone_conflicts"})
             except RuntimeError as error:
                 assert "E_RESOURCE_LIMIT" in str(error), error
                 return
             raise AssertionError(f"pressure admitted {kind} while all candidates were protected")
 
         with ThreadPoolExecutor(max_workers=6) as pool:
-            list(pool.map(attempt, [(endpoint, bundle, ref, kind, i)
-                                   for i, (endpoint, bundle, ref) in enumerate(((primary, a, scope_a), (secondary, b, scope_b)))
+            list(pool.map(attempt, [(endpoint, ref, kind, i)
+                                   for i, (endpoint, ref) in enumerate(((primary, scope_a), (secondary, scope_b)))
                                    for kind in ("launch", "fork", "restore")]))
         assert budget()["allocated"] == before
         print(f"Two Serve routes shared the {unit} ledger under pressure. Six launch, fork and restore requests were refused, and both protected VMs remained live.", flush=True)
@@ -437,6 +450,9 @@ def pressure_proof(primary, root, first, inventory, _started, group):
         other_wake = {**wake, "protection_id": "independent-wake"}
         call(b, parked, "RequestWake", other_wake)
         restart_worker(stack, root, worker)
+        if same_bundle:
+            assert rpc(worker, "Health")["executable_sha256"] == expected_worker
+            print(f"The replacement Worker is the same installed executable {expected_worker}.", flush=True)
         assert not select.select([descriptors[0]], [], [], 0)[0]
         assert http(primary, f"{EXT}/instances/{scope_a['instance_id']}/inventory")["execution"] == inventory["execution"]
         left = status(a, scope_a)
@@ -578,12 +594,15 @@ def main():
     parser.add_argument("--guest", type=lambda s: Path(s).resolve(), help="prebuilt static kvm-parked-block-guest executable")
     parser.add_argument("--historical-bundle", type=lambda s: Path(s).resolve(),
                         help="bundle whose Worker predates the vm_slice capability")
+    parser.add_argument("--same-bundle", action="store_true",
+                        help="use the supplied measured Bundle unchanged on both Serve routes")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("Linux root, KVM, systemd, and cgroup v2 are required")
     if os.environ.get("SMOLVM_PRESSURE_TEST_NAMESPACE") != "1":
         os.execvp("unshare", ["unshare", "--mount", "--propagation", "private", "--net", "--",
-                             "/usr/bin/env", "SMOLVM_PRESSURE_TEST_NAMESPACE=1", sys.executable, __file__, *sys.argv[1:]])
+                             "/usr/bin/env", "SMOLVM_PRESSURE_TEST_NAMESPACE=1", "PYTHONDONTWRITEBYTECODE=1",
+                             sys.executable, __file__, *sys.argv[1:]])
     with tempfile.TemporaryDirectory(dir="/var/tmp", prefix="smp-") as directory, ExitStack() as stack:
         root = Path(directory)
         root.chmod(0o755)
@@ -597,7 +616,7 @@ def main():
         properties(unit, str(3 << 30))
         try:
             verify(args.bundle, root, args.guest, None, False, False, False, False,
-                   observer=lambda *values: pressure_proof(*values, group))
+                   observer=lambda *values: pressure_proof(*values, group, args.same_bundle))
         except BaseException:
             for log in ("serve.log", "serve-second.log", "worker.log"):
                 path = root / log
