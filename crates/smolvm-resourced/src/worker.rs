@@ -1822,8 +1822,7 @@ impl Worker {
         }))
     }
 
-    fn drive_statepoint_stop(&mut self, record: StatePoint) -> Result<StatePoint> {
-        let source = self.catalog.execution(&record.point.incarnation_id)?;
+    fn stop_vmm(&mut self, source: &Execution) -> Result<bool> {
         if source.host_boot_id == self.boot && source.phase != "exited" {
             if let Some(pidfd) = self.executions.get(&source.incarnation_id) {
                 if !pid_exited(pidfd).map_err(broker_error)? {
@@ -1840,7 +1839,7 @@ impl Worker {
                     {
                         return Err(broker_error(io::Error::last_os_error()));
                     }
-                    return Ok(record);
+                    return Ok(false);
                 }
             } else if pid_start(source.pid).ok() == Some(source.pid_start_time) {
                 match process_fd(source.pid) {
@@ -1857,8 +1856,8 @@ impl Worker {
                                 }
                             }
                         }
-                        self.executions.insert(source.incarnation_id, pidfd);
-                        return self.drive_statepoint_stop(record);
+                        self.executions.insert(source.incarnation_id.clone(), pidfd);
+                        return self.stop_vmm(source);
                     }
                     Ok(_) => (),
                     Err(error) if error.raw_os_error() == Some(libc::ESRCH) => (),
@@ -1866,8 +1865,48 @@ impl Worker {
                 }
             }
         }
+        Ok(true)
+    }
+
+    fn drive_statepoint_stop(&mut self, record: StatePoint) -> Result<StatePoint> {
+        let source = self.catalog.execution(&record.point.incarnation_id)?;
+        if !self.stop_vmm(&source)? {
+            return Ok(record);
+        }
         self.finalize_scoped_execution(source)?;
         self.catalog.finish_statepoint_stop(&record)
+    }
+
+    fn reconcile_native_stops(&mut self) -> Result<()> {
+        for id in crate::native_operations::committed_stops(&self.catalog.db)? {
+            if let Err(fault) = self.drive_native_stop(&id) {
+                let detail = format!("{}: {}", fault.code, fault.message);
+                self.catalog.db.execute("UPDATE native_transitions SET last_error=? WHERE operation_id=? AND last_error IS NOT ?",
+                    rusqlite::params![detail,id,detail])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn drive_native_stop(&mut self, id: &str) -> Result<()> {
+        let op = self.catalog.operation(id)?;
+        let request = crate::managed_statepoint::request(&op, json!({}));
+        let source = self.scoped_execution(&request)?;
+        let binding = self.catalog.query_binding(
+            &request.derived("QueryBinding", json!({"instance_id": op.instance_id})),
+        )?;
+        if binding["active_operation_id"] != id
+            || binding["execution_epoch"] != source.execution_epoch
+            || (binding["incarnation_id"] != source.incarnation_id
+                && !(binding["incarnation_id"].is_null() && source.phase == "exited"))
+        {
+            return Err(stale_execution());
+        }
+        if self.stop_vmm(&source)? {
+            self.finalize_scoped_execution(source)?;
+            crate::native_operations::complete_stop(&mut self.catalog, id)?;
+        }
+        Ok(())
     }
 
     fn abort_statepoint(&mut self, request: &Request) -> Result<Value> {
@@ -2451,6 +2490,9 @@ fn serve(
                 .map_err(|e| io::Error::other(e.message))?;
             if let Err(error)=worker.reconcile_fork_cancellations() {
                 eprintln!("resourced fork cancellation: {error}");
+            }
+            if let Err(error) = worker.reconcile_native_stops() {
+                eprintln!("resourced native stop: {error}");
             }
             worker
                 .reconcile_statepoints()

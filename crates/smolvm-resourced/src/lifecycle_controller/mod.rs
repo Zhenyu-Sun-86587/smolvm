@@ -308,7 +308,7 @@ pub(crate) fn handle(c: &mut Catalog, r: &Request) -> Result<Value> {
     // Take the WAL writer before reading the binding and request receipt. A
     // concurrent native state transition must serialize with this decision.
     let tx = Transaction::new_unchecked(&c.db, TransactionBehavior::Immediate)?;
-    let (actual, _) = binding(c, r)?;
+    let (actual, active) = binding(c, r)?;
     if let Some((prior, answer)) = tx
         .query_row(
             "SELECT digest,reply FROM lifecycle_requests WHERE instance_id=? AND request_id=?",
@@ -335,6 +335,15 @@ pub(crate) fn handle(c: &mut Catalog, r: &Request) -> Result<Value> {
             "E_STALE_EXECUTION",
             "lifecycle request refers to a different execution",
         ));
+    }
+    if r.method == "RequestWake" {
+        if let Some(id) = active {
+            let stopping: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id=?
+                AND kind='stop' AND phase='NEW')", [id], |row| row.get(0))?;
+            if stopping {
+                return Err(Fault::new("E_OPERATION_IN_PROGRESS", "an explicit stop owns this instance"));
+            }
+        }
     }
     if r.method != "ApplyLifecyclePolicy" {
         row_policy(&tx, &expected.instance_id)?;

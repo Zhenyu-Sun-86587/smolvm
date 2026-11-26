@@ -34,7 +34,9 @@ struct Parameters {
 pub(crate) fn progress(db: &Connection, id: &str) -> Result<Option<Progress>> {
     Ok(db
         .query_row(
-            "SELECT stage,mode,disposition,last_error FROM native_transitions WHERE operation_id=?",
+            "SELECT CASE WHEN s.operation_id IS NOT NULL AND n.stage='entering'
+                THEN 'stop_committed' ELSE n.stage END,n.mode,n.disposition,n.last_error
+                FROM native_transitions n LEFT JOIN native_stop_commits s USING(operation_id) WHERE n.operation_id=?",
             [id],
             |r| {
                 Ok(Progress {
@@ -109,7 +111,8 @@ pub fn submit(catalog: &mut Catalog, boot: &str, r: &Request, input: Input) -> R
         ("standby", None | Some("managed")) => "managed",
         ("standby", Some("raw")) => "raw",
         ("wake", None) => "",
-        ("standby" | "wake", _) => {
+        ("stop", None) => "managed",
+        ("standby" | "wake" | "stop", _) => {
             return Err(Fault::invalid("unsupported native transition parameters"))
         }
         _ => {
@@ -149,8 +152,21 @@ pub fn submit(catalog: &mut Catalog, boot: &str, r: &Request, input: Input) -> R
             "native operation scope changed",
         ));
     }
+    if input.kind == "stop" {
+        let system: bool = catalog.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_launches WHERE incarnation_id=?
+                AND json_extract(spec_json,'$.boot_profile')='system-debian-v1')",
+            [incarnation], |row| row.get(0),
+        )?;
+        if !system {
+            return Err(unsupported("cold stop requires a managed System execution"));
+        }
+    }
     let endpoint = Endpoint::load(&catalog.db, incarnation, boot)?;
     let observed = endpoint.inventory()?;
+    if input.kind == "stop" && !observed.stop_barrier {
+        return Err(unsupported("Guest kernel did not negotiate the managed stop barrier"));
+    }
     if let Err(fault) = catalog.ready() {
         if fault.code != "E_RECOVERING" {
             return Err(fault);
@@ -319,9 +335,52 @@ fn finish(
     Ok(())
 }
 
+fn commit_stop(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
+    let instance: String = tx.query_row(
+        "SELECT o.instance_id FROM operations o JOIN instance_bindings b
+            ON b.route_id=o.route_id AND b.instance_id=o.instance_id
+        WHERE o.operation_id=? AND o.kind='stop' AND o.phase='NEW' AND b.active_operation_id=o.operation_id
+            AND b.incarnation_id=o.expected_incarnation_id AND b.execution_epoch=o.expected_execution_epoch",
+        [id], |row| row.get(0),
+    ).optional()?.ok_or_else(|| Fault::new("E_STALE_EXECUTION", "stop source binding changed"))?;
+    tx.execute("INSERT INTO native_stop_commits VALUES(?)", [id])?;
+    advance(tx, id, "entering", "STANDBY")?;
+    tx.execute("UPDATE lifecycle_protections SET state='released',reason='explicit stop',revision=revision+1
+        WHERE instance_id=? AND kind='wake' AND state='pending'", [&instance])?;
+    tx.execute("UPDATE lifecycle_decisions SET stage='cancelled',finished_at=unixepoch()*1000,error='explicit stop'
+        WHERE instance_id=? AND stage IN ('queued','dispatching') AND NOT EXISTS
+        (SELECT 1 FROM operations o WHERE o.operation_id=lifecycle_decisions.id AND o.phase='NEW')", [&instance])?;
+    Ok(())
+}
+
+pub(crate) fn committed_stops(db: &Connection) -> Result<Vec<String>> {
+    let mut query = db.prepare("SELECT s.operation_id FROM native_stop_commits s
+        JOIN operations o USING(operation_id) WHERE o.kind='stop' AND o.phase='NEW' ORDER BY s.rowid")?;
+    let ids = query.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
+}
+
+pub(crate) fn complete_stop(catalog: &mut Catalog, id: &str) -> Result<()> {
+    let tx = catalog.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let confirmed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations o
+        JOIN native_stop_commits s USING(operation_id)
+        JOIN instance_bindings b ON b.route_id=o.route_id AND b.instance_id=o.instance_id
+        JOIN executions e ON e.incarnation_id=o.expected_incarnation_id
+        WHERE operation_id=? AND o.kind='stop' AND o.phase='NEW'
+        AND b.active_operation_id=o.operation_id AND b.incarnation_id IS NULL
+        AND b.execution_epoch=o.expected_execution_epoch AND e.phase='exited')", [id], |row| row.get(0))?;
+    if !confirmed {
+        return Err(Fault::new("E_FENCE_UNPROVEN", "stop source still owns an execution or writers"));
+    }
+    finish(&tx, id, true, "EXITED", None)?;
+    tx.commit()?;
+    Ok(())
+}
+
 enum Next<'a> {
     Again,
     Advance(&'a str, &'a str),
+    CommitStop,
     Finish(bool, &'a str, Option<String>),
 }
 struct Transition {
@@ -362,7 +421,7 @@ impl Transition {
         if self.stage == "accepted" {
             return Ok(match (self.kind.as_str(), s.mode.as_str()) {
                 ("wake", _) => Next::Advance("waking", "STANDBY"),
-                ("standby", "managed") => Next::Advance("preparing", "RUNNING"),
+                ("standby" | "stop", "managed") => Next::Advance("preparing", "RUNNING"),
                 ("standby", "raw") => Next::Advance("entering", "UNKNOWN"),
                 _ => return Err(unsupported("unknown native operation")),
             });
@@ -375,7 +434,13 @@ impl Transition {
                     if state.0 == "armed" {
                         self.gate(
                             ep,
-                            if s.network { "PARK_NETWORK" } else { "PARK" },
+                            if self.kind == "stop" {
+                                "PARK_STOP"
+                            } else if s.network {
+                                "PARK_NETWORK"
+                            } else {
+                                "PARK"
+                            },
                             &s.anchor,
                         )?
                     } else {
@@ -398,7 +463,7 @@ impl Transition {
                         }
                         result => result?,
                     };
-                    if matches!(state.0.as_str(), "preparing" | "armed" | "parked") {
+                    if matches!(state.0.as_str(), "preparing" | "armed" | "parked" | "stop_parked") {
                         self.gate(ep, "ABORT", "")?
                     } else {
                         state
@@ -413,7 +478,8 @@ impl Transition {
                 ),
                 ("aborting", "aborted") => Next::Finish(false, "RUNNING", None),
                 ("preparing", "armed") => Next::Advance("parking", "GUEST_HELD"),
-                ("parking", "parked") => Next::Advance("entering", "GUEST_HELD"),
+                ("parking", "parked") if self.kind != "stop" => Next::Advance("entering", "GUEST_HELD"),
+                ("parking", "stop_parked") if self.kind == "stop" => Next::Advance("entering", "GUEST_HELD"),
                 (_, "preparing" | "parking" | "aborting") => Next::Again,
                 _ => {
                     return Err(Fault::new(
@@ -438,7 +504,7 @@ impl Transition {
                 if inventory.source_disposition == "RUNNING" {
                     return Ok(Next::Finish(false, "RUNNING", Some(fault.message)));
                 }
-                if s.mode == "managed" && self.gate(ep, "QUERY", "")?.0 == "parked" {
+                if s.mode == "managed" && matches!(self.gate(ep, "QUERY", "")?.0.as_str(), "parked" | "stop_parked") {
                     return Ok(Next::Advance("aborting", "GUEST_HELD"));
                 }
                 return Err(fault);
@@ -459,6 +525,7 @@ impl Transition {
         }
         Ok(
             match (self.stage.as_str(), receipt["source_disposition"].as_str()) {
+                ("entering", Some("STANDBY")) if self.kind == "stop" => Next::CommitStop,
                 ("entering", Some("STANDBY")) => Next::Finish(true, "STANDBY", None),
                 ("waking", Some("RUNNING")) => Next::Finish(true, "RUNNING", None),
                 ("waking", Some("WAKING")) => Next::Again,
@@ -483,6 +550,7 @@ impl Transition {
         match outcome {
             Next::Again => return Ok(false),
             Next::Advance(phase, state) => advance(&tx, &self.id, phase, state)?,
+            Next::CommitStop => commit_stop(&tx, &self.id)?,
             Next::Finish(success, state, error) => {
                 finish(&tx, &self.id, success, state, error.as_deref())?
             }
@@ -493,7 +561,8 @@ impl Transition {
 }
 
 fn pending(db: &Connection) -> Result<Vec<String>> {
-    let mut query=db.prepare("SELECT operation_id FROM native_transitions WHERE stage NOT IN ('complete','aborted') ORDER BY rowid")?;
+    let mut query=db.prepare("SELECT n.operation_id FROM native_transitions n WHERE stage NOT IN ('complete','aborted')
+        AND NOT EXISTS (SELECT 1 FROM native_stop_commits s WHERE s.operation_id=n.operation_id) ORDER BY rowid")?;
     let ids = query
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
