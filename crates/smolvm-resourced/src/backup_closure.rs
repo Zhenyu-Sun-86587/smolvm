@@ -167,7 +167,6 @@ pub(crate) fn prepare(
     objects: &File,
     request: &Request,
 ) -> Result<(Value, File)> {
-    catalog.ready()?;
     let bundle = bundle(catalog, request)?;
     let selection: Selection = request.payload()?;
     let enrolled = catalog.bundle(bundle)?;
@@ -205,6 +204,9 @@ pub(crate) fn prepare(
         }
         return Ok((json!({"backup_id":selection.backup_id,"manifest_digest":digest(raw.as_bytes())}), manifest_file(&raw)?));
     }
+    // A committed backup has a durable root set and no execution-dependent
+    // provider. Recovery only gates the creation of a new closure.
+    catalog.ready()?;
 
     let mut manifest = Manifest {
         schema: SCHEMA.into(),
