@@ -541,7 +541,9 @@ pub fn seal_heads(
     mut heads: Vec<VolumeHead>,
 ) -> Result<Value> {
     let op = catalog.matching_operation(request)?;
-    if op.kind != "catalog" || heads.is_empty() || heads.len() > 64 {
+    let retiring = op.kind == crate::managed_retirement::KIND
+        && request.method == crate::managed_retirement::METHOD;
+    if (op.kind != "catalog" && !retiring) || heads.is_empty() || heads.len() > 64 {
         return Err(Fault::invalid(
             "block seal requires a catalog operation and 1 to 64 heads",
         ));
@@ -587,7 +589,7 @@ pub fn seal_heads(
         return Ok(json!({"generations":objects}));
     }
     catalog.active_operation(request)?;
-    if prior.is_empty() {
+    if prior.is_empty() && !retiring {
         catalog.ready()?;
     }
     let mut handles = Vec::new();

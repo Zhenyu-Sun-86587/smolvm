@@ -179,11 +179,14 @@ fn exec(db: &Connection, id: &str) -> Result<Option<Execution>> {
         .optional()?)
 }
 
-fn binding(
+pub(crate) fn binding(
     db: &Connection,
     route: &str,
     instance: &str,
 ) -> Result<(i64, Option<String>, Option<String>)> {
+    if crate::managed_retirement::is_retired(db, route, instance)? {
+        return Err(stale());
+    }
     Ok(db
         .query_row(
             "SELECT execution_epoch,incarnation_id,active_operation_id
@@ -266,9 +269,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_native_resize.sql"))?;
                 tx.execute_batch(include_str!("schema_native_stop.sql"))?;
                 tx.execute_batch(include_str!("schema_first_launch.sql"))?;
-                tx.execute_batch("PRAGMA user_version=26")?;
+                tx.execute_batch(include_str!("schema_managed_retirements.sql"))?;
+                tx.execute_batch("PRAGMA user_version=27")?;
             }
-            1..=26 => {
+            1..=27 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -346,7 +350,10 @@ impl Catalog {
                 }
                 if version < 26 {
                     tx.execute_batch(include_str!("schema_first_launch.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=26")?;
+                }
+                if version < 27 {
+                    tx.execute_batch(include_str!("schema_managed_retirements.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=27")?;
                 }
                 crate::packet_wake::recover(&tx)?;
                 crate::lifecycle_controller::recover(&tx)?;
@@ -616,6 +623,12 @@ impl Catalog {
             ));
         }
         let mut operation = self.matching_operation(r)?;
+        if operation.kind == crate::managed_retirement::KIND {
+            return Err(conflict(
+                "E_OPERATION_HAS_EFFECTS",
+                "instance retirement requires Worker reconciliation",
+            ));
+        }
         if operation.kind == "managed_cpu_limit" {
             return Err(conflict(
                 "E_OPERATION_HAS_EFFECTS",

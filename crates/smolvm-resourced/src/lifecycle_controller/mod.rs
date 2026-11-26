@@ -339,9 +339,9 @@ pub(crate) fn handle(c: &mut Catalog, r: &Request) -> Result<Value> {
     if r.method == "RequestWake" {
         if let Some(id) = active {
             let stopping: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id=?
-                AND kind='stop' AND phase='NEW')", [id], |row| row.get(0))?;
+                AND kind IN ('stop','retire_instance') AND phase='NEW')", [id], |row| row.get(0))?;
             if stopping {
-                return Err(Fault::new("E_OPERATION_IN_PROGRESS", "an explicit stop owns this instance"));
+                return Err(Fault::new("E_OPERATION_IN_PROGRESS", "an explicit stop or deletion owns this instance"));
             }
         }
     }

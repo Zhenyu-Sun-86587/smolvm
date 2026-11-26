@@ -958,6 +958,9 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            crate::managed_retirement::METHOD => {
+                Ok(json!(crate::managed_retirement::submit(&mut self.catalog, request)?))
+            }
             "QueryNativeResources" => {
                 if request.payload != json!({}) {
                     return Err(Fault::invalid("native resource query requires an empty payload"));
@@ -2493,6 +2496,9 @@ fn serve(
             }
             if let Err(error) = worker.reconcile_native_stops() {
                 eprintln!("resourced native stop: {error}");
+            }
+            if let Err(error) = crate::managed_retirement::reconcile(&mut worker.catalog, &worker.objects) {
+                eprintln!("resourced instance retirement: {error}");
             }
             worker
                 .reconcile_statepoints()

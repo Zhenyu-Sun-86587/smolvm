@@ -503,7 +503,10 @@ impl Controller {
         protections::expire(&c.db)?;
         let p = pressure::refresh(&c.db, &mut self.cache_reclaim)?;
         let ids = {
-            let mut q=c.db.prepare("SELECT instance_id FROM lifecycle_policies ORDER BY json_extract(policy_json,'$.reclaim_priority'),idle_since,instance_id")?;
+            let mut q=c.db.prepare("SELECT p.instance_id FROM lifecycle_policies p
+                WHERE NOT EXISTS (SELECT 1 FROM operations o WHERE o.route_id='deep' AND o.instance_id=p.instance_id
+                    AND o.kind='retire_instance' AND o.phase='COMPLETED')
+                ORDER BY json_extract(policy_json,'$.reclaim_priority'),idle_since,p.instance_id")?;
             let rows = q
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
