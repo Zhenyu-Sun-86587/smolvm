@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 
-from test_deep_managed_launch import EXT, digest, http, rpc, settled, until, verify
+from test_deep_managed_launch import EXT, digest, http, installed_bundle, rpc, settled, until, verify
 from test_deep_worker_pressure import MIB, create_slice, open_pidfd, properties, restart_worker
 
 
@@ -25,7 +25,7 @@ def expect_error(code, operation):
         raise AssertionError(f"expected {code}")
 
 
-def exercise(endpoint, root, original, inventory, _started, legacy, group):
+def exercise(endpoint, root, original, inventory, _started, legacy, group, pressure_driver=None):
     worker = root / "ipc/worker.sock"
     bundle = http(endpoint, EXT + "/capabilities")["bundle_digest"]
 
@@ -82,12 +82,69 @@ def exercise(endpoint, root, original, inventory, _started, legacy, group):
         assert line.startswith("0::/smolvmresize"), line
         return Path("/sys/fs/cgroup") / line.removeprefix("0::/")
 
+    def pressure_round(ref):
+        control("ApplyLifecyclePolicy", "pressure-after-resize", ref, {
+            "expected_applied_revision": 0, "new_revision": 1,
+            "effective_policy": {"auto_standby": False, "auto_hibernate": True,
+                                 "hibernate_after_seconds": 600, "min_running_after_wake_seconds": 0},
+        })
+        counts = {"host": {"inbound": 0, "outbound": 0},
+                  "guest": {"inbound": 0, "outbound": 0, "exec": 0, "task": 0},
+                  "platform": {"task": 0, "exec": 0, "stream": 0}}
+        for collector, values in counts.items():
+            control("ReportActivity", "hint-" + collector, ref, {
+                "collector": collector, "session": "resize-pressure-test", "seq": 1,
+                "valid_for_ms": 60000, "counts": values,
+            })
+        properties(group.name, str(int((group / "memory.current").read_text()) + 120 * MIB))
+
+        def hint_result():
+            view = control("GetLifecycleStatus", "hint-status", ref, {})
+            hint = (view["pressure"] or {}).get("last_balloon")
+            if hint and hint["outcome"] != "unknown":
+                return view, hint
+
+        view, hint = until(hint_result, 35)
+        assert hint["decision_id"] == view["last_decision"]["operation_id"]
+        assert hint["worker_memory_before_bytes"] > 0 and hint["worker_memory_after_bytes"] > 0
+        assert hint["outcome"] in ("observed", "timed_out", "unavailable"), hint
+        print(json.dumps({"automatic_balloon_before_hibernate": hint}), flush=True)
+        properties(group.name, "infinity")
+        return hint
+
+    def unbind_balloon(ref):
+        driver = "/sys/bus/virtio/drivers/virtio_balloon"
+        device = execute(ref, "/bin/sh", "-ec",
+                         f'set -- {driver}/virtio*; test -d "$1"; basename "$1"').decode().strip()
+        assert device.startswith("virtio")
+        execute(ref, "/bin/sh", "-ec", f'printf %s "$1" > {driver}/unbind', "unbind", device)
+        return driver, device
+
     initial = resources(original)
     assert initial["profile"] == "parked-capture" and initial["capture_compatible"], initial
     assert initial["observed"]["cpus"] == {"created": 2, "capacity": 2}, initial
     assert initial["observed"]["online_cpu_ids"] == [0, 1], initial
     assert initial["capabilities"]["balloon"]["available_now"], initial
     budget = ledger()
+    if pressure_driver:
+        assert budget["memory_mib"] == 512
+        if pressure_driver == "unbound":
+            unbind_balloon(original)
+        else:
+            resize("confirm-balloon", original, change="balloon", target_mib=16)
+            assert complete("confirm-balloon")["resize"]["observed"]["balloon"]["actual_mib"] == 16
+            resize("return-balloon", original, change="balloon", target_mib=0)
+            assert complete("return-balloon")["resize"]["observed"]["balloon"]["actual_mib"] == 0
+        assert ledger() == budget
+        hint = pressure_round(original)
+        assert ledger()["memory_mib"] == budget["memory_mib"]
+        if pressure_driver == "unbound":
+            assert hint["outcome"] in ("timed_out", "unavailable") and not hint["guest_reported_bytes"], hint
+        else:
+            assert hint["outcome"] == "observed" and hint["guest_reported_bytes"] > 0, hint
+        print(json.dumps({"balloon_driver": pressure_driver, "bundle": bundle, "guest_memory_budget": budget,
+                          "worker_digest": rpc(worker, "Health")["executable_sha256"], "hint": hint}), flush=True)
+        return
     expect_error("E_CAPABILITY_UNSUPPORTED", lambda: resize("fixed-cpu-refused", original, change="cpu_online", cpus=3))
     expect_error("E_CAPABILITY_UNSUPPORTED", lambda: resize("fixed-ram-refused", original, change="memory_grow", memory_mib=640))
     assert ledger() == budget
@@ -109,11 +166,7 @@ def exercise(endpoint, root, original, inventory, _started, legacy, group):
     resize("balloon-deflate", original, change="balloon", target_mib=0)
     assert complete("balloon-deflate")["resize"]["observed"]["balloon"]["actual_mib"] == 0
 
-    driver = "/sys/bus/virtio/drivers/virtio_balloon"
-    device = execute(original, "/bin/sh", "-ec",
-                     f'set -- {driver}/virtio*; test -d "$1"; basename "$1"').decode().strip()
-    assert device.startswith("virtio")
-    execute(original, "/bin/sh", "-ec", f"printf %s \"$1\" > {driver}/unbind", "unbind", device)
+    driver, device = unbind_balloon(original)
     resize("balloon-unresponsive", original, change="balloon", target_mib=16)
 
     def awaiting_actual():
@@ -217,33 +270,7 @@ def exercise(endpoint, root, original, inventory, _started, legacy, group):
         print(json.dumps({"hot_compute": resources(ref)["observed"], "guest_memtotal_kib": [before, after],
                           "ledger": ledger(), "initial_cpu_operation": resized["phase"]}), flush=True)
 
-        control("ApplyLifecyclePolicy", "pressure-after-resize", restored, {
-            "expected_applied_revision": 0, "new_revision": 1,
-            "effective_policy": {"auto_standby": False, "auto_hibernate": True,
-                                 "hibernate_after_seconds": 600, "min_running_after_wake_seconds": 0},
-        })
-        counts = {"host": {"inbound": 0, "outbound": 0},
-                  "guest": {"inbound": 0, "outbound": 0, "exec": 0, "task": 0},
-                  "platform": {"task": 0, "exec": 0, "stream": 0}}
-        for collector, values in counts.items():
-            control("ReportActivity", "hint-" + collector, restored, {
-                "collector": collector, "session": "resize-pressure-test", "seq": 1,
-                "valid_for_ms": 60000, "counts": values,
-            })
-        properties(group.name, str(int((group / "memory.current").read_text()) + 120 * MIB))
-
-        def hint_result():
-            view = control("GetLifecycleStatus", "hint-status", restored, {})
-            hint = (view["pressure"] or {}).get("last_balloon")
-            if hint and hint["outcome"] != "unknown":
-                return view, hint
-
-        view, hint = until(hint_result, 35)
-        assert hint["decision_id"] == view["last_decision"]["operation_id"]
-        assert hint["worker_memory_before_bytes"] > 0 and hint["worker_memory_after_bytes"] > 0
-        assert hint["outcome"] in ("observed", "timed_out", "unavailable"), hint
-        print(json.dumps({"automatic_balloon_before_hibernate": hint}), flush=True)
-        properties(group.name, "infinity")
+        pressure_round(restored)
 
 
 def main():
@@ -252,21 +279,26 @@ def main():
     parser.add_argument("--system-image", type=lambda raw: Path(raw).resolve(), required=True)
     parser.add_argument("--guest", type=lambda raw: Path(raw).resolve(), help="optional prebuilt static fixture executable")
     parser.add_argument("--legacy-agent", action="store_true", help="verify a System image from before typed live resource methods")
+    parser.add_argument("--pressure-balloon", choices=("bound", "unbound"),
+                        help="measure pressure feedback and its actual effect on the configured memory budget")
+    parser.add_argument("--work-dir", type=Path, default=Path("/var/tmp"))
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("requires Linux root, KVM and systemd")
     if os.environ.get("SMOLVM_RESIZE_TEST_NAMESPACE") != "1":
         os.execvp("unshare", ["unshare", "--mount", "--propagation", "private", "--net", "--",
                              "/usr/bin/env", "SMOLVM_RESIZE_TEST_NAMESPACE=1", sys.executable, __file__, *sys.argv[1:]])
-    with tempfile.TemporaryDirectory(dir="/var/tmp", prefix="smrz-") as directory, ExitStack() as stack:
+    with tempfile.TemporaryDirectory(dir=args.work_dir, prefix="smrz-") as directory, ExitStack() as stack:
         root = Path(directory)
         root.chmod(0o755)
         unit = f"smolvmresize{os.getpid()}_{os.urandom(4).hex()}.slice"
         group = create_slice(unit, stack)
         os.environ.update(SMOLVM_WORKER_SLICE_NAME=unit, SMOLVM_WORKER_VCPU_BUDGET="5")
         try:
-            verify(args.bundle, root, args.guest, args.system_image, False, False, False, False,
-                   observer=lambda *result: exercise(*result, args.legacy_agent, group))
+            bundle = stack.enter_context(installed_bundle(args.bundle, root)) if args.pressure_balloon else args.bundle
+            verify(bundle, root, args.guest, args.system_image, False, False, False, False,
+                   stage_bundle=not args.pressure_balloon,
+                   observer=lambda *result: exercise(*result, args.legacy_agent, group, args.pressure_balloon))
         except BaseException:
             for log in [root / "serve.log", root / "worker.log", *(root / "state/managed").glob("*.log")]:
                 if log.exists():
