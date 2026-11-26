@@ -24,6 +24,7 @@ mod live_resources;
 mod oci_supervisor;
 mod shutdown;
 mod shutdown_freeze;
+mod system_files;
 
 /// Ensures storage disk is mounted exactly once. The mount happens either during
 /// deferred init (the common case) or on the first request that needs storage
@@ -2478,6 +2479,7 @@ fn handle_connection(
     // the session is replaced, or when a protocol violation (e.g.,
     // another request type arriving mid-stream) takes it.
     let mut write_session: Option<WriteSession> = None;
+    let mut system_upload = None;
     let mut files_session: Option<container::FilesSession> = None;
     let mut directory_session: Option<directory_write::Session> = None;
 
@@ -2573,12 +2575,16 @@ fn handle_connection(
         debug!(method = %request.log_summary(), "received request");
 
         if mode.is_system() {
+            if !matches!(request, AgentRequest::FileWriteChunk { .. }) {
+                system_upload = None;
+            }
             let response = match request {
                 AgentRequest::Ping => AgentResponse::Pong {
                     version: PROTOCOL_VERSION,
                     capabilities: vec![
                         "system-service-v1".to_owned(),
                         smolvm_protocol::SYSTEM_FILE_WRITE_CAPABILITY.to_owned(),
+                        smolvm_protocol::SYSTEM_FILE_TRANSFER_CAPABILITY.to_owned(),
                         smolvm_protocol::SYSTEM_EXEC_STREAM_CAPABILITY.to_owned(),
                         smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_owned(),
                         smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY.to_owned(),
@@ -2623,6 +2629,13 @@ fn handle_connection(
                 } if data.len() <= smolvm_protocol::FILE_WRITE_SINGLE_SHOT_MAX => {
                     let _permit = WORK_SLOTS.acquire();
                     handle_file_write(&path, &data, mode, uid, gid, Some(&WorkloadTarget::Vm))
+                }
+                request @ (AgentRequest::FileRead { .. }
+                | AgentRequest::ListDirectory { .. }
+                | AgentRequest::FileWriteBegin { .. }
+                | AgentRequest::FileWriteChunk { .. }) => {
+                    system_files::handle(stream, request, &mut system_upload)?;
+                    continue;
                 }
                 _ => AgentResponse::error(
                     "request is unavailable in the system Agent service",
@@ -3941,18 +3954,11 @@ impl WriteSession {
             .unwrap_or_default();
         let tmp_name = format!("{}{}", file_name, staging_suffix());
         let tmp_path = match &target {
-            Some(target) => {
-                if let Some(parent) = target.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                }
-                target
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .map(|p| p.join(&tmp_name))
-                    .unwrap_or_else(|| std::path::PathBuf::from(&tmp_name))
-            }
+            Some(target) => target
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.join(&tmp_name))
+                .unwrap_or_else(|| std::path::PathBuf::from(&tmp_name)),
             None => storage::archive_scratch_dir().join(&tmp_name),
         };
 
@@ -4011,6 +4017,13 @@ impl WriteSession {
     /// to close the handle first; it drops naturally when this
     /// function returns via the by-value caller pattern.
     fn finalize(&mut self) -> AgentResponse {
+        self.finalize_checked(|| Ok(()))
+    }
+
+    fn finalize_checked(
+        &mut self,
+        before_rename: impl FnOnce() -> Result<(), AgentResponse>,
+    ) -> AgentResponse {
         if self.bytes_written != self.total_size {
             return AgentResponse::error(
                 format!(
@@ -4079,13 +4092,21 @@ impl WriteSession {
         let target = match self.target.clone() {
             Some(t) => t,
             None => {
-                match resolve_guest_io_path(&self.guest_path, FilePathAccess::Write, &self.root) {
+                let path = match resolve_guest_io_path(
+                    &self.guest_path,
+                    FilePathAccess::Write,
+                    &self.root,
+                ) {
                     Ok(p) => p,
                     Err(resp) => return resp,
+                };
+                if let Err(resp) = ensure_parent_dir(&path) {
+                    return resp;
                 }
+                path
             }
         };
-        if let Err(resp) = ensure_parent_dir(&target) {
+        if let Err(resp) = before_rename() {
             return resp;
         }
         // Disarm Drop before rename; if the rename fails we'll
@@ -4171,7 +4192,12 @@ fn handle_file_write_begin(
         }
         nsfile::GuestNs::Root(_) => {
             match resolve_guest_io_path(&path, FilePathAccess::Write, &root) {
-                Ok(p) => Some(p),
+                Ok(p) => {
+                    if let Err(resp) = ensure_parent_dir(&p) {
+                        return (None, resp);
+                    }
+                    Some(p)
+                }
                 Err(resp) => return (None, resp),
             }
         }
@@ -4284,6 +4310,10 @@ fn send_data_chunks<R: Read>(
     error_code: &'static str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     send_data_chunks_body(stream, reader, chunk_size, error_context, error_code)?;
+    send_data_eof(stream)
+}
+
+fn send_data_eof(stream: &mut WireStream<impl Write>) -> Result<(), Box<dyn std::error::Error>> {
     send_response(
         stream,
         &AgentResponse::DataChunk {
@@ -4388,64 +4418,10 @@ fn handle_streaming_file_read(
             }
         }
     }
-    let resolved = match resolve_guest_io_path(path, FilePathAccess::Read, &root) {
-        Ok(p) => p,
-        Err(resp) => {
-            send_response(stream, &resp)?;
-            return Ok(());
-        }
+    let (mut file, size) = match open_regular_vm_file(path, &root) {
+        Ok(opened) => opened,
+        Err(response) => return send_response(stream, &response),
     };
-    let mut file = match nsfile::open_file_for_read(&resolved) {
-        Ok(f) => f,
-        Err(e) => {
-            send_response(
-                stream,
-                &AgentResponse::error(
-                    format!("failed to open {}: {}", path, e),
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        error_codes::NOT_FOUND
-                    } else {
-                        error_codes::FILE_IO_FAILED
-                    },
-                ),
-            )?;
-            return Ok(());
-        }
-    };
-    // Only stream regular files. Opening with O_NONBLOCK above prevents a FIFO
-    // from hanging before this check. Directories fail on read only after the
-    // first chunk (desyncing the wire), and devices may never reach EOF. Reject
-    // them with a clean error BEFORE the first DataChunk frame.
-    let metadata = match file.metadata() {
-        Ok(m) => m,
-        Err(e) => {
-            send_response(
-                stream,
-                &AgentResponse::error(
-                    format!("failed to stat {}: {}", path, e),
-                    error_codes::FILE_IO_FAILED,
-                ),
-            )?;
-            return Ok(());
-        }
-    };
-    if !metadata.is_file() {
-        // Say "is a directory" specifically. A caller that asked for a path
-        // without knowing what it is can then ask for the listing instead,
-        // which it cannot do if a directory, a socket and a device all report
-        // the same thing.
-        let detail = if metadata.is_dir() {
-            format!("is a directory: {}", path)
-        } else {
-            format!("not a regular file: {}", path)
-        };
-        send_response(
-            stream,
-            &AgentResponse::error(detail, error_codes::FILE_IO_FAILED),
-        )?;
-        return Ok(());
-    }
-    let size = metadata.len();
     info!(path = %path, size, "streaming file read");
     send_data_chunks(
         stream,
@@ -4454,6 +4430,39 @@ fn handle_streaming_file_read(
         "failed to read file",
         error_codes::FILE_IO_FAILED,
     )
+}
+
+fn open_regular_vm_file(
+    path: &str,
+    root: &io_target::IoRoot,
+) -> Result<(std::fs::File, u64), AgentResponse> {
+    let resolved = resolve_guest_io_path(path, FilePathAccess::Read, root)?;
+    let file = nsfile::open_file_for_read(&resolved).map_err(|err| {
+        AgentResponse::error(
+            format!("failed to open {path}: {err}"),
+            if err.kind() == std::io::ErrorKind::NotFound {
+                error_codes::NOT_FOUND
+            } else {
+                error_codes::FILE_IO_FAILED
+            },
+        )
+    })?;
+    let metadata = file.metadata().map_err(|err| {
+        AgentResponse::error(
+            format!("failed to stat {path}: {err}"),
+            error_codes::FILE_IO_FAILED,
+        )
+    })?;
+    // O_NONBLOCK prevents a FIFO from hanging before the regular-file check.
+    if !metadata.is_file() {
+        let detail = if metadata.is_dir() {
+            format!("is a directory: {path}")
+        } else {
+            format!("not a regular file: {path}")
+        };
+        return Err(AgentResponse::error(detail, error_codes::FILE_IO_FAILED));
+    }
+    Ok((file, metadata.len()))
 }
 
 /// Stream a tar archive of a directory directly over vsock.
@@ -8689,9 +8698,15 @@ fn handle_streaming_export_layer(
 pub(crate) fn list_directory_entries(
     path: &str,
 ) -> std::result::Result<Vec<smolvm_protocol::DirectoryEntry>, String> {
+    let read = std::fs::read_dir(path).map_err(|e| format!("list directory {path}: {e}"))?;
+    Ok(collect_directory_entries(read))
+}
+
+fn collect_directory_entries(
+    read: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> Vec<smolvm_protocol::DirectoryEntry> {
     use smolvm_protocol::DirectoryEntry;
 
-    let read = std::fs::read_dir(path).map_err(|e| format!("list directory {path}: {e}"))?;
     let mut entries: Vec<DirectoryEntry> = Vec::new();
     for entry in read.flatten() {
         let Ok(name) = entry.file_name().into_string() else {
@@ -8721,7 +8736,7 @@ pub(crate) fn list_directory_entries(
         });
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(entries)
+    entries
 }
 
 /// List a guest directory, inside the workload container when there is one.
