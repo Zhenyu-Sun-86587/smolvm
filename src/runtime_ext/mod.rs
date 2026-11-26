@@ -8,7 +8,13 @@ use std::{
     io::{BufReader, Read},
 };
 
-static CAPABILITIES: tokio::sync::OnceCell<Handshake> = tokio::sync::OnceCell::const_new();
+struct InstalledCapabilities {
+    handshake: Handshake,
+    #[cfg(feature = "deep-runtime")]
+    measured: Option<smolvm_runtime_protocol::MeasuredRelease>,
+}
+
+static CAPABILITIES: tokio::sync::OnceCell<InstalledCapabilities> = tokio::sync::OnceCell::const_new();
 #[cfg(feature = "deep-runtime")]
 mod guest_agent;
 #[cfg(feature = "deep-runtime")]
@@ -60,11 +66,51 @@ fn installed_profile() -> Result<(Handshake, serde_json::Value, String), String>
     };
     Ok((handshake, manifest, binary_hash))
 }
-fn installed() -> Result<Handshake, String> {
-    installed_profile().map(|(handshake, _, _)| handshake)
+#[cfg(feature = "deep-runtime")]
+fn measured_profile(manifest: &serde_json::Value) -> Option<smolvm_runtime_protocol::MeasuredRelease> {
+    let exe = std::env::current_exe().ok()?;
+    let root = exe.parent()?;
+    let file = File::open(root.join(smolvm_runtime_protocol::MANAGED_ACCEPTANCE_PATH)).ok()?;
+    const LIMIT: u64 = 64 * 1024;
+    let mut evidence = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut evidence).ok()?;
+    if evidence.len() as u64 > LIMIT {
+        return None;
+    }
+    let release = smolvm_runtime_protocol::measured_release(manifest, &evidence)?;
+    // The installer verified the System archive. Check the small installed
+    // identity and profile inputs again before interpreting that evidence.
+    let artifacts = manifest["artifacts"].as_array()?;
+    for path in ["profiles/verification.json", "guest/identity-helper", "guest/agent"] {
+        let expected = artifacts.iter().find(|entry| entry["path"] == path)?;
+        let mut input = File::open(root.join(path)).ok()?;
+        let limit = expected["size"].as_u64()?;
+        if input.metadata().ok()?.len() != limit {
+            return None;
+        }
+        let mut checksum = Sha256::new();
+        if std::io::copy(&mut input, &mut checksum).ok()? != limit
+            || expected["sha256"] != format!("{:x}", checksum.finalize())
+        {
+            return None;
+        }
+    }
+    let system_path = "guest/system-debian.tar.gz";
+    let expected = artifacts.iter().find(|entry| entry["path"] == system_path)?;
+    let archive = std::fs::metadata(root.join(system_path)).ok()?;
+    (archive.is_file() && Some(archive.len()) == expected["size"].as_u64()).then_some(release)
 }
 
-pub(crate) async fn capabilities() -> Result<Json<&'static Handshake>, ApiError> {
+fn installed() -> Result<InstalledCapabilities, String> {
+    let (handshake, _manifest, _) = installed_profile()?;
+    Ok(InstalledCapabilities {
+        handshake,
+        #[cfg(feature = "deep-runtime")]
+        measured: measured_profile(&_manifest),
+    })
+}
+
+async fn installed_capabilities() -> Result<&'static InstalledCapabilities, ApiError> {
     CAPABILITIES
         .get_or_try_init(|| async {
             tokio::task::spawn_blocking(installed)
@@ -73,7 +119,30 @@ pub(crate) async fn capabilities() -> Result<Json<&'static Handshake>, ApiError>
                 .map_err(ApiError::Unavailable)
         })
         .await
-        .map(Json)
+}
+
+pub(crate) async fn capabilities() -> Result<Json<Handshake>, ApiError> {
+    let installed = installed_capabilities().await?;
+    let handshake = installed.handshake.clone();
+    #[cfg(feature = "deep-runtime")]
+    let handshake = if let Some(release) = &installed.measured {
+        let unavailable = if let Some(socket) = launch::worker_socket() {
+            use smolvm_resourced::client::worker_executable_release;
+            match tokio::task::spawn_blocking(move || worker_executable_release(socket)).await {
+                Ok(Ok(Some(digest))) if digest == release.worker_sha256() => None,
+                Ok(Ok(_)) => Some("WORKER_RELEASE_MISMATCH"),
+                _ => Some("WORKER_RELEASE_UNAVAILABLE"),
+            }
+        } else {
+            Some("WORKER_NOT_CONFIGURED")
+        };
+        let mut handshake = handshake;
+        release.advertise(&mut handshake, unavailable);
+        handshake
+    } else {
+        handshake
+    };
+    Ok(Json(handshake))
 }
 
 /// Read durable receipts from the operator-selected Worker on the private Serve socket.
@@ -184,8 +253,8 @@ async fn operation(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> axum::response::Response {
     use axum::{http::StatusCode, response::IntoResponse};
-    let handshake = match capabilities().await {
-        Ok(Json(handshake)) => handshake,
+    let handshake = match installed_capabilities().await {
+        Ok(installed) => &installed.handshake,
         Err(err) => return err.into_response(),
     };
     let response = tokio::task::spawn_blocking(move || {
@@ -229,8 +298,8 @@ async fn native<T: serde::Serialize + Send + 'static>(
         + 'static,
 ) -> axum::response::Response {
     use axum::{http::StatusCode, response::IntoResponse};
-    let handshake = match capabilities().await {
-        Ok(Json(h)) => h,
+    let handshake = match installed_capabilities().await {
+        Ok(installed) => &installed.handshake,
         Err(e) => return e.into_response(),
     };
     let result = tokio::task::spawn_blocking(move || {
