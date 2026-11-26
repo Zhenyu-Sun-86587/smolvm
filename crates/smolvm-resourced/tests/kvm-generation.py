@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -26,7 +27,7 @@ def require(condition, *detail):
         raise RuntimeError(*detail)
 
 
-def rpc(worker, method, payload=None, *, fds=(), reply_fds=False, **scope):
+def rpc(worker, method, payload=None, *, fds=(), reply_fds=False, expect_error=None, **scope):
     request = dict(protocol=PROTOCOL, method=method, request_id=method, payload=payload, **scope)
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as conn:
         conn.settimeout(10)
@@ -42,9 +43,18 @@ def rpc(worker, method, payload=None, *, fds=(), reply_fds=False, **scope):
                 require((level, tag) == (socket.SOL_SOCKET, socket.SCM_RIGHTS), "invalid ancillary data")
                 received.frombytes(data)
             result = json.loads(body)
+            if expect_error:
+                for fd in received:
+                    os.close(fd)
+                require(not received and not result.get("fd_table"), result)
+                require(result.get("error", {}).get("code") == expect_error, result)
+                return result["error"]["code"]
             require("result" in result, result)
             return result["result"], result.get("fd_table", []), list(received)
         result = json.loads(conn.recv(65536))
+        if expect_error:
+            require(result.get("error", {}).get("code") == expect_error, result)
+            return expect_error
         require("result" in result, result)
         return result["result"]
 
@@ -118,6 +128,10 @@ def worker(args):
             if method == "register":
                 result = rpc(path, "RegisterExecution", {"launch_permit": cmd["permit"]},
                              **operation(instance, "launch"))
+            elif method == "lease_lost":
+                result = rpc(path, "AcquireResourceLease", {
+                    "lease_id": instance + "-lease", "resource_id": cmd["resource"], "access": "ro", "offset": 0,
+                }, reply_fds=True, expect_error="E_RESOURCE_UNAVAILABLE", **lease)
             elif method in ("export", "recover_source"):
                 recovering = method == "recover_source"
                 if recovering:
@@ -198,7 +212,7 @@ def until(check, process, detail):
     raise RuntimeError("timed out", detail)
 
 
-def orchestration(broker, library, guest):
+def orchestration(broker, library, guest, loss_case=None):
     broker, library, guest = [Path(path).resolve(strict=True) for path in (broker, library, guest)]
     with tempfile.TemporaryDirectory(prefix="deep-resource-kvm-") as temporary:
         work = Path(temporary)
@@ -297,6 +311,76 @@ def orchestration(broker, library, guest):
             until(lambda: source_control.exists() and ticks(source_log) and ticks(source_log)[-1][0] >= 3,
                   source, "source guest output")
 
+            if loss_case:
+                capture = work / "loss-capture"
+                print(control(source_control, "FORK " + str(capture)), flush=True)
+                scope = operation("source", "generation")
+                resource = {"resource_id": resource_id("source")}
+                owner = {"owner_kind": "capture", "owner_id": "retained-intent"}
+                admin("BeginOperation", {"kind": "generation"}, **scope)
+                exported = command(source, "export", capture=str(capture))
+                admin("AddOwnerRef", {**owner, **resource, "expected_revision": 0}, **scope)
+                prior = admin("QueryResource", resource)
+                require(prior["state"] == "available" and prior["durability"] == "volatile", prior)
+                require(prior["descriptor"] == exported["descriptor"], prior)
+                inodes = {int(name.rsplit("-", 1)[-1], 16) for name in prior["descriptor"]["backing_sizes"]}
+
+                def backing_fds(pid):
+                    found = set()
+                    for path in (Path("/proc") / str(pid) / "fd").iterdir():
+                        try:
+                            if path.readlink().as_posix().startswith("/memfd:"):
+                                found.add(path.stat().st_ino)
+                        except FileNotFoundError:
+                            pass
+                    return found & inodes
+
+                require(backing_fds(source.pid) == backing_fds(service.pid) == inodes, inodes)
+                require(not backing_fds(os.getpid()), "control process unexpectedly retained a backing")
+                # There is no child or independent reader. Remove the file-based
+                # capture metadata before either process can be replaced.
+                shutil.rmtree(capture)
+                old_session = status["broker_session_id"]
+                if loss_case == "broker-only":
+                    source.kill()
+                    source.wait(10)
+                    retire_exporter("source")
+                    require(backing_fds(service.pid) == inodes)
+                    require(admin("QueryResource", resource)["state"] == "available")
+                    service.kill()
+                else:
+                    # A stopped provider cannot publish anything between the two deaths.
+                    os.kill(source.pid, signal.SIGSTOP)
+                    stopped = os.waitid(os.P_PID, source.pid, os.WSTOPPED | os.WEXITED | os.WNOWAIT)
+                    require(stopped.si_code == os.CLD_STOPPED and stopped.si_status == signal.SIGSTOP, stopped)
+                    service.kill()
+                    source.kill()
+                    source.wait(10)
+                service.wait(10)
+                service, status = start_broker()
+                require(status["state"] == "recovering" and old_session != status["broker_session_id"], status)
+                current = admin("QueryResource", resource)
+                admin("CollectResource", {**resource, "expected_revision": current["revision"]}, expect_error="E_RECOVERING")
+                if loss_case == "last-provider":
+                    retire_exporter("source")
+                require(admin("CompleteRecovery", {"broker_session_id": status["broker_session_id"]})["state"] == "ready")
+                current = admin("QueryResource", resource)
+                require(current["state"] == current["fd_state"] == "lost", current)
+                require(current["descriptor"] == prior["descriptor"], current)
+                require(not backing_fds(service.pid))
+                closure = admin("QueryOwnerClosure", owner)["resources"]
+                require([entry["resource_id"] for entry in closure] == [resource["resource_id"]], closure)
+                admin("CollectResource", {**resource, "expected_revision": current["revision"]}, expect_error="E_RESOURCE_PINNED")
+                reader, endpoint, _ = launch("lost-reader", roots[1])
+                lease = operation("lost-reader", "resource_lease")
+                admin("BeginOperation", {"kind": "resource_lease"}, **lease)
+                require(command(reader, "lease_lost", resource=resource["resource_id"]) == "E_RESOURCE_UNAVAILABLE")
+                require(not endpoint.exists() and not backing_fds(reader.pid))
+                admin("FinishOperation", {"abort": True, "expected_revision": 1}, **lease)
+                print(loss_case, "sealed inodes", sorted(inodes), "broker", old_session, "->", status["broker_session_id"],
+                      "lost descriptor", current["descriptor_digest"], "capture intent retained; GC fenced; new reader got no FDs", flush=True)
+                return
+
             def recover_source(capture, outcome):
                 nonlocal service, status
                 scope = operation("source", "generation")
@@ -366,7 +450,7 @@ def orchestration(broker, library, guest):
 if __name__ == "__main__":
     if len(sys.argv) == 8 and sys.argv[1] == "worker":
         worker(sys.argv[2:])
-    elif len(sys.argv) == 4:
+    elif len(sys.argv) == 4 or (len(sys.argv) == 5 and sys.argv[4] in ("broker-only", "last-provider")):
         orchestration(*sys.argv[1:])
     else:
-        sys.exit(f"usage: {sys.argv[0]} RESOURCED LIBKRUN STATIC_GUEST")
+        sys.exit(f"usage: {sys.argv[0]} RESOURCED LIBKRUN STATIC_GUEST [broker-only|last-provider]")
