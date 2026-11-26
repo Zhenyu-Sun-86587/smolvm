@@ -339,7 +339,8 @@ def local_case(args):
         try:
             with installed_bundle(args.bundle, root) as measured:
                 verify(measured, root, guest, None, False, False, False, False,
-                       observer=measure, stage_bundle=False, check_launch_rejections=False, guest_files=inputs)
+                       observer=measure, stage_bundle=False, check_launch_rejections=False, guest_files=inputs,
+                       guest_vcpus=args.guest_vcpus)
         except BaseException:
             for log in (root / "serve.log", root / "worker.log", *sorted((root / "state/managed").glob("*.log"))):
                 if log.exists():
@@ -392,6 +393,7 @@ def main():
     parser.add_argument("--compile-workload", action="store_true",
                         help="Build and verify C object files in each Guest after its random-read task (libtcc-dev)")
     parser.add_argument("--fanout", type=int, default=2)
+    parser.add_argument("--guest-vcpus", type=int, default=2, help="vCPUs requested for each Guest in every sample")
     parser.add_argument("--depth", type=int, default=3, help="Recursive fork depth, or 0 to skip the depth sweep")
     parser.add_argument("--durable", action="store_true")
     parser.add_argument("--trace-vcpus", action="store_true",
@@ -405,7 +407,7 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0 or not Path("/dev/kvm").exists():
         parser.error("measured Worker KVM fixture requires root and /dev/kvm")
-    if args.fanout < 2 or args.depth < 0 or args.samples < 1 or any(not 0 <= count <= 16 for count in args.read_lanes):
+    if args.guest_vcpus < 1 or args.fanout < 2 or args.depth < 0 or args.samples < 1 or any(not 0 <= count <= 16 for count in args.read_lanes):
         parser.error("invalid benchmark dimensions")
     if args.local_case:
         return local_case(args)
@@ -417,7 +419,8 @@ def main():
     report = {"schema": "ManagedRuntimeBench/1", "bundle_digest": manifest["bundle_digest"],
               "kernel": platform.release(), "machine_arch": platform.machine(),
               "cpu_model": cpu, "cpu_count": len(os.sched_getaffinity(0)),
-              "host_load_before": os.getloadavg(), "previous_global_caches_retained": True, "samples": []}
+              "guest_vcpus": args.guest_vcpus, "host_load_before": os.getloadavg(),
+              "previous_global_caches_retained": True, "samples": []}
     if args.compile_workload:
         source = ROOT / "tests/fixtures/bench-arithmetic.c"
         report["compile_source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -427,7 +430,8 @@ def main():
             for lanes in counts:
                 command = ["unshare", "--mount", "--propagation", "private", "--net", "--", sys.executable, __file__,
                            "--local-case", "--bundle", str(args.bundle), "--mode", mode, "--lane", str(lanes),
-                           "--fanout", str(args.fanout), "--depth", str(args.depth), "--work-dir", str(args.work_dir)]
+                           "--fanout", str(args.fanout), "--guest-vcpus", str(args.guest_vcpus),
+                           "--depth", str(args.depth), "--work-dir", str(args.work_dir)]
                 if args.trace_vcpus:
                     command.append("--trace-vcpus")
                 if args.compile_workload:

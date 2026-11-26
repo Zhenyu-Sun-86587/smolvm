@@ -166,7 +166,8 @@ def partial_fork(endpoint, root, ref):
 
 
 def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults, lifecycle=False, *,
-           observer=None, stage_bundle=True, worker_binary=None, check_launch_rejections=True, guest_files=()):
+           observer=None, stage_bundle=True, worker_binary=None, check_launch_rejections=True, guest_files=(),
+           guest_vcpus=2):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
@@ -272,7 +273,7 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
                 )
                 assert observation["attachments"][0]["state"] == "reserved", observation
                 wanted_heads[volume] = observation["head_resource_id"]
-        parameters = dict(name=name,boot_profile="oci-v1",cpus=2,memory_mib=512,disks=disks,init="/counter",args=[])
+        parameters = dict(name=name,boot_profile="oci-v1",cpus=guest_vcpus,memory_mib=512,disks=disks,init="/counter",args=[])
         if system_image:parameters.update(boot_profile="system-debian-v1",init="/sbin/init",args=["--unit=multi-user.target","--log-target=console"])
         submit = dict(operation_id="launch-managed", request_digest=digest(json.dumps(parameters).encode()),
                       expected={k: before[k] for k in ("instance_id","incarnation_id","execution_epoch")},kind="launch",parameters=parameters)
@@ -378,7 +379,7 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
         serve=spawn(serve_command,"serve.log")
         until(lambda:http(endpoint,EXT+"/capabilities"))
         assert http(endpoint,EXT+"/operations",submit)==op and http(endpoint,inventory_url)["execution"]==record["execution"]
-        assert rpc(worker,"QueryWorkerBudget")["allocated"]["vcpus"]==2
+        assert rpc(worker,"QueryWorkerBudget")["allocated"]["vcpus"]==guest_vcpus
         if fork:
             names=["alpha-branch","beta-branch"]
             call=dict(operation_id="fork-counter-batch",request_digest=digest(b"counter-batch"),expected=ref,kind="fork_batch",parameters={"children":names})
