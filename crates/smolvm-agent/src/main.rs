@@ -20,6 +20,8 @@ use tracing::{debug, error, info, warn};
 
 mod crun;
 mod live_resources;
+#[cfg(target_os = "linux")]
+mod oci_supervisor;
 mod shutdown;
 mod shutdown_freeze;
 
@@ -448,15 +450,6 @@ fn main() {
     #[cfg(target_os = "linux")]
     maybe_set_clock_from_host();
 
-    // Keep the guest clock synced with the host for the machine's whole life:
-    // libkrun's host-side TimesyncThread pushes the host time over a vsock DGRAM
-    // at boot, every 60s, and — critically — right after the host resumes from
-    // sleep (when the frozen VM's clock has fallen behind). Boot-only seeding
-    // above doesn't cover that; without this the guest drifts behind after macOS
-    // sleep until TLS breaks (issue #521).
-    #[cfg(target_os = "linux")]
-    timesync::spawn();
-
     // CRITICAL: Mount essential filesystems FIRST, before anything else.
     // When running as init (PID 1), we need these for the system to function.
     // This must happen before logging (which needs /dev for output).
@@ -506,21 +499,6 @@ fn main() {
     if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
         start_seatd();
     }
-
-    // CRITICAL: Create vsock listener IMMEDIATELY after mounts.
-    // This must happen before logging setup to minimize time to listener ready.
-    // The kernel boots in ~30ms and host connects immediately after.
-    let listener = match vsock::listen(ports::AGENT_CONTROL) {
-        Ok(l) => l,
-        Err(e) => {
-            boot_log("ERROR", &format!("FAILED to create vsock listener: {}", e));
-            std::process::exit(1);
-        }
-    };
-    boot_log(
-        "INFO",
-        &format!("boot vsock_bound uptime_ms={}", uptime_ms()),
-    );
 
     // Set up signal handlers for graceful shutdown (sync before exit)
     setup_signal_handlers();
@@ -654,13 +632,7 @@ fn main() {
     // Placed AFTER init_volume_mounts so that `-v host:/workspace` takes
     // priority — the exists() check sees the bind mount and skips.
     //
-    // The target `/storage/workspace` is created by the storage mount, which
-    // now runs *after* this block (it was moved below signal_ready_to_host()
-    // to overlap with the host connect). So the symlink is created even when
-    // the target doesn't exist yet — a dangling symlink is fine, it resolves
-    // once storage mounts, which always completes before the accept loop reads
-    // any request. Gating on `workspace_target.exists()` here would silently
-    // skip the symlink for bare VMs and is what regressed `/workspace`.
+    // Storage creates the target before the Agent enters its accept loop.
     {
         let workspace_link = std::path::Path::new("/workspace");
         let workspace_target = std::path::Path::new("/storage/workspace");
@@ -673,6 +645,57 @@ fn main() {
     // REGISTRY.ensure_loaded(). On fresh boot, no containers from a previous
     // instance survive, so this work (~30-50ms for crun list + JSON parse)
     // is wasted if no container operations are requested.
+
+    // Mount the Rosetta 2 runtime and register the binfmt_misc handler if the
+    // host attached it. Must run after pivot_root (the wrapper lives in the
+    // rootfs) and after /proc is mounted (binfmt_misc registration).
+    if rosetta::is_enabled() {
+        info!("Rosetta 2 requested, setting up x86_64 translation");
+        rosetta::setup();
+    }
+
+    // If the host started us with --gpu, sanity-check that the guest
+    // kernel actually sees a virtio-gpu device. libkrun accepts the
+    // GPU config call regardless of whether the embedded kernel has
+    // the `virtio-gpu` driver compiled in, so the only place this
+    // mismatch surfaces is here. Without this log, the user discovers
+    // the missing GPU much later — when their workload makes a
+    // rendering call and crashes with a confused EGL/Vulkan error.
+    #[cfg(target_os = "linux")]
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
+        log_gpu_status();
+    }
+
+    ensure_storage_mounted();
+    if let Err(error) = storage::prune_staged_working_copies(boot_mounts) {
+        warn!(error = %error, "failed to clean stale staged working copies");
+    }
+
+    // The prepared VM and its mounts outlive the process serving the control
+    // port. Each replacement starts an empty registry and finds existing crun
+    // workloads in their live on-disk state.
+    #[cfg(target_os = "linux")]
+    oci_supervisor::run(|| serve_oci_agent(start_uptime));
+    #[cfg(not(target_os = "linux"))]
+    serve_oci_agent(start_uptime);
+}
+
+fn serve_oci_agent(start_uptime: u64) -> ! {
+    let listener = match vsock::listen(ports::AGENT_CONTROL) {
+        Ok(listener) => listener,
+        Err(error) => {
+            boot_log("ERROR", &format!("FAILED to create vsock listener: {error}"));
+            std::process::exit(1);
+        }
+    };
+    boot_log(
+        "INFO",
+        &format!("boot vsock_bound uptime_ms={}", uptime_ms()),
+    );
+
+    // A replacement Agent listens for fresh host timesync frames too.
+    #[cfg(target_os = "linux")]
+    timesync::spawn();
 
     // Start SSH agent forwarding bridge if enabled by host
     if ssh_agent::is_enabled() {
@@ -704,50 +727,17 @@ fn main() {
     // `--mount-socket`). No-op when none are configured.
     publish_socket::start_all();
 
-    // Mount the Rosetta 2 runtime and register the binfmt_misc handler if the
-    // host attached it. Must run after pivot_root (the wrapper lives in the
-    // rootfs) and after /proc is mounted (binfmt_misc registration).
-    if rosetta::is_enabled() {
-        info!("Rosetta 2 requested, setting up x86_64 translation");
-        rosetta::setup();
-    }
-
-    // If the host started us with --gpu, sanity-check that the guest
-    // kernel actually sees a virtio-gpu device. libkrun accepts the
-    // GPU config call regardless of whether the embedded kernel has
-    // the `virtio-gpu` driver compiled in, so the only place this
-    // mismatch surfaces is here. Without this log, the user discovers
-    // the missing GPU much later — when their workload makes a
-    // rendering call and crashes with a confused EGL/Vulkan error.
-    #[cfg(target_os = "linux")]
-    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
-        log_gpu_status();
-    }
-
     info!(
         total_startup_ms = uptime_ms() - start_uptime,
         uptime_ms = uptime_ms(),
         "agent init complete, entering accept loop"
     );
 
-    // Only now is the guest safe to accept host requests for init/exec.
-    // Network is configured above; storage is mounted below while the host is
-    // establishing its vsock connection (~10-30ms), so the accept loop always
-    // sees storage ready without that mount adding to the user-visible boot time.
     signal_ready_to_host();
     boot_log(
         "INFO",
         &format!("boot ready_sent uptime_ms={}", uptime_ms()),
     );
-
-    // Mount storage after signaling ready. The accept loop has not started yet,
-    // so no request can arrive before this completes. The OnceLock in
-    // ensure_storage_mounted() also guards any concurrent call from a request
-    // that races in the brief window on very fast hosts.
-    ensure_storage_mounted();
-    if let Err(error) = storage::prune_staged_working_copies(storage::init_volume_mounts()) {
-        warn!(error = %error, "failed to clean stale staged working copies");
-    }
 
     // With the disks mounted, start reclaiming freed blocks back to the host
     // sparse files so disk footprint tracks live data (see disk_trim).
@@ -762,6 +752,7 @@ fn main() {
         error!(error = %e, "server error");
         std::process::exit(1);
     }
+    std::process::exit(0);
 }
 
 #[derive(Clone, Copy)]
