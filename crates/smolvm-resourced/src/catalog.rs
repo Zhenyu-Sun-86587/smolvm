@@ -265,9 +265,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_managed_cpu_limits.sql"))?;
                 tx.execute_batch(include_str!("schema_native_resize.sql"))?;
                 tx.execute_batch(include_str!("schema_native_stop.sql"))?;
-                tx.execute_batch("PRAGMA user_version=25")?;
+                tx.execute_batch(include_str!("schema_first_launch.sql"))?;
+                tx.execute_batch("PRAGMA user_version=26")?;
             }
-            1..=25 => {
+            1..=26 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -342,7 +343,10 @@ impl Catalog {
                 }
                 if version < 25 {
                     tx.execute_batch(include_str!("schema_native_stop.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=25")?;
+                }
+                if version < 26 {
+                    tx.execute_batch(include_str!("schema_first_launch.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=26")?;
                 }
                 crate::packet_wake::recover(&tx)?;
                 crate::lifecycle_controller::recover(&tx)?;

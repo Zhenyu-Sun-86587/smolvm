@@ -231,6 +231,7 @@ pub(super) fn status(c: &Catalog, expected: &Expected) -> Result<Value> {
     Ok(
         json!({"collectors":collectors,"instance_id":expected.instance_id,"incarnation_id":expected.incarnation_id,"execution_epoch":expected.execution_epoch,
         "binding_revision":protections::revision(expected)?,"power":o.power,"statepoint":m.saved(&c.db)?,"applied_revision":m.rev,"effective_policy":m.policy,"activity_seq":m.seq,
+        "first_launch_supported":true,
         "blockers":o.blockers,"controlled_suspended":o.gate.is_some() && o.gate==m.freeze_session && m.freeze==Some(m.seq),"idle_ms":m.idle.map(|v|now.saturating_sub(v)),
         "last_decision":decision,"next_action":next,"pressure":pressure.map(|(held,raw)|json!({"admission_throttled":held,"sample":serde_json::from_str::<Value>(&raw).ok(),"last_balloon":balloon}))}),
     )
@@ -446,11 +447,7 @@ fn step(
                     .map_err(invalid)?,
             )
         }
-        "launch" => {
-            let raw:String=c.db.query_row("SELECT spec_json FROM managed_launches m JOIN operations o USING(operation_id)
-                WHERE o.instance_id=? AND o.phase='COMPLETED' ORDER BY o.expected_execution_epoch DESC LIMIT 1",[id],|r|r.get(0))?;
-            crate::managed::submit(c, &r, serde_json::from_str(&raw).map_err(invalid)?)
-        }
+        "launch" => cold_launch(c, m, d, &r),
         _ => return Err(invalid("unexpected lifecycle decision")),
     };
     match outcome {
@@ -480,6 +477,22 @@ fn step(
     }
     Ok(())
 }
+
+fn cold_launch(c: &mut Catalog, m: &Machine, d: &Decision, request: &Request) -> Result<Operation> {
+    let id = &m.expected.instance_id;
+    let raw: Option<String> = if d.expected.execution_epoch == 0 {
+        c.db.query_row("SELECT first_launch_json FROM lifecycle_protections WHERE instance_id=? AND wake_operation=?
+            AND kind='wake' AND state='pending' AND first_launch_json IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+            params![id,d.id],|row|row.get(0)).optional()?
+    } else {
+        c.db.query_row("SELECT spec_json FROM managed_launches m JOIN operations o USING(operation_id)
+            WHERE o.instance_id=? AND o.phase='COMPLETED' ORDER BY o.expected_execution_epoch DESC LIMIT 1",
+            [id],|row|row.get(0)).optional()?
+    };
+    let raw = raw.ok_or_else(|| conflict("the authorized cold wake has no launch plan"))?;
+    crate::managed::submit(c, request, serde_json::from_str(&raw).map_err(invalid)?)
+}
+
 fn attach_more(db: &Connection, machine: &str, op: &str) -> Result<()> {
     db.execute("UPDATE lifecycle_protections SET wake_operation=?,revision=revision+1 WHERE instance_id=? AND kind='wake' AND state='pending'
                 AND wake_operation IS NULL",params![op,machine])?;

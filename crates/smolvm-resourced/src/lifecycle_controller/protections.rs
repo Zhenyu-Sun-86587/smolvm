@@ -17,6 +17,7 @@ struct Input {
     endpoint_revision: Option<i64>,
     wake_operation: Option<String>,
     authorized: Option<bool>,
+    first_launch: Option<crate::managed::Machine>,
 }
 
 pub(crate) fn revision(expected: &Expected) -> Result<i64> {
@@ -93,6 +94,23 @@ pub(crate) fn mutate(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> 
         "SELECT kind,revision,state,principal,semantics,token_hash,incarnation_id,wake_operation FROM lifecycle_protections WHERE instance_id=? AND id=?",params![machine,id],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional()?;
     let (_, policy) = row_policy(tx, machine)?;
+    let first_launch = if let Some(plan) = &input.first_launch {
+        if r.method != "RequestWake" || expected.execution_epoch != 0 || expected.incarnation_id.is_some()
+            || !matches!(input.trigger.as_deref(), Some("api_access" | "service_access"))
+            || !policy.wake_conditions.allow_cold_start
+            || plan.boot_profile != "system-debian-v1"
+        {
+            return Err(conflict("first launch requires an authorized cold wake on an empty System binding"));
+        }
+        crate::managed::serve_id(machine, &plan.name)?;
+        let raw = serde_json::to_string(plan).map_err(invalid)?;
+        if raw.len() > 16 * 1024 {
+            return Err(invalid("first launch plan exceeds the catalog limit"));
+        }
+        Some(raw)
+    } else {
+        None
+    };
     match r.method.as_str() {
         "CloseAccessProtection" => {
             // A platform connection owns one random ID for its full lifetime,
@@ -153,6 +171,9 @@ pub(crate) fn mutate(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> 
                             "wake is unauthorized for this entry point",
                         ));
                     }
+                    if expected.execution_epoch == 0 && first_launch.is_none() {
+                        return Err(conflict("a fresh System binding needs its first launch plan"));
+                    }
                     if policy.permits_wake(trigger) {
                         "wake"
                     } else if matches!(trigger, "api_access" | "service_access")
@@ -182,9 +203,10 @@ pub(crate) fn mutate(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> 
                 }
             }
             tx.execute("INSERT INTO lifecycle_protections(instance_id,id,kind,principal,incarnation_id,epoch,semantics,revision,state,reason,expires_at,
-                authorization_revision,endpoint_revision,token_hash,expires_boot)VALUES(?,?,?,?,?,?,?,1,?,?,?,?,?,?,(SELECT host_boot_id FROM worker_state))",
+                authorization_revision,endpoint_revision,token_hash,expires_boot,first_launch_json)
+                VALUES(?,?,?,?,?,?,?,1,?,?,?,?,?,?,(SELECT host_boot_id FROM worker_state),?)",
                 params![machine,id,kind,input.principal,expected.incarnation_id,expected.execution_epoch,version,if kind=="wake"{"pending"}else{"active"},
-                        reason,until,input.authorization_revision,input.endpoint_revision,token])?;
+                        reason,until,input.authorization_revision,input.endpoint_revision,token,first_launch])?;
             bump(tx, machine, true)?;
         }
         "RenewRunningLease"
