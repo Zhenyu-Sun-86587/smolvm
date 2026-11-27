@@ -425,6 +425,15 @@ fn mark_lost(c: &Catalog, record: &Record) -> Result<()> {
          AND owner_kind='kernel_anchor_export' AND state='active'",
         [&record.capture_id],
     )?;
+    if record.resource_state.is_some() {
+        // The batch cannot retry this cut. Each dispatched child keeps its
+        // own operation references until its separate launch resolves.
+        tx.execute(
+            "UPDATE root_refs SET state='dropped',revision=revision+1
+             WHERE owner_kind='fork_capture' AND owner_id=? AND state='active'",
+            [&record.operation_id],
+        )?;
+    }
     tx.commit()?;
     remove_socket(c, record)
 }

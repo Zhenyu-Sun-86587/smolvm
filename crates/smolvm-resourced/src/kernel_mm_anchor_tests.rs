@@ -137,6 +137,10 @@ fn restart_keeps_original_process_and_loss_never_rebinds_cut() {
     reconcile(&c).unwrap();
     assert!(pid_exited(&live).unwrap());
     assert_eq!(c.resource("cut").unwrap()["state"], "lost");
+    assert_eq!(
+        c.closure("fork_capture", "op").unwrap()["resources"],
+        json!([])
+    );
     assert_eq!(acquire(&c, "op", "cut").unwrap_err().code, "E_CAPTURE_LOST");
     let source_row = c.execution("source").unwrap();
     let (_, donor) = observe_pid(source.pid()).unwrap();
