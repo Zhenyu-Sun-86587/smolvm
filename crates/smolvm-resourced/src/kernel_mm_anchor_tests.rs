@@ -187,6 +187,13 @@ fn last_capture_pin_fences_collection() {
     )
     .unwrap();
     reconcile(&c).unwrap();
+    assert_eq!(c.resource("cut").unwrap()["state"], "available");
+    c.db.execute(
+        "UPDATE operations SET phase='COMPLETED' WHERE operation_id='op'",
+        [],
+    )
+    .unwrap();
+    reconcile(&c).unwrap();
     assert_eq!(c.resource("cut").unwrap()["state"], "deleting");
     helper.exit();
     c.collect_gc("cut", 2, |catalog| collect(catalog, "cut"))

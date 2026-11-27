@@ -768,6 +768,8 @@ pub(crate) fn reconcile(c: &Catalog) -> Result<()> {
     // the helper after the deletion fence and confirms its actual exit.
     c.db.execute("UPDATE resources SET state='deleting',revision=revision+1
         WHERE state='available' AND EXISTS(SELECT 1 FROM kernel_mm_anchors a WHERE a.resource_id=resources.resource_id)
+         AND EXISTS(SELECT 1 FROM operations o WHERE o.operation_id=resources.created_by_operation
+           AND o.phase IN ('COMPLETED','ABORTED'))
          AND NOT EXISTS(SELECT 1 FROM root_refs p WHERE p.resource_id=resources.resource_id AND p.state='active')
          AND NOT EXISTS(SELECT 1 FROM resource_edges e WHERE e.child_resource_id=resources.resource_id)
          AND NOT EXISTS(SELECT 1 FROM fd_leases f WHERE f.resource_id=resources.resource_id AND f.state<>'released')
