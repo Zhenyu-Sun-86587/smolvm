@@ -3,6 +3,66 @@ use crate::ipc::{Expected, Fault, Request};
 use serde_json::json;
 
 #[test]
+fn lost_anchor_leaves_activation_authority_only_for_the_imported_execution() {
+    use crate::activation_catalog::ActivationInput;
+
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(&dir.path().join("catalog.sqlite"), "boot", "session").unwrap();
+    let bundle = format!("sha256:{}", "2".repeat(64));
+    let digest = format!("sha256:{}", "3".repeat(64));
+    catalog.register_bundle(&bundle, &digest).unwrap();
+    catalog.db.execute_batch(
+        "INSERT INTO operations
+           SELECT 'batch','fork_batch',executable_sha256,'deep','source-vm',bundle_digest,
+                  1,'source-inc','NEW','NONE',1 FROM runtime_bundles;
+         INSERT INTO operations
+           SELECT 'old-target','restore_target',executable_sha256,'deep','target-vm',bundle_digest,
+                  0,NULL,'ABORTED','ABORT',2 FROM runtime_bundles;
+         INSERT INTO operations
+           SELECT 'active-target','restore_target',executable_sha256,'deep','target-vm',bundle_digest,
+                  1,NULL,'NEW','NONE',1 FROM runtime_bundles;
+         INSERT INTO executions(incarnation_id,route_id,instance_id,execution_epoch,bundle_digest,host_boot_id,
+                                pid,pid_start_time,uid,phase,last_operation_id)
+           SELECT 'source-inc','deep','source-vm',1,bundle_digest,'boot',123,1,1001,'exited','batch'
+           FROM runtime_bundles
+           UNION ALL SELECT 'old-inc','deep','target-vm',1,bundle_digest,'boot',124,1,1002,'exited','old-target'
+           FROM runtime_bundles
+           UNION ALL SELECT 'active-inc','deep','target-vm',2,bundle_digest,'boot',125,1,1003,'registered','active-target'
+           FROM runtime_bundles;
+         INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,
+           session,token,anchor,network_gate,original,stage,source_released,helper_digest)
+           SELECT 'batch','source-inc','serve','cut','{}','[]',1,'hold','11111111111111111111111111111111',
+                  0,'RUNNING','children',1,executable_sha256 FROM runtime_bundles;
+         UPDATE managed_fork_batches SET selected_memory_fork_backend='kernel_cow' WHERE operation_id='batch';
+         INSERT INTO managed_fork_children(batch_id,ordinal,name,instance_id,operation_id,prior_epoch,attempt)
+           VALUES('batch',0,'target','target-vm','active-target',1,1);
+         INSERT INTO resources VALUES('cut','descriptor','lost','volatile',1,'{}','sha256:layout','batch',2);
+         INSERT INTO kernel_mm_anchors(capture_id,operation_id,source_incarnation,source_epoch,source_session,
+           host_boot_id,regions_json,layout_digest,helper_id,helper_pid,helper_start,executable_dev,executable_ino,resource_id,failure)
+           VALUES('cut','batch','source-inc',1,1,'boot','[]','layout',
+                  'ffffffffffffffffffffffffffffffff',2147483647,1,1,1,'cut','helper exited');
+         INSERT INTO kernel_cow_imports VALUES('old-inc','cut','sha256:old-proof');"
+    ).unwrap();
+    let op = catalog.operation("active-target").unwrap();
+    let input: ActivationInput = serde_json::from_value(
+        crate::managed_fork::activation_input(&catalog, &op).unwrap(),
+    ).unwrap();
+    let active = catalog.execution("active-inc").unwrap();
+    assert_eq!(
+        catalog.activation_binding(input.clone(), &active).unwrap_err().code,
+        "E_FENCE_UNPROVEN"
+    );
+    catalog.db.execute("INSERT INTO kernel_cow_imports VALUES('active-inc','cut','sha256:active-proof')", []).unwrap();
+    let binding = serde_json::to_value(catalog.activation_binding(input.clone(), &active).unwrap()).unwrap();
+    assert_eq!(binding["source_capture"]["kernel_import_digest"], "sha256:active-proof");
+    assert!(binding["source_capture"].get("lease_id").is_none());
+    assert_eq!(
+        catalog.activation_binding(input, &catalog.execution("old-inc").unwrap()).unwrap_err().code,
+        "E_FENCE_UNPROVEN"
+    );
+}
+
+#[test]
 fn boot_change_marks_volatile_resources_lost_and_preserves_intents() {
     let work = tempfile::tempdir().unwrap();
     let path = work.path().join("catalog.sqlite");
