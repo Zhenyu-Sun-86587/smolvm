@@ -630,7 +630,7 @@ impl Job {
                 ep.command(&format!("CAPTURE_KERNEL_ABANDON {scope}"))?;
                 ep.command(&format!("CAPTURE_FINISH {scope} RETURN_STANDBY"))?;
             }
-            "STANDBY" if self.original == "RUNNING" => {
+            "STANDBY" | "WAKING" if self.original == "RUNNING" => {
                 ep.command(&format!("STANDBY_WAKE {scope}"))?;
             }
             current if current == self.original => {
@@ -862,7 +862,7 @@ impl Actor {
                     ep.command(&format!("CAPTURE_CANCEL {scope}"))?;
                     return Ok(());
                 }
-                if inv.source_disposition=="STANDBY" && j.original=="RUNNING" {
+                if matches!(inv.source_disposition.as_str(), "STANDBY" | "WAKING") && j.original == "RUNNING" {
                     ep.command(&format!("STANDBY_WAKE {scope}"))?;
                     return Ok(());
                 }
