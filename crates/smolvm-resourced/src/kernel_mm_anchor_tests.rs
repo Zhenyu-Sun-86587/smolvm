@@ -102,6 +102,63 @@ fn recorded(
 }
 
 #[test]
+fn recovery_replays_only_the_original_accounted_kernel_cut() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("catalog.sqlite");
+    let source = TestProcess::start();
+    let mut helper = TestProcess::start();
+    let first = recorded(&path, &source, &helper, "fork_batch", "fork_capture");
+    first.db.execute_batch(
+        "INSERT INTO native_endpoints VALUES('source','/run/test-control',1,1);
+         UPDATE managed_fork_batches SET stage='children',source_released=1,checkpoint=x'01';",
+    ).unwrap();
+    drop(first);
+
+    let mut catalog = Catalog::open(&path, "boot-a", "second").unwrap();
+    reconcile(&catalog).unwrap();
+    // A known RAM resource cannot clear an unknown source execution.
+    let blocked = |c: &mut Catalog| {
+        assert_eq!(c.complete_recovery("second").unwrap_err().code, "E_RECOVERING");
+    };
+    blocked(&mut catalog);
+    catalog.db.execute_batch(
+        "UPDATE executions SET phase='registered' WHERE incarnation_id='source';
+         UPDATE kernel_mm_anchors SET source_session=2;",
+    ).unwrap();
+    blocked(&mut catalog);
+    catalog.db.execute_batch(
+        "UPDATE kernel_mm_anchors SET source_session=1;
+         UPDATE root_refs SET state='dropped';",
+    ).unwrap();
+    blocked(&mut catalog);
+    catalog.db.execute_batch(
+        "UPDATE root_refs SET state='active';
+         UPDATE managed_fork_batches SET selected_memory_fork_backend='native';",
+    ).unwrap();
+    blocked(&mut catalog);
+    catalog.db.execute("UPDATE managed_fork_batches SET selected_memory_fork_backend='kernel_cow'", []).unwrap();
+    assert_eq!(catalog.complete_recovery("second").unwrap()["state"], "ready");
+
+    // Once the journal proves the source was released, its exit cannot
+    // strand a child of the same cut. A recorded loss remains a loss.
+    catalog.db.execute_batch(
+        "UPDATE worker_state SET recovering=1;
+         UPDATE executions SET phase='exited';
+         DELETE FROM native_endpoints;
+         UPDATE managed_fork_batches SET source_released=0;",
+    ).unwrap();
+    blocked(&mut catalog);
+    catalog.db.execute("UPDATE managed_fork_batches SET source_released=1", []).unwrap();
+    assert_eq!(catalog.complete_recovery("second").unwrap()["state"], "ready");
+    helper.exit();
+    reconcile(&catalog).unwrap();
+    catalog.db.execute("UPDATE worker_state SET recovering=1", []).unwrap();
+    assert_eq!(catalog.complete_recovery("second").unwrap()["state"], "ready");
+    assert_eq!(catalog.resource("cut").unwrap()["state"], "lost");
+    assert!(pinned(&catalog, "op", "cut").is_err());
+}
+
+#[test]
 fn restart_keeps_original_process_and_loss_never_rebinds_cut() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("catalog.sqlite");

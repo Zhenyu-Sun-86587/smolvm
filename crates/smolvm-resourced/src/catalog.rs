@@ -470,20 +470,37 @@ impl Catalog {
         // for, waiting for those operations to finish here would deadlock
         // them on the same recovery barrier when they acquire resources.
         let outstanding: bool = tx.query_row(
-            "WITH replayable_forks AS (
+            "WITH accounted_kernel_cuts AS (
+                 SELECT a.capture_id,a.operation_id,a.source_incarnation,a.source_epoch,a.source_session,a.host_boot_id
+                 FROM kernel_mm_anchors a JOIN resources ram ON ram.resource_id=a.resource_id
+                 WHERE a.resource_id=a.capture_id AND ram.created_by_operation=a.operation_id
+                   AND ram.kind='descriptor' AND ram.durability='volatile'
+                   AND json_extract(ram.descriptor_json,'$.schema')='KernelMmAnchor/1'
+                   AND ((ram.state='available' AND a.failure IS NULL AND EXISTS (
+                         SELECT 1 FROM root_refs p WHERE p.resource_id=ram.resource_id
+                           AND p.owner_kind='fork_capture' AND p.owner_id=a.operation_id AND p.state='active'))
+                        OR (ram.state='lost' AND a.failure IS NOT NULL))
+             ), replayable_forks AS (
                  SELECT b.operation_id,o.route_id,o.bundle_digest FROM managed_fork_batches b
                  JOIN operations o USING(operation_id)
                  JOIN executions e ON e.incarnation_id=b.source_incarnation
-                 JOIN native_endpoints n ON n.incarnation_id=e.incarnation_id
+                 LEFT JOIN native_endpoints n ON n.incarnation_id=e.incarnation_id
                  LEFT JOIN fd_transfers f ON f.resource_id=b.capture_id
                  LEFT JOIN resources r ON r.resource_id=f.resource_id
+                 LEFT JOIN accounted_kernel_cuts k ON b.selected_memory_fork_backend='kernel_cow'
+                   AND f.resource_id IS NULL AND k.capture_id=b.capture_id AND k.operation_id=o.operation_id
+                   AND k.source_incarnation=e.incarnation_id AND k.source_epoch=e.execution_epoch
+                   AND k.source_session=b.session AND k.host_boot_id=e.host_boot_id
                  WHERE o.kind IN ('independent_fork','fork_batch') AND o.phase='NEW'
-                   AND e.phase='registered' AND e.host_boot_id=(SELECT host_boot_id FROM worker_state)
+                   AND e.host_boot_id=(SELECT host_boot_id FROM worker_state)
                    AND o.route_id=e.route_id AND o.bundle_digest=e.bundle_digest AND o.instance_id=e.instance_id
                    AND o.expected_incarnation_id=e.incarnation_id AND o.expected_execution_epoch=e.execution_epoch
+                   AND ((e.phase='registered' AND n.incarnation_id IS NOT NULL)
+                        OR (k.operation_id IS NOT NULL AND e.phase='exited' AND b.source_released=1 AND b.stage='children'))
                    AND ((b.checkpoint IS NULL AND f.resource_id IS NULL) OR
-                        (f.state='committed' AND r.state='available' AND f.incarnation_id=e.incarnation_id
-                         AND f.operation_id=o.operation_id))
+                        (b.selected_memory_fork_backend='native' AND f.state='committed'
+                         AND r.state='available' AND f.incarnation_id=e.incarnation_id
+                         AND f.operation_id=o.operation_id) OR k.operation_id IS NOT NULL)
              ), replayable_operations AS (
                  SELECT operation_id FROM replayable_forks
                  UNION ALL
