@@ -24,3 +24,11 @@ CREATE TABLE kernel_mm_anchors (
     resource_id TEXT UNIQUE REFERENCES resources(resource_id),
     failure TEXT
 );
+
+-- An import receipt belongs to the final VMM and commits alongside its
+-- registration after the privileged bootstrap has released the donor pidfd.
+CREATE TABLE kernel_cow_imports (
+    incarnation_id TEXT PRIMARY KEY REFERENCES executions(incarnation_id),
+    capture_id TEXT NOT NULL REFERENCES kernel_mm_anchors(capture_id),
+    proof_digest TEXT NOT NULL
+);

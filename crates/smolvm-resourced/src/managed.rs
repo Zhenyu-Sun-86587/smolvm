@@ -65,6 +65,8 @@ pub struct Machine {
     /// compatible managed StatePoint reader in the parked runtime.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub live_compute_growth: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_fork_profile: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -119,6 +121,10 @@ pub(crate) fn serve_id(instance: &str, name: &str) -> Result<String> {
     Ok(id.to_string())
 }
 impl Machine {
+    pub fn kernel_cow(&self) -> bool {
+        self.memory_fork_profile.as_deref() == Some(smolvm_runtime_protocol::kernel_cow::PROFILE)
+    }
+
     pub(crate) fn devices(
         &self,
         c: &Catalog,
@@ -131,6 +137,7 @@ impl Machine {
             || self.cpus == 0
             || self.memory_mib < 64
             || !matches!(self.boot_profile.as_str(), "oci-v1" | "system-debian-v1")
+            || self.memory_fork_profile.is_some() && (!self.kernel_cow() || self.live_compute_growth)
             || self.live_compute_growth
                 && (!cfg!(target_arch = "x86_64")
                     || self.boot_profile != "system-debian-v1"
@@ -445,6 +452,9 @@ pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<O
         return Err(Fault::new("E_STATE_CONFLICT", "a saved execution requires StatePoint restore"));
     }
     let devices = machine.devices(c, id, route, bundle, expected)?;
+    if machine.kernel_cow() {
+        crate::managed_kernel_cow::require_worker(bundle)?;
+    }
     if let Some(network) = &machine.network {
         c.register_private_network(&crate::network_catalog::RegisterNetwork {
             network_id: network.network_id.clone(),

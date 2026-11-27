@@ -699,7 +699,7 @@ mod tests {
             };
             let execution = catalog.register_execution(&launch, NewExecution {
                 route: "deep", bundle: &bundle, expected: &expected, boot: "boot",
-                pid: 123, start: 456, uid: 1000, permit_digest: &"d".repeat(64),
+                pid: 123, start: 456, uid: 1000, permit_digest: &"d".repeat(64), kernel_import: None,
             }).unwrap();
             let offered = catalog.offer_tap(&execution, "attachment").unwrap();
             let attached = catalog.acknowledge_tap(&execution, "attachment", "lease", offered.revision).unwrap();
@@ -720,7 +720,11 @@ mod tests {
             }
             if case == "legacy schema" {
                 catalog.db.execute_batch(
-                    "DROP TABLE product_machine_volumes; DROP TABLE network_kernel_receipts; PRAGMA user_version=27;"
+                    "DROP TABLE kernel_cow_imports; DROP TABLE kernel_mm_anchors;
+                     ALTER TABLE managed_fork_batches DROP COLUMN memory_fork_backend;
+                     ALTER TABLE managed_fork_batches DROP COLUMN selected_memory_fork_backend;
+                     ALTER TABLE managed_fork_batches DROP COLUMN kernel_export_deadline;
+                     DROP TABLE product_machine_volumes; DROP TABLE network_kernel_receipts; PRAGMA user_version=27;"
                 ).unwrap();
             }
             drop(catalog);

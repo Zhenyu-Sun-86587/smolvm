@@ -39,6 +39,8 @@ pub(crate) struct Inventory {
     pub stop_barrier: bool,
     #[serde(default)]
     pub standby_blocker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_fork_profile: Option<String>,
     pub devices: Vec<Value>,
 }
 
@@ -87,6 +89,15 @@ impl Endpoint {
             ino,
         };
         let inventory = endpoint.inventory()?;
+        let launch = catalog.operation(&execution.last_operation_id)?;
+        if let Some(plan) = crate::managed::plan(catalog, &launch)? {
+            if inventory.memory_fork_profile != plan.machine.memory_fork_profile {
+                return Err(Fault::new(
+                    "E_FENCE_UNPROVEN",
+                    "running VMM RAM profile differs from its managed launch",
+                ));
+            }
+        }
         let path = path
             .to_str()
             .ok_or_else(|| Fault::invalid("native control path must be UTF-8"))?;

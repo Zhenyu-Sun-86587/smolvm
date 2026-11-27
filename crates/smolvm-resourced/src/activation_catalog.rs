@@ -108,7 +108,11 @@ fn capture_origin(db: &Connection, resource_id: &str) -> Result<CaptureOrigin> {
         FROM statepoints p JOIN executions e ON e.incarnation_id=p.source_incarnation_id
         JOIN resources r ON r.resource_id=p.representation_id
         WHERE p.representation_id=?1 AND p.phase IN ('durable','stop_committed','hibernated')
-          AND r.state='available' AND r.immutable=1 AND r.durability='durable'",
+          AND r.state='available' AND r.immutable=1 AND r.durability='durable'
+        UNION ALL
+        SELECT a.source_incarnation,a.source_epoch,r.descriptor_digest
+        FROM kernel_mm_anchors a JOIN resources r USING(resource_id)
+        WHERE a.resource_id=?1 AND r.kind='descriptor' AND r.immutable=1 AND r.created_by_operation=a.operation_id",
         [resource_id],
         |r| Ok(CaptureOrigin {incarnation:r.get(0)?, epoch:r.get(1)?, digest:r.get(2)?}),
     ).optional()?.ok_or_else(|| Fault::new("E_FENCE_UNPROVEN", "network attestation requires committed immutable capture RAM"))
@@ -444,8 +448,12 @@ pub(crate) struct SourceCapture {
     descriptor_digest: String,
     incarnation_id: String,
     execution_epoch: i64,
-    lease_id: String,
-    lease_revision: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease_revision: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kernel_import_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -533,7 +541,7 @@ fn source_capture(
         .db
         .query_row(
             "SELECT transfer.descriptor_digest,source.incarnation_id,source.execution_epoch,
-                lease.lease_id,lease.revision
+                lease.lease_id,lease.revision,NULL
          FROM fd_transfers transfer
          JOIN resources resource USING(resource_id)
          JOIN executions source ON source.incarnation_id=transfer.incarnation_id
@@ -543,7 +551,7 @@ fn source_capture(
            AND lease.incarnation_id=?2 AND lease.operation_id=?3 AND lease.state='attached'
            AND source.bundle_digest=?4 AND source.incarnation_id<>?2 AND source.route_id=?5
          UNION ALL
-         SELECT p.manifest_digest,source.incarnation_id,source.execution_epoch,lease.lease_id,lease.revision
+         SELECT p.manifest_digest,source.incarnation_id,source.execution_epoch,lease.lease_id,lease.revision,NULL
          FROM statepoints p
          JOIN resources resource ON resource.resource_id=p.representation_id
          JOIN executions source ON source.incarnation_id=p.source_incarnation_id
@@ -555,6 +563,18 @@ fn source_capture(
            AND source.bundle_digest=?4 AND source.incarnation_id<>?2 AND source.route_id=?5
            AND json_extract(p.point_json,'$.capture_anchor')=?6
            AND json_extract(p.point_json,'$.helper_digest')=?7
+         UNION ALL
+         SELECT resource.descriptor_digest,source.incarnation_id,source.execution_epoch,NULL,NULL,import.proof_digest
+         FROM kernel_cow_imports import JOIN kernel_mm_anchors a USING(capture_id)
+         JOIN resources resource ON resource.resource_id=a.resource_id
+         JOIN executions source ON source.incarnation_id=a.source_incarnation
+         JOIN managed_fork_batches b ON b.operation_id=a.operation_id
+         JOIN managed_fork_children ch ON ch.batch_id=b.operation_id
+         WHERE a.resource_id=?1 AND import.incarnation_id=?2 AND ch.operation_id=?3
+           AND resource.kind='descriptor' AND resource.immutable=1 AND resource.created_by_operation=b.operation_id
+           AND source.bundle_digest=?4 AND source.incarnation_id<>?2 AND source.route_id=?5
+           AND b.anchor=?6 AND b.helper_digest=?7 AND b.source_released=1
+           AND b.selected_memory_fork_backend='kernel_cow'
          ORDER BY 4 LIMIT 1",
             params![
                 input.capture_resource_id,
@@ -572,6 +592,7 @@ fn source_capture(
                     execution_epoch: row.get(2)?,
                     lease_id: row.get(3)?,
                     lease_revision: row.get(4)?,
+                    kernel_import_digest: row.get(5)?,
                 })
             },
         )
@@ -579,7 +600,7 @@ fn source_capture(
         .ok_or_else(|| {
             Fault::new(
                 "E_FENCE_UNPROVEN",
-                "sealed source RAM has no attached lease on this distinct restored execution",
+                "source RAM has no import or attached lease on this restored execution",
             )
         })?;
     Ok(capture)

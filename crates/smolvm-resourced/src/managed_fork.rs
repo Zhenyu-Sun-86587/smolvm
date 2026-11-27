@@ -1,18 +1,20 @@
 //! One held source cut per admitted batch, independent of the HTTP connection.
 use crate::admission::{self, Capacity};
-use crate::catalog::{Catalog, Operation};
+use crate::catalog::{Catalog, Execution, Operation};
 use crate::escrow::Escrow;
 use crate::ipc::{valid_id, Fault, Request, Result};
 use crate::managed::{key, machine_id, Machine, Restore};
-use crate::native_control::Endpoint;
+use crate::native_control::{Endpoint, Inventory};
 use crate::statepoint_capture::{self, Export, Purpose};
 use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use smolvm_runtime_protocol::kernel_cow::PROFILE;
 use std::{
     collections::{BTreeMap, HashSet},
     sync::mpsc,
     thread,
+    time::Instant,
 };
 
 #[derive(Deserialize)]
@@ -23,6 +25,81 @@ pub(crate) struct Input {
     pub capture_id: Option<String>,
     pub mode: Option<String>,
     pub admission: Option<String>,
+    pub memory_fork_backend: Option<MemoryForkBackend>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryForkBackend {
+    #[default]
+    Native,
+    KernelCow,
+    Auto,
+}
+
+impl MemoryForkBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::KernelCow => "kernel_cow",
+            Self::Auto => "auto",
+        }
+    }
+
+    fn select(self, fork: bool, native: bool, kernel: bool) -> Result<&'static str> {
+        match self {
+            _ if !fork && kernel => Ok("kernel_cow"),
+            Self::Auto | Self::KernelCow if kernel => Ok("kernel_cow"),
+            Self::Auto | Self::Native if native => Ok("native"),
+            Self::KernelCow => Err(unsupported("this execution cannot fork with Kernel CoW")),
+            _ => Err(unsupported("this execution has no compatible RAM capture backend")),
+        }
+    }
+}
+
+fn unsupported(reason: &str) -> Fault {
+    Fault::new("E_CAPABILITY_UNSUPPORTED", reason)
+}
+
+fn parkable(inv: &Inventory) -> bool {
+    inv.measured_helper
+        && inv.standby_blocker.is_none()
+        && !inv.devices.iter().any(|dev| dev["virtio_type"] == 19 && dev["parked_vsock_rebind"] != true)
+}
+
+fn memory_fork_backends(inv: &Inventory, machine: Option<&Machine>, bundle: &str) -> (bool, bool, &'static str) {
+    let Some(machine) = machine.filter(|machine| !machine.live_compute_growth) else {
+        return (false, false, "source_managed_profile_unverified");
+    };
+    if !parkable(inv) {
+        return (false, false, "source_capture_ineligible");
+    }
+    match (inv.memory_fork_profile.as_deref(), machine.kernel_cow()) {
+        (None, false) => (true, false, "source_native_ram_profile"),
+        (Some(PROFILE), true) =>
+            if crate::managed_kernel_cow::worker_available(bundle) {
+                (false, true, "")
+            } else {
+                (false, false, crate::managed_kernel_cow::UNAVAILABLE)
+            },
+        _ => (false, false, "source_memory_profile_unverified"),
+    }
+}
+
+pub(crate) fn memory_fork_inventory(c: &Catalog, execution: &Execution, inv: &Inventory) -> Result<Value> {
+    let launch = c.operation(&execution.last_operation_id)?;
+    let plan = crate::managed::plan(c, &launch)?;
+    let machine = plan.as_ref().filter(|_| launch.phase == "COMPLETED").map(|plan| &plan.machine);
+    let (native, kernel, reason) = memory_fork_backends(inv, machine, &execution.bundle_digest);
+    let mut observed = json!({
+        "profile": inv.memory_fork_profile.as_deref().unwrap_or("native"),
+        "native_supported": native,
+        "kernel_cow_supported": kernel,
+    });
+    if !reason.is_empty() {
+        observed["unavailable_reason"] = json!(reason);
+    }
+    Ok(observed)
 }
 fn conflict(reason: impl ToString) -> Fault {
     Fault::new("E_STATE_CONFLICT", reason.to_string())
@@ -40,9 +117,10 @@ pub(crate) fn restore(c: &Catalog, child: &str) -> Result<Option<Restore>> {
         |r|Ok(Restore{batch_id:r.get(0)?,capture_id:r.get(1)?,anchor:r.get(2)?,helper_digest:r.get(3)?,source_pivot:r.get(4)?,durable:None})).optional()?)
 }
 pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
-    let Some((stage,capture,original,released,error,admission))=c.db.query_row(
-        "SELECT stage,capture_id,original,source_released,error,admission_mode FROM managed_fork_batches WHERE operation_id=?",[id],
-        |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?))).optional()? else {return Ok(None)};
+    let Some((stage,capture,original,released,error,admission,requested,selected))=c.db.query_row(
+        "SELECT stage,capture_id,original,source_released,error,admission_mode,memory_fork_backend,selected_memory_fork_backend
+         FROM managed_fork_batches WHERE operation_id=?",[id],
+        |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?))).optional()? else {return Ok(None)};
     let mut stmt = c.db.prepare(
         "SELECT ch.name,ch.instance_id,ch.operation_id,
              CASE WHEN (ch.cancelled=1 OR ch.admission_error IS NOT NULL) AND o.operation_id IS NULL THEN 'ABORTED' ELSE COALESCE(o.phase,'RESERVED') END,
@@ -79,7 +157,9 @@ pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
         ("complete", _, _) => "partial",
         _ => "pending",
     };
+    let profile = if selected == "kernel_cow" { PROFILE } else { "native" };
     Ok(Some(json!({"stage":stage, "capture_id":capture, "original_source_disposition":original, "admission":admission,
+        "requested_memory_fork_backend":requested, "selected_memory_fork_backend":selected, "memory_fork_profile":profile,
         "source_released":released, "children":rows, "completed_count":successful,
         "failed_count":failed, "outcome":outcome, "error":error})))
 }
@@ -95,6 +175,7 @@ pub(crate) fn submit(
     let unique: HashSet<_> = input.children.iter().collect();
     let fork = matches!(kind,"independent_fork"|"fork_batch");
     let rollback = kind == "vm_rollback";
+    let requested = input.memory_fork_backend.unwrap_or_default();
     let admission = input.admission.as_deref().unwrap_or("all_or_reject");
     if !matches!(admission, "all_or_reject" | "best_effort") || input.admission.is_some() && kind != "fork_batch" {
         return Err(invalid("admission mode is supported only for fork batches"));
@@ -107,7 +188,7 @@ pub(crate) fn submit(
             return Err(invalid("invalid fork parameters or child set"));
         }
     } else if !matches!(kind,"vm_snapshot"|"hibernate"|"vm_rollback")
-        || !input.children.is_empty() || input.capture_id.as_deref().is_some_and(|id|!valid_id(id))
+        || input.memory_fork_backend.is_some() || !input.children.is_empty() || input.capture_id.as_deref().is_some_and(|id|!valid_id(id))
         || rollback && input.capture_id.is_none() || !rollback && input.mode.is_some()
         || input.mode.as_deref().is_some_and(|m| !matches!(m,"exact"|"clone_conflicts")) {
         return Err(invalid("invalid StatePoint operation parameters"));
@@ -118,9 +199,9 @@ pub(crate) fn submit(
     let target = if rollback {input.capture_id.as_deref()} else {None};
     let mode = if rollback {Some(input.mode.as_deref().unwrap_or("clone_conflicts"))} else {None};
     if let Some(prior) = c.db.query_row(
-        "SELECT children,capture_id,restore_capture_id,volume_restore_policy,admission_mode FROM managed_fork_batches WHERE operation_id=?",
-        [id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?)) ).optional()? {
-        if prior.0!=names || prior.1!=capture || prior.2.as_deref()!=target || prior.3.as_deref()!=mode || prior.4!=admission {
+        "SELECT children,capture_id,restore_capture_id,volume_restore_policy,admission_mode,memory_fork_backend FROM managed_fork_batches WHERE operation_id=?",
+        [id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)) ).optional()? {
+        if prior.0!=names || prior.1!=capture || prior.2.as_deref()!=target || prior.3.as_deref()!=mode || prior.4!=admission || prior.5!=requested.as_str() {
             return Err(Fault::new("E_IDEMPOTENCY_CONFLICT","capture parameters changed"));
         }
         return c.begin(r,kind);
@@ -180,6 +261,8 @@ pub(crate) fn submit(
     if inv.devices.iter().any(|dev|dev["virtio_type"]==19 && dev["parked_vsock_rebind"]!=true) {
         return Err(Fault::new("E_CAPABILITY_UNSUPPORTED","this source vsock has no verified parked rebind contract"));
     }
+    let (native, kernel, _) = memory_fork_backends(&inv, Some(&template.machine), bundle);
+    let selected = requested.select(fork, native, kernel)?;
     let (session, token, anchor) = if inv.source_disposition == "STANDBY" {
         c.db.query_row("SELECT n.session,n.token,n.anchor FROM native_standby s JOIN native_transitions n USING(operation_id) WHERE s.incarnation_id=? AND n.mode='managed'",[incarnation],
             |r|Ok((r.get::<_,u32>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?.ok_or_else(||conflict("source requires managed standby"))?
@@ -245,8 +328,11 @@ pub(crate) fn submit(
         if !fork {
             admission::require_capture_space(tx, capacity.memory_mib)?;
         }
-        tx.execute("INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,session,token,anchor,network_gate,original,stage,pivot_json,restore_capture_id,volume_restore_policy,admission_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![id,incarnation,namespace,capture,template_bytes,names,session,token,anchor,network,inv.source_disposition,initial,pivot,target,mode,admission])?;
+        if selected == "kernel_cow" {
+            admission::require_kernel_anchor_room(tx, capacity.memory_mib)?;
+        }
+        tx.execute("INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,session,token,anchor,network_gate,original,stage,pivot_json,restore_capture_id,volume_restore_policy,admission_mode,memory_fork_backend,selected_memory_fork_backend) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![id,incarnation,namespace,capture,template_bytes,names,session,token,anchor,network,inv.source_disposition,initial,pivot,target,mode,admission,requested.as_str(),selected])?;
         let mut admitted = 0;
         let mut last_refusal = None;
         for (i,name) in input.children.iter().enumerate(){
@@ -292,12 +378,10 @@ pub(crate) fn retry(c: &mut Catalog, r: &Request, control: Control) -> Result<Op
     let op = control_scope(c,r)?;
     if !matches!(op.kind.as_str(),"fork_batch"|"independent_fork") {return Err(conflict("only failed fork children can be retried"))}
     let id = &op.operation_id;
-    let tx = c.db.transaction()?;
-    let replay: bool = tx.query_row(
+    let replay: bool = c.db.query_row(
         "SELECT EXISTS(SELECT 1 FROM managed_fork_retries WHERE batch_id=? AND prior_revision=?)",
         params![id,control.expected_revision], |r|r.get(0))?;
     if replay {
-        drop(tx);
         return Ok(op);
     }
     if op.revision != control.expected_revision {
@@ -306,6 +390,12 @@ pub(crate) fn retry(c: &mut Catalog, r: &Request, control: Control) -> Result<Op
     if op.phase != "COMPLETED" {
         return Err(conflict("wait for the existing target attempts to settle"));
     }
+    let (capture, selected): (String, String) = c.db.query_row(
+        "SELECT capture_id,selected_memory_fork_backend FROM managed_fork_batches WHERE operation_id=?",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let tx = c.db.unchecked_transaction()?;
     let failed = {
         let mut stmt = tx.prepare("SELECT ch.ordinal,ch.attempt,ch.instance_id,b.execution_epoch,
             h.vcpus,h.memory_mib,h.storage_bytes
@@ -321,6 +411,9 @@ pub(crate) fn retry(c: &mut Catalog, r: &Request, control: Control) -> Result<Op
     };
     if failed.is_empty() {
         return Err(conflict("batch has no fenced failed targets to retry"));
+    }
+    if selected == "kernel_cow" {
+        crate::kernel_mm_anchor::acquire(c, id, &capture)?;
     }
     for (ordinal, prior_attempt, instance, epoch, capacity) in failed {
         admission::reserve(&tx,id,&instance,capacity)?;
@@ -377,10 +470,22 @@ struct Job {
     kind: String,
     network: bool,
     pivot: Option<String>,
+    kernel_cow: bool,
 }
 impl Job {
     fn scope(&self) -> String {
         format!("{} {}", self.session, self.token)
+    }
+    fn capture_timing(&self, phase: &str, started: Instant) {
+        let mut ended = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ended) } == 0 {
+            let monotonic_us = ended.tv_sec * 1_000_000 + ended.tv_nsec / 1000;
+            let backend = if self.kernel_cow { "kernel_cow" } else { "native" };
+            eprintln!(
+                "resourced managed capture operation={} capture={} backend={backend} phase={phase} monotonic_us={monotonic_us} duration_us={}",
+                self.id, self.resource, started.elapsed().as_micros()
+            );
+        }
     }
     fn advance(&self, c: &Catalog, next: &str) -> Result<()> {
         c.db.execute(
@@ -402,6 +507,7 @@ impl Job {
         Ok(fields[2].to_owned())
     }
     fn capture(&self, c: &Catalog, escrow: &mut Escrow, ep: &Endpoint) -> Result<()> {
+        let started = Instant::now();
         let op = c.operation(&self.id)?;
         let source = c.execution(&self.inc)?;
         let export = Export {
@@ -411,18 +517,25 @@ impl Job {
             session: self.session,
             hold_token: self.token.clone(),
         };
-        let mut capture = statepoint_capture::acquire(ep, &export)?;
-        if capture.anchor != self.anchor {
-            return Err(conflict("observed capture anchor changed"));
-        }
-        let roots = statepoint_capture::disk_roots(c, &op, &source, &export, &capture.devices)?;
-        let disks: BTreeMap<_, _> = capture
-            .devices
-            .iter()
-            .filter_map(|d| d.managed_source())
-            .map(|(d, (g,v))| (d.to_string(), (g.to_string(),v.to_string())))
-            .collect();
-        escrow.import_native(c, &self.resource, &op, &source, &mut capture)?;
+        let (checkpoint, helper_digest, roots, disks) = if self.kernel_cow {
+            let capture = statepoint_capture::acquire_kernel(ep, &export)?;
+            self.check_anchor(&capture.anchor)?;
+            let roots = statepoint_capture::disk_roots(c, &op, &source, &export, &capture.devices)?;
+            let disks = Self::capture_disks(&capture.devices);
+            let import_started = Instant::now();
+            crate::kernel_mm_anchor::register(
+                c, &self.id, &self.resource, &source, capture.source_pidfd, &capture.regions,
+            )?;
+            self.capture_timing("anchor_ready", import_started);
+            (capture.checkpoint, capture.helper_digest, roots, disks)
+        } else {
+            let mut capture = statepoint_capture::acquire(ep, &export)?;
+            self.check_anchor(&capture.anchor)?;
+            let roots = statepoint_capture::disk_roots(c, &op, &source, &export, &capture.devices)?;
+            let disks = Self::capture_disks(&capture.devices);
+            escrow.import_native(c, &self.resource, &op, &source, &mut capture)?;
+            (capture.checkpoint, capture.helper_digest, roots, disks)
+        };
         crate::activation_catalog::pin_source_tap(c, &self.resource, &source, self.network)?;
         let tx = c.db.unchecked_transaction()?;
         for root in roots {
@@ -431,10 +544,109 @@ impl Job {
                 params![self.id, root, self.id],
             )?;
         }
-        tx.execute("UPDATE managed_fork_batches SET stage='source_return',checkpoint=?,disk_json=?,helper_digest=?,error=NULL WHERE operation_id=? AND stage='exporting'",
-            params![capture.checkpoint,serde_json::to_string(&disks).map_err(invalid)?,capture.helper_digest,self.id])?;
+        let next = if self.kernel_cow { "kernel_confirming" } else { "source_return" };
+        tx.execute("UPDATE managed_fork_batches SET stage=?,checkpoint=?,disk_json=?,helper_digest=?,error=NULL WHERE operation_id=? AND stage='exporting'",
+            params![next,checkpoint,serde_json::to_string(&disks).map_err(invalid)?,helper_digest,self.id])?;
         tx.commit()?;
+        self.capture_timing("exported", started);
         Ok(())
+    }
+    fn check_anchor(&self, anchor: &str) -> Result<()> {
+        if anchor != self.anchor {
+            return Err(conflict("observed capture anchor changed"));
+        }
+        Ok(())
+    }
+    fn capture_disks(devices: &[statepoint_capture::Device]) -> BTreeMap<String, (String, String)> {
+        devices
+            .iter()
+            .filter_map(|d| d.managed_source())
+            .map(|(d, (g,v))| (d.to_string(), (g.to_string(),v.to_string())))
+            .collect()
+    }
+    fn kernel_export(&self, c: &Catalog, escrow: &mut Escrow, ep: &Endpoint) -> Result<()> {
+        // Allow rediscovery of the same paused point after a broker restart.
+        // The deadline starts after the writer transition is reconciled.
+        let expired: bool = c.db.query_row(
+            "UPDATE managed_fork_batches
+             SET kernel_export_deadline=coalesce(kernel_export_deadline,unixepoch()+45)
+             WHERE operation_id=? RETURNING kernel_export_deadline<=unixepoch()",
+            [&self.id],
+            |row| row.get(0),
+        )?;
+        let result = if expired {
+            Err(Fault::new("E_CAPTURE_TIMEOUT", "Kernel CoW anchor import did not settle while the source was held"))
+        } else if self.stage == "exporting" {
+            self.capture(c, escrow, ep)
+        } else {
+            let started = Instant::now();
+            crate::kernel_mm_anchor::acquire(c, &self.id, &self.resource)
+                .and_then(|_| ep.command(&format!("CAPTURE_KERNEL_IMPORTED {}", self.scope())))
+                .and_then(|_| {
+                    self.capture_timing("anchor_confirmed", started);
+                    self.advance(c, "source_return")
+                })
+        };
+        match result {
+            Err(error) if expired || matches!(error.code.as_str(),
+                "E_CAPTURE_LOST" | "E_KERNEL_ANCHOR_UNAVAILABLE" | "E_FENCE_UNPROVEN" | "E_INVALID_REQUEST" | "E_STATE_CONFLICT") =>
+            {
+                c.db.execute(
+                    "UPDATE managed_fork_batches SET stage='kernel_abandon',error=? WHERE operation_id=? AND stage=?",
+                    params![error.message, self.id, self.stage],
+                )?;
+                Ok(())
+            }
+            result => result,
+        }
+    }
+    fn kernel_abandon(&self, c: &mut Catalog, ep: &Endpoint) -> Result<()> {
+        let scope = self.scope();
+        let inv = ep.inventory()?;
+        match inv.source_disposition.as_str() {
+            "HELD" => {
+                crate::kernel_mm_anchor::quiesce_unpublished(c, &self.id, &self.resource)?;
+                ep.command(&format!("CAPTURE_KERNEL_ABANDON {scope}"))?;
+                ep.command(&format!("CAPTURE_FINISH {scope} RETURN_STANDBY"))?;
+            }
+            "STANDBY" if self.original == "RUNNING" => {
+                ep.command(&format!("STANDBY_WAKE {scope}"))?;
+            }
+            current if current == self.original => {
+                let reason: Option<String> = c.db.query_row(
+                    "SELECT error FROM managed_fork_batches WHERE operation_id=?",
+                    [&self.id],
+                    |row| row.get(0),
+                )?;
+                finish_abort(c, &self.id, reason.as_deref())?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::MemoryForkBackend;
+
+    #[test]
+    fn requested_backend_is_chosen_before_capture() {
+        let default = MemoryForkBackend::default();
+        assert_eq!(default.select(true, true, false).unwrap(), "native");
+        assert_eq!(
+            default.select(true, false, true).unwrap_err().code,
+            "E_CAPABILITY_UNSUPPORTED"
+        );
+        assert_eq!(
+            MemoryForkBackend::KernelCow.select(true, true, false).unwrap_err().code,
+            "E_CAPABILITY_UNSUPPORTED"
+        );
+        let auto = MemoryForkBackend::Auto;
+        assert_eq!(auto.select(true, true, false).unwrap(), "native");
+        assert_eq!(auto.select(true, false, true).unwrap(), "kernel_cow");
+        assert!(auto.select(true, false, false).is_err());
+        assert_eq!(default.select(false, false, true).unwrap(), "kernel_cow");
     }
 }
 
@@ -480,8 +692,9 @@ impl Actor {
             // Keep the original command stable across reconnects. The running
             // VMM may already have accepted it even before the first catalog write.
             let mut q=c.db.prepare("SELECT operation_id,source_incarnation,capture_id,session,token,anchor,stage,original,network_gate,
-                json_remove(pivot_json,'$.admitted_grant_id','$.reconciled_writer'),(SELECT kind FROM operations o WHERE o.operation_id=b.operation_id)
-                FROM managed_fork_batches b WHERE stage IN ('failure_return','cancel_preflight','children','cancel_gate','arming','parking','standby','holding','pivoting','source_return','waking')
+                json_remove(pivot_json,'$.admitted_grant_id','$.reconciled_writer'),(SELECT kind FROM operations o WHERE o.operation_id=b.operation_id),
+                selected_memory_fork_backend='kernel_cow'
+                FROM managed_fork_batches b WHERE stage IN ('failure_return','cancel_preflight','children','cancel_gate','arming','parking','standby','holding','pivoting','source_return','waking','kernel_confirming','kernel_abandon')
                 OR (stage='exporting' AND EXISTS (SELECT 1 FROM operations o WHERE o.operation_id=b.operation_id AND o.kind IN ('independent_fork','fork_batch'))) ORDER BY rowid")?;
             let result = q
                 .query_map([], |r| {
@@ -497,6 +710,7 @@ impl Actor {
                         network: r.get(8)?,
                         pivot: r.get(9)?,
                         kind: r.get(10)?,
+                        kernel_cow: r.get(11)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -504,6 +718,10 @@ impl Actor {
         };
         for job in jobs {
             if let Err(e) = self.step(c, escrow, boot, &job) {
+                if job.stage == "kernel_abandon" {
+                    eprintln!("resourced Kernel CoW source return {}: {}", job.id, e.message);
+                    continue;
+                }
                 c.db.execute("UPDATE managed_fork_batches SET error=? WHERE operation_id=? AND error IS NOT ?",params![e.message,job.id,e.message])?;
             }
         }
@@ -561,10 +779,12 @@ impl Actor {
                 }
             }
             "standby" => {
+                let started = Instant::now();
                 let status = ep.command(&format!("STANDBY_ENTER {scope} managed"))?;
                 if serde_json::from_str::<Value>(&status).map_err(invalid)?["source_disposition"]
                     == "STANDBY"
                 {
+                    j.capture_timing("source_parked", started);
                     j.advance(c, "holding")?
                 }
             }
@@ -584,7 +804,13 @@ impl Actor {
                 }
             }
             "holding" => {
-                let status = match ep.command(&format!("CAPTURE_PREPARE {scope} parked")) {
+                let started = Instant::now();
+                let command = if j.kernel_cow {
+                    format!("CAPTURE_KERNEL_PREPARE {scope}")
+                } else {
+                    format!("CAPTURE_PREPARE {scope} parked")
+                };
+                let status = match ep.command(&command) {
                     Err(fault) if fault.code=="E_NATIVE_REFUSED" && (fault.message.starts_with("ENOTSUP") || fault.message.starts_with("EIO held capture:")) => {
                         c.db.execute("UPDATE managed_fork_batches SET stage='failure_return',error=? WHERE operation_id=? AND stage='holding'",params![fault.message,j.id])?;
                         return Ok(())
@@ -596,6 +822,7 @@ impl Actor {
                     let reason = status["error"].as_str().unwrap_or("native source failed to reach the capture boundary");
                     c.db.execute("UPDATE managed_fork_batches SET stage='failure_return',error=? WHERE operation_id=? AND stage='holding'",params![reason,j.id])?;
                 } else if status["source_disposition"] == "HELD" {
+                    j.capture_timing("held_prepare", started);
                     j.advance(
                         c,
                         if j.pivot.is_some() {
@@ -623,12 +850,16 @@ impl Actor {
                     });
                 }
             }
+            "exporting" | "kernel_confirming" if j.kernel_cow => j.kernel_export(c, escrow, &ep)?,
+            "kernel_abandon" => j.kernel_abandon(c, &ep)?,
             "exporting" => j.capture(c, escrow, &ep)?,
             "source_return" => {
+                let started = Instant::now();
                 let status = ep.command(&format!("CAPTURE_FINISH {scope} RETURN_STANDBY"))?;
                 if serde_json::from_str::<Value>(&status).map_err(invalid)?["source_disposition"]
                     == "STANDBY"
                 {
+                    j.capture_timing("source_returned_to_standby", started);
                     if j.original == "STANDBY" {
                         release(c, j)?
                     } else {
@@ -637,10 +868,12 @@ impl Actor {
                 }
             }
             "waking" => {
+                let started = Instant::now();
                 let status = ep.command(&format!("STANDBY_WAKE {scope}"))?;
                 if serde_json::from_str::<Value>(&status).map_err(invalid)?["source_disposition"]
                     == "RUNNING"
                 {
+                    j.capture_timing("source_returned_to_running", started);
                     release(c, j)?
                 }
             }
@@ -652,7 +885,7 @@ impl Actor {
 /// A source pivot is one step in a managed operation. The fenced source exit
 /// may release the parent, but only its actor can publish the terminal result.
 pub(crate) fn source_exited(tx:&rusqlite::Transaction<'_>,inc:&str)->Result<()> {
-    let mut q=tx.prepare("SELECT b.operation_id,o.kind,b.checkpoint IS NOT NULL,p.phase FROM managed_fork_batches b JOIN operations o USING(operation_id)
+    let mut q=tx.prepare("SELECT b.operation_id,o.kind,b.checkpoint IS NOT NULL AND b.stage!='kernel_abandon',p.phase FROM managed_fork_batches b JOIN operations o USING(operation_id)
         LEFT JOIN statepoints p USING(capture_id) WHERE b.source_incarnation=? AND b.source_released=0 AND o.phase='NEW'")?;
     let jobs=q.query_map([inc],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,Option<String>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     drop(q);
@@ -666,6 +899,7 @@ pub(crate) fn source_exited(tx:&rusqlite::Transaction<'_>,inc:&str)->Result<()> 
         tx.execute("UPDATE managed_fork_batches SET stage=?,source_released=1,error=? WHERE operation_id=?",params![next,
             if next=="aborted" {Some("source exited before the managed capture was committed")}else{None},id])?;
         if next=="aborted" {
+            drop_capture_pins(tx, &id)?;
             tx.execute("UPDATE operations SET phase='ABORTED',decision='ABORT',revision=revision+1 WHERE operation_id=?",[&id])?;
             tx.execute("UPDATE managed_budget_holds SET state='released' WHERE operation_id=? AND state='reserved'",[&id])?;
         }
@@ -676,10 +910,15 @@ pub(crate) fn source_exited(tx:&rusqlite::Transaction<'_>,inc:&str)->Result<()> 
 pub(crate) fn finish_abort(c:&mut Catalog,id:&str,error:Option<&str>)->Result<()> {
     let tx=c.db.transaction()?;
     tx.execute("UPDATE managed_fork_batches SET source_released=1,stage='aborted',error=? WHERE operation_id=?",params![error,id])?;
+    drop_capture_pins(&tx, id)?;
     tx.execute("UPDATE operations SET phase='ABORTED',decision='ABORT',revision=revision+1 WHERE operation_id=? AND phase='NEW'",[id])?;
     tx.execute("UPDATE managed_budget_holds SET state='released' WHERE operation_id=? AND state='reserved'",[id])?;
     tx.execute("UPDATE instance_bindings SET active_operation_id=NULL WHERE active_operation_id=?",[id])?;
     tx.commit()?;
+    Ok(())
+}
+fn drop_capture_pins(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
+    tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind IN ('fork_capture','kernel_anchor_export') AND owner_id=? AND state='active'", [id])?;
     Ok(())
 }
 fn release(c: &mut Catalog, j: &Job) -> Result<()> {
@@ -723,6 +962,7 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
     for (op, name, instance, epoch) in pending {
         let mut machine = base.clone();
         machine.name = name.clone();
+        machine.memory_fork_profile = j.kernel_cow.then(|| PROFILE.to_owned());
         for d in &mut machine.disks {
             d.volume_id = None;
             d.generation_id = disks.get(&d.device_id).ok_or_else(||conflict("capture omits declared disk"))?.0.clone();
@@ -770,7 +1010,7 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
         tx.execute("UPDATE managed_fork_batches SET stage='complete' WHERE operation_id=?", [&j.id])?;
         tx.execute("UPDATE operations SET phase='COMPLETED',revision=revision+1 WHERE operation_id=? AND phase='NEW'",[&j.id])?;
         if retryable == 0 {
-            tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='fork_capture' AND owner_id=? AND state='active'",[&j.id])?;
+            drop_capture_pins(&tx, &j.id)?;
         }
         if failed > 0 {
             tx.execute("UPDATE managed_budget_holds SET state='released' WHERE operation_id=? AND state='reserved'",[&j.id])?;
@@ -832,12 +1072,58 @@ pub(crate) fn metadata(
         files,
     ))
 }
+pub(crate) fn kernel_metadata(
+    c: &Catalog,
+    op: &Operation,
+) -> Result<(Value, Vec<crate::ipc::FdEntry>, Vec<std::os::fd::OwnedFd>, crate::managed_kernel_cow::Import)> {
+    use sha2::{Digest, Sha256};
+    let target = &op.operation_id;
+    let restore = restore(c, target)?.ok_or_else(|| invalid("missing fork source"))?;
+    let checkpoint: Vec<u8> = c.db.query_row(
+        "SELECT b.checkpoint FROM managed_fork_batches b JOIN managed_fork_children ch ON ch.batch_id=b.operation_id
+         WHERE b.operation_id=? AND ch.operation_id=? AND ch.cancelled=0 AND b.source_released=1
+           AND b.selected_memory_fork_backend='kernel_cow' AND b.checkpoint IS NOT NULL",
+        params![restore.batch_id, target],
+        |row| row.get(0),
+    ).optional()?.ok_or_else(|| conflict("target has no authorized Kernel CoW capture"))?;
+    let (anchor, donor) = crate::kernel_mm_anchor::acquire(c, &restore.batch_id, &restore.capture_id)?;
+    let checkpoint_digest = format!("sha256:{:x}", Sha256::digest(&checkpoint));
+    let import = crate::managed_kernel_cow::Import {
+        capture_id: restore.capture_id.clone(),
+        proof_digest: format!("sha256:{:x}", Sha256::digest(format!(
+            "KernelCowImport/1\0{}\0{target}\0{}\0{checkpoint_digest}",
+            restore.capture_id, anchor.layout_digest,
+        ))),
+    };
+    let descriptors = vec![donor, sealed_file(&checkpoint)?];
+    let table = ["kernel_mm_anchor", "checkpoint"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, role)| crate::ipc::FdEntry {
+            index,
+            resource_id: restore.capture_id.clone(),
+            role: role.into(),
+        })
+        .collect();
+    Ok((
+        json!({"capture_id":restore.capture_id, "checkpoint_bytes":checkpoint.len(), "regions":anchor.regions}),
+        table,
+        descriptors,
+        import,
+    ))
+}
 pub(crate) fn activation_input(c: &Catalog, op: &Operation) -> Result<Value> {
     let spec = restore(c, &op.operation_id)?.ok_or_else(|| invalid("missing fork activation"))?;
+    let selected: String = c.db.query_row(
+        "SELECT selected_memory_fork_backend FROM managed_fork_batches WHERE operation_id=?",
+        [&spec.batch_id],
+        |row| row.get(0),
+    )?;
+    let profile = if selected == "kernel_cow" { PROFILE } else { "parked" };
     let profile_digest = format!(
         "sha256:{:x}",
         <sha2::Sha256 as sha2::Digest>::digest(format!(
-            "{}:parked:{}",
+            "{}:{profile}:{}",
             op.bundle_digest, spec.helper_digest
         ))
     );

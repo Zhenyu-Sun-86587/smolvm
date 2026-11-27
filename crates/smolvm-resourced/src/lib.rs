@@ -32,6 +32,8 @@ mod ipc;
 pub mod managed;
 #[cfg(target_os = "linux")]
 mod managed_fork;
+#[cfg(target_os = "linux")]
+mod managed_kernel_cow;
 pub mod managed_state_restore;
 #[cfg(target_os = "linux")]
 mod managed_retirement;

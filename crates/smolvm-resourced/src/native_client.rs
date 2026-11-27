@@ -80,6 +80,29 @@ fn fault(code: &str, msg: impl ToString) -> QueryError {
     }
 }
 
+fn sealed_bytes(fd: OwnedFd, size: &Value, limit: u64) -> Result<Vec<u8>, QueryError> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let protocol = || fault("E_PROTOCOL_UNSUPPORTED", "invalid captured memory descriptor");
+    let size = size.as_u64().filter(|size| *size > 0 && *size <= limit).ok_or_else(protocol)?;
+    let file = std::fs::File::from(fd);
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    let required = libc::F_SEAL_WRITE | libc::F_SEAL_SEAL | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+    if seals < 0
+        || seals & required != required
+        || file.metadata().map_err(|e| fault("E_HOST_IO", e))?.len() != size
+    {
+        return Err(protocol());
+    }
+    let mut value = Vec::new();
+    file.take(size).read_to_end(&mut value).map_err(|e| fault("E_HOST_IO", e))?;
+    if value.len() as u64 != size {
+        return Err(protocol());
+    }
+    Ok(value)
+}
+
 impl Client<'_> {
     pub fn register_bundle(&self, exe_hash: &str) -> Result<(), QueryError> {
         let r: Value = self.call(
@@ -257,6 +280,7 @@ impl Client<'_> {
         let socket = ipc::connect(self.socket).map_err(transport)?;
         // Disk reattachment and volume mutation can hash a complete backing.
         let seconds = match method {
+            "QueryKernelCowBoot" => 1,
             "ApplyProductVolume" => 120,
             "AcquireManagedLaunchDisks" => 90,
             _ => 20,
@@ -307,6 +331,9 @@ impl Client<'_> {
     }
     pub fn native_resources(&self, expected: &ExecutionRef) -> Result<Value, QueryError> {
         self.call("QueryNativeResources", Some(expected), None, empty())
+    }
+    pub fn kernel_cow_boot(&self) -> Result<smolvm_runtime_protocol::Capability, QueryError> {
+        self.call("QueryKernelCowBoot", None, None, empty())
     }
     pub fn submit_resize(&self, input: &Submission) -> Result<OperationReceipt, QueryError> {
         self.recover_and_retry(|| self.receipt("SubmitNativeResize", &input.operation_id,
@@ -371,7 +398,6 @@ impl Client<'_> {
         plan: &crate::managed::Plan,
         restore: &crate::managed::Restore,
     ) -> Result<ForkMemory, QueryError> {
-        use std::io::Read;
         let launch = &plan.launch;
         let expected = Some(&launch.execution);
         let intent = Some((launch.operation_id.as_str(), launch.request_digest.as_str()));
@@ -387,37 +413,12 @@ impl Client<'_> {
         {
             return Err(protocol());
         }
-        let bytes = |fd: OwnedFd, size: &Value, limit: u64| -> Result<Vec<u8>, QueryError> {
-            use std::os::fd::AsRawFd;
-            let size = size
-                .as_u64()
-                .filter(|s| *s > 0 && *s <= limit)
-                .ok_or_else(protocol)?;
-            let file = std::fs::File::from(fd);
-            let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
-            let required =
-                libc::F_SEAL_WRITE | libc::F_SEAL_SEAL | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
-            if seals < 0
-                || seals & required != required
-                || file.metadata().map_err(|e| fault("E_HOST_IO", e))?.len() != size
-            {
-                return Err(protocol());
-            }
-            let mut value = Vec::new();
-            file.take(size)
-                .read_to_end(&mut value)
-                .map_err(|e| fault("E_HOST_IO", e))?;
-            if value.len() as u64 != size {
-                return Err(protocol());
-            }
-            Ok(value)
-        };
-        let descriptor = bytes(
+        let descriptor = sealed_bytes(
             files.pop().ok_or_else(protocol)?,
             &meta["descriptor_bytes"],
             4 << 20,
         )?;
-        let checkpoint = bytes(
+        let checkpoint = sealed_bytes(
             files.pop().ok_or_else(protocol)?,
             &meta["checkpoint_bytes"],
             64 << 20,
@@ -470,6 +471,37 @@ impl Client<'_> {
             checkpoint,
             ram,
             authority: self.restore_authority(launch, restore)?,
+        })
+    }
+
+    pub fn kernel_fork_memory(
+        &self,
+        launch: &Launch,
+        restore: &crate::managed::Restore,
+        permit: &str,
+    ) -> Result<KernelForkMemory, QueryError> {
+        let protocol = || fault("E_PROTOCOL_UNSUPPORTED", "invalid Kernel CoW import receipt");
+        let (meta, table, files): (Value, _, _) = self.exchange(
+            "AcquireManagedKernelCow",
+            Some(&launch.execution),
+            Some((&launch.operation_id, &launch.request_digest)),
+            json!({"launch_permit":permit}),
+        )?;
+        if meta["capture_id"] != restore.capture_id
+            || table.len() != 2
+            || table[0].role != "kernel_mm_anchor"
+            || table[1].role != "checkpoint"
+            || table.iter().any(|entry| entry.resource_id != restore.capture_id)
+        {
+            return Err(protocol());
+        }
+        let [donor, checkpoint] = files.try_into().map_err(|_| protocol())?;
+        let regions = serde_json::from_value::<Vec<_>>(meta["regions"].clone()).map_err(|_| protocol())?;
+        smolvm_runtime_protocol::kernel_cow::packed_size(&regions).map_err(|_| protocol())?;
+        Ok(KernelForkMemory {
+            donor,
+            regions,
+            checkpoint: sealed_bytes(checkpoint, &meta["checkpoint_bytes"], 64 << 20)?,
         })
     }
 
@@ -882,6 +914,12 @@ pub struct ForkMemory {
     pub checkpoint: Vec<u8>,
     pub ram: Vec<OwnedFd>,
     pub authority: TargetAuthority,
+}
+
+pub struct KernelForkMemory {
+    pub donor: OwnedFd,
+    pub regions: Vec<smolvm_runtime_protocol::kernel_cow::Region>,
+    pub checkpoint: Vec<u8>,
 }
 
 pub struct TargetAuthority {

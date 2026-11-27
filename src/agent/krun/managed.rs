@@ -4,7 +4,7 @@ use smolvm_resourced::managed::{DiskSet, Plan};
 use smolvm_resourced::network_client::AttachmentDescriptor;
 use std::collections::BTreeMap;
 use std::ffi::{c_char, CString};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::ptr;
@@ -262,6 +262,51 @@ impl KrunFunctions {
 }
 
 impl KrunFunctions {
+    pub(crate) fn enable_managed_kernel_cow(&self, ctx: u32) -> Result<(), String> {
+        unsafe {
+            let enable = self._handle.get::<unsafe extern "C" fn(u32) -> i32>(
+                b"krun_enable_worker_kernel_cow_v1\0",
+            ).map_err(|error| error.to_string())?;
+            self.check_managed_restore("Kernel CoW RAM profile", enable(ctx))
+        }
+    }
+
+    pub(crate) fn import_managed_kernel_cow(
+        &self,
+        ctx: u32,
+        memory: smolvm_resourced::native_client::KernelForkMemory,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), String> {
+        use smolvm_runtime_protocol::kernel_cow::Region;
+        type Import = unsafe extern "C" fn(
+            u32, i32, *const Region, usize, *const u8, usize, u32, u32, u32,
+        ) -> i32;
+        let kvm_group = crate::process::kvm_group_gid().unwrap_or(0);
+        unsafe {
+            let import = self._handle.get::<Import>(b"krun_import_worker_kernel_cow_v1\0")
+                .map_err(|error| error.to_string())?;
+            // The donor pidfd is transferred at entry, including when the
+            // runtime rejects the import. This process never needs it again.
+            let status = import(
+                ctx,
+                memory.donor.into_raw_fd(),
+                memory.regions.as_ptr(),
+                memory.regions.len(),
+                memory.checkpoint.as_ptr(),
+                memory.checkpoint.len(),
+                uid,
+                gid,
+                kvm_group,
+            );
+            self.check_managed_restore("Kernel CoW RAM import", status)?;
+            if libc::geteuid() != uid || libc::getegid() != gid {
+                return Err("Kernel CoW bootstrap did not assume its execution credentials".into());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn managed_restore(
         &self,
         ctx: u32,

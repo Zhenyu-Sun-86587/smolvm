@@ -175,6 +175,7 @@ struct Permit {
     start: i64,
     pidfd: OwnedFd,
     expires: Instant,
+    kernel_import: Option<crate::managed_kernel_cow::Import>,
 }
 
 struct Worker {
@@ -655,6 +656,7 @@ impl Worker {
                     delivered: None,
                 });
             }
+            "AcquireManagedKernelCow" => return self.acquire_managed_kernel_cow(request, peer),
             "PrepareManagedForkAuthority" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 let op = self.catalog.active_operation(request)?;
@@ -1005,6 +1007,15 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            "QueryKernelCowBoot" => {
+                self.catalog.ready()?;
+                if request.payload != json!({}) {
+                    return Err(Fault::invalid("Kernel CoW probe requires an empty payload"));
+                }
+                let bundle = request.bundle_digest.as_deref()
+                    .ok_or_else(|| Fault::invalid("Kernel CoW probe requires a bundle identity"))?;
+                Ok(crate::managed_kernel_cow::capability(bundle))
+            }
             "QueryPrivateNetworkPeering" => {
                 self.catalog.ready()?;
                 self.network.peering_status(request)
@@ -1207,7 +1218,9 @@ impl Worker {
                     &execution.incarnation_id,
                     &self.boot,
                 )?;
-                Ok(json!({"execution":execution,"inventory":ep.inventory()?}))
+                let inventory = ep.inventory()?;
+                let memory_fork = crate::managed_fork::memory_fork_inventory(&self.catalog, &execution, &inventory)?;
+                Ok(json!({"execution":execution,"inventory":inventory,"memory_fork":memory_fork}))
             }
             "SubmitNativeOperation" => {
                 let op = crate::native_operations::submit(
@@ -1560,9 +1573,44 @@ impl Worker {
                 start,
                 pidfd,
                 expires: Instant::now() + Duration::from_secs(60),
+                kernel_import: None,
             },
         );
         Ok(json!({"launch_permit":credential, "pid_start_time":start}))
+    }
+
+    fn acquire_managed_kernel_cow(&mut self, request: &Request, peer: libc::ucred) -> Result<Reply> {
+        if peer.uid != 0 {
+            return Err(Fault::new("E_PERMISSION_DENIED", "Kernel CoW requires the privileged launch process"));
+        }
+        let supplied: Token = request.payload()?;
+        let (_, bundle, expected) = request.scope()?;
+        let op = self.catalog.matching_operation(request)?;
+        self.catalog.verify_launch(&op, expected)?;
+        let plan = crate::managed::plan(&self.catalog, &op)?
+            .filter(|plan| plan.machine.kernel_cow() && plan.restore.as_ref().is_some_and(|restore| restore.durable.is_none()))
+            .ok_or_else(|| Fault::invalid("Kernel CoW requires an admitted volatile fork target"))?;
+        if op.kind != "restore_target" || plan.launch.execution != *expected {
+            return Err(stale_execution());
+        }
+        crate::managed_kernel_cow::require_worker(bundle)?;
+        let permit = self.permits.get_mut(&supplied.launch_permit).filter(|permit| {
+            permit.operation == op.operation_id && permit.expected == *expected
+                && permit.pid == peer.pid && permit.uid != 0 && permit.expires > Instant::now()
+                && permit.kernel_import.is_none()
+        }).ok_or_else(|| Fault::new("E_LAUNCH_PERMIT", "an unused launch permit for this process is required"))?;
+        verify_executable(peer.pid, permit.start, &permit.pidfd, &self.catalog.bundle(bundle)?)?;
+        let start = permit.start;
+        self.verify_execution_scope(&op.operation_id, peer.pid)?;
+        let (result, table, descriptors, kernel_import) = crate::managed_fork::kernel_metadata(&self.catalog, &op)?;
+        let permit = self.permits.get_mut(&supplied.launch_permit).expect("validated permit exists");
+        if pid_start(peer.pid).ok() != Some(start) || pid_exited(&permit.pidfd).map_err(broker_error)? {
+            return Err(stale_execution());
+        }
+        // Charge this exact process before handing out the donor. An
+        // ambiguous delivery may only be recovered by a new process claim.
+        permit.kernel_import = Some(kernel_import);
+        Ok(Reply { result, table, descriptors, delivered: None })
     }
 
     fn register_execution(&mut self, r: &Request, peer: libc::ucred) -> Result<Value> {
@@ -1611,6 +1659,11 @@ impl Worker {
             &self.catalog.bundle(bundle)?,
         )?;
         self.verify_execution_scope(&op.operation_id, peer.pid)?;
+        if permit.kernel_import.is_none() && crate::managed::plan(&self.catalog, &op)?
+            .is_some_and(|plan| plan.machine.kernel_cow() && plan.restore.is_some())
+        {
+            return Err(Fault::new("E_LAUNCH_PERMIT", "Kernel CoW target has no authorized RAM import"));
+        }
         self.restore_managed_cpu_limit(&op, peer.pid, permit.start, &permit.pidfd)?;
         let execution = self.catalog.register_execution(
             &op,
@@ -1623,6 +1676,7 @@ impl Worker {
                 start: permit.start,
                 uid: peer.uid,
                 permit_digest: &permit_digest,
+                kernel_import: permit.kernel_import.as_ref(),
             },
         )?;
         let permit = self
@@ -2547,6 +2601,8 @@ fn serve(
     worker
         .reconnect_native_endpoints()
         .map_err(|f| io::Error::other(f.message))?;
+    crate::kernel_mm_anchor::reconcile(&worker.catalog)
+        .map_err(|fault| io::Error::other(fault.message))?;
     worker
         .reconcile_statepoints()
         .map_err(|fault| io::Error::other(fault.message))?;
@@ -2584,6 +2640,9 @@ fn serve(
             }
             if let Err(error) = worker.reconcile_capture_source_exits() {
                 eprintln!("resourced capture source recovery: {error}");
+            }
+            if let Err(error) = crate::kernel_mm_anchor::reconcile(&worker.catalog) {
+                eprintln!("resourced Kernel CoW anchor recovery: {error}");
             }
             worker
                 .forks

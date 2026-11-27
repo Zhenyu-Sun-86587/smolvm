@@ -116,6 +116,7 @@ pub struct NewExecution<'a> {
     pub start: i64,
     pub uid: u32,
     pub permit_digest: &'a str,
+    pub(crate) kernel_import: Option<&'a crate::managed_kernel_cow::Import>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -907,6 +908,12 @@ impl Catalog {
         )?;
         tx.execute("UPDATE instance_bindings SET incarnation_id=?,execution_epoch=? WHERE route_id=? AND instance_id=?",
             params![incarnation, new.expected.execution_epoch, new.route, new.expected.instance_id])?;
+        if let Some(import) = new.kernel_import {
+            tx.execute(
+                "INSERT INTO kernel_cow_imports(incarnation_id,capture_id,proof_digest) VALUES(?,?,?)",
+                params![incarnation, import.capture_id, import.proof_digest],
+            )?;
+        }
         tx.commit()?;
         self.execution(incarnation)
     }
