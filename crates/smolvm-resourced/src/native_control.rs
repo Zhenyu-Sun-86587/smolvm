@@ -41,6 +41,8 @@ pub(crate) struct Inventory {
     pub standby_blocker: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_fork_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_relay_fork: Option<bool>,
     pub devices: Vec<Value>,
 }
 

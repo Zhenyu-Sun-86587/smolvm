@@ -1143,7 +1143,7 @@ impl Worker {
                         request,
                         || self.verify_live_execution(&execution),
                     )?,
-                    "released" => record,
+                    "released" | "failed_held" => record,
                     _ => {
                         return Err(Fault::new(
                             "E_FENCE_UNPROVEN",
@@ -2187,6 +2187,67 @@ impl Worker {
         }
         Ok(())
     }
+
+    fn reconcile_failed_managed_targets(&mut self) -> Result<()> {
+        let targets = {
+            let mut query = self.catalog.db.prepare(
+                "SELECT o.operation_id,e.incarnation_id FROM target_activations a
+                 JOIN operations o USING(operation_id)
+                 JOIN managed_launches m ON m.operation_id=o.operation_id AND m.incarnation_id=a.incarnation_id
+                 JOIN executions e ON e.incarnation_id=m.incarnation_id AND e.last_operation_id=o.operation_id
+                 JOIN instance_bindings b ON b.route_id=e.route_id AND b.instance_id=e.instance_id
+                   AND b.execution_epoch=e.execution_epoch AND b.active_operation_id=o.operation_id
+                 WHERE a.phase='failed_held' AND o.kind='restore_target' AND o.phase='NEW'
+                   AND a.execution_epoch=e.execution_epoch AND a.instance_id=e.instance_id
+                   AND a.bundle_digest=e.bundle_digest AND a.host_boot_id=e.host_boot_id
+                   AND ((e.phase='exited' AND b.incarnation_id IS NULL) OR b.incarnation_id=e.incarnation_id)",
+            )?;
+            let rows = query.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (operation, incarnation) in targets {
+            if let Err(error) = self.finish_failed_managed_target(&operation, &incarnation) {
+                eprintln!("resourced failed managed target {operation}: {error}");
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_failed_managed_target(&mut self, operation: &str, incarnation: &str) -> Result<()> {
+        let op = self.catalog.operation(operation)?;
+        let execution = self.catalog.execution(incarnation)?;
+        if !self.stop_vmm(&execution)? {
+            return Ok(());
+        }
+        let expected = crate::ipc::Expected {
+            instance_id: execution.instance_id.clone(),
+            incarnation_id: None,
+            execution_epoch: execution.execution_epoch,
+        };
+        // The exact VMM must exit and release its writer OFDs and TAP before
+        // the operation may abort. Keep the activation decision for receipts.
+        self.finalize_scoped_execution(execution)?;
+        crate::managed_state_restore::fail(
+            &self.catalog,
+            operation,
+            &Fault::new("E_IDENTITY_REJECTED", "target Guest identity failed while held"),
+        )?;
+        let request = Request {
+            protocol: crate::ipc::PROTOCOL.into(),
+            method: "FinishOperation".into(),
+            request_id: "failed-managed-target".into(),
+            route_id: Some(op.route_id),
+            bundle_digest: Some(op.bundle_digest),
+            operation_id: Some(op.operation_id),
+            request_digest: Some(op.request_digest),
+            expected: Some(expected),
+            fd_table: Vec::new(),
+            payload: Value::Null,
+        };
+        self.catalog.finish(&request, true, op.revision)?;
+        Ok(())
+    }
+
     fn reconcile_statepoints(&mut self) -> Result<()> {
         for record in self
             .statepoints
@@ -2670,6 +2731,9 @@ fn serve(
                 .forks
                 .tick(&mut worker.catalog, &mut worker.escrow, &worker.boot)
                 .map_err(|e| io::Error::other(e.message))?;
+            if let Err(error) = worker.reconcile_failed_managed_targets() {
+                eprintln!("resourced managed target failure recovery: {error}");
+            }
             if let Err(error)=worker.reconcile_fork_cancellations() {
                 eprintln!("resourced fork cancellation: {error}");
             }

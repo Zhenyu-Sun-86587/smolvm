@@ -63,6 +63,65 @@ fn lost_anchor_leaves_activation_authority_only_for_the_imported_execution() {
 }
 
 #[test]
+fn upgrades_both_version_30_capture_journals_without_losing_their_rows() {
+    for (version, cow, relay) in [(29, false, false), (30, true, false), (30, false, true)] {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("catalog.sqlite");
+        let old = Catalog::open(&path, "boot", "old").unwrap();
+        old.register_bundle(&format!("sha256:{}", "1".repeat(64)), &format!("sha256:{}", "2".repeat(64))).unwrap();
+        old.db.execute_batch(
+            "INSERT INTO operations SELECT 'fork','fork_batch',executable_sha256,'deep','parent',bundle_digest,
+                1,'source','NEW','NONE',2 FROM runtime_bundles;
+             INSERT INTO executions(incarnation_id,route_id,instance_id,execution_epoch,bundle_digest,
+                host_boot_id,pid,pid_start_time,uid,phase,last_operation_id)
+                SELECT 'source','deep','parent',1,bundle_digest,'boot',123,1,1001,'exited','fork'
+                FROM runtime_bundles;
+             INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,
+                template,children,session,token,anchor,network_gate,original,stage)
+                VALUES('fork','source','serve','cut','{}','[]',1,'token','anchor',0,'RUNNING','children');",
+        ).unwrap();
+        if cow {
+            old.db.execute_batch(
+                "UPDATE managed_fork_batches SET selected_memory_fork_backend='kernel_cow';
+                 INSERT INTO kernel_mm_anchors(capture_id,operation_id,source_incarnation,source_epoch,
+                    source_session,host_boot_id,regions_json,layout_digest,helper_id,helper_pid,helper_start,
+                    executable_dev,executable_ino)
+                    VALUES('cut','fork','source',1,1,'boot','[]','layout','helper',124,1,1,1);",
+            ).unwrap();
+        } else {
+            old.db.execute_batch(
+                "DROP TABLE kernel_cow_imports;
+                 DROP TABLE kernel_statepoint_checkpoints;
+                 DROP TABLE kernel_mm_anchors;
+                 ALTER TABLE managed_fork_batches DROP COLUMN kernel_export_deadline;
+                 ALTER TABLE managed_fork_batches DROP COLUMN selected_memory_fork_backend;
+                 ALTER TABLE managed_fork_batches DROP COLUMN memory_fork_backend;",
+            ).unwrap();
+        }
+        if relay {
+            old.db.execute_batch("UPDATE managed_fork_batches SET credential_relay_hold='access-old'").unwrap();
+        } else {
+            old.db.execute_batch("ALTER TABLE managed_fork_batches DROP COLUMN credential_relay_hold").unwrap();
+        }
+        old.db.pragma_update(None, "user_version", version).unwrap();
+        drop(old);
+
+        for session in ["upgrade", "reopen"] {
+            let current = Catalog::open(&path, "boot", session).unwrap();
+            let journal: (String, Option<String>, i64) = current.db.query_row(
+                "SELECT selected_memory_fork_backend,credential_relay_hold,(SELECT count(*) FROM kernel_mm_anchors)
+                 FROM managed_fork_batches WHERE operation_id='fork' AND capture_id='cut'",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).unwrap();
+            assert_eq!(journal.0, if cow { "kernel_cow" } else { "native" });
+            assert_eq!(journal.1.as_deref(), relay.then_some("access-old"));
+            assert_eq!(journal.2, i64::from(cow));
+            assert_eq!(current.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 31);
+        }
+    }
+}
+
+#[test]
 fn boot_change_marks_volatile_resources_lost_and_preserves_intents() {
     let work = tempfile::tempdir().unwrap();
     let path = work.path().join("catalog.sqlite");

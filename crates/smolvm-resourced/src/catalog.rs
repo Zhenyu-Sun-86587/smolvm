@@ -13,6 +13,27 @@ const OP_COLUMNS: &str = "operation_id,kind,request_digest,route_id,instance_id,
     expected_execution_epoch,expected_incarnation_id,phase,decision,revision";
 const EXEC_COLUMNS: &str = "incarnation_id,route_id,instance_id,execution_epoch,bundle_digest,
     host_boot_id,pid,pid_start_time,uid,phase,last_operation_id";
+const ADD_FORK_RELAY_HOLD: &str =
+    "ALTER TABLE managed_fork_batches ADD COLUMN credential_relay_hold TEXT;";
+
+// Two pre-release version-30 catalogs exist. They committed either the
+// CoW journal or the relay hold column. Preserve each layout's data.
+fn migrate_capture_journal(tx: &Transaction<'_>) -> Result<()> {
+    let (cow, relay): (bool, bool) = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='kernel_mm_anchors'),
+                EXISTS(SELECT 1 FROM pragma_table_info('managed_fork_batches') WHERE name='credential_relay_hold')",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if !cow {
+        tx.execute_batch(include_str!("schema_kernel_mm_anchors.sql"))?;
+    }
+    if !relay {
+        tx.execute_batch(ADD_FORK_RELAY_HOLD)?;
+    }
+    tx.pragma_update(None, "user_version", 31)?;
+    Ok(())
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Operation {
@@ -293,10 +314,9 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_managed_retirements.sql"))?;
                 tx.execute_batch(include_str!("schema_network_recovery.sql"))?;
                 tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
-                tx.execute_batch(include_str!("schema_kernel_mm_anchors.sql"))?;
-                tx.execute_batch("PRAGMA user_version=30")?;
+                migrate_capture_journal(&tx)?;
             }
-            1..=30 => {
+            1..=31 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -384,9 +404,8 @@ impl Catalog {
                 if version < 29 {
                     tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
                 }
-                if version < 30 {
-                    tx.execute_batch(include_str!("schema_kernel_mm_anchors.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=30")?;
+                if version < 31 {
+                    migrate_capture_journal(&tx)?;
                 }
                 crate::packet_wake::recover(&tx)?;
                 crate::lifecycle_controller::recover(&tx)?;

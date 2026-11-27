@@ -724,6 +724,7 @@ mod tests {
                      ALTER TABLE managed_fork_batches DROP COLUMN memory_fork_backend;
                      ALTER TABLE managed_fork_batches DROP COLUMN selected_memory_fork_backend;
                      ALTER TABLE managed_fork_batches DROP COLUMN kernel_export_deadline;
+                     ALTER TABLE managed_fork_batches DROP COLUMN credential_relay_hold;
                      DROP TABLE product_machine_volumes; DROP TABLE network_kernel_receipts; PRAGMA user_version=27;"
                 ).unwrap();
             }
