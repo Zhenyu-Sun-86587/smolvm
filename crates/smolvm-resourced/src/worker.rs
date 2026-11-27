@@ -294,6 +294,22 @@ pub(crate) fn process_fd(pid: i32) -> io::Result<OwnedFd> {
     }
 }
 
+pub(crate) fn recorded_process_exited(pid: i32, start: i64) -> io::Result<bool> {
+    // The original process may have exited before the replacement broker
+    // obtained its pidfd. A reused PID or a zombie cannot retain ownership.
+    let pidfd = match process_fd(pid) {
+        Ok(fd) => fd,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    match pid_start(pid) {
+        Ok(observed) if observed == start => pid_exited(&pidfd),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 struct MeasuredExecutable {
     file: File,
     digest: String,
@@ -1193,6 +1209,7 @@ impl Worker {
                     bundle
                 )?))
             }
+            "CheckManagedLaunch" => self.check_managed_launch(request),
             "QueryInstanceBinding" => self.catalog.query_binding(request),
             "BindNativeControl" => {
                 let binding: crate::native_control::Binding = request.payload()?;
@@ -1306,6 +1323,7 @@ impl Worker {
                 .prepare(&self.catalog, request)
                 .map(|lease| json!(lease)),
             "PrepareManagedLaunchNetwork" => {
+                self.catalog.ready()?;
                 let op = self.catalog.active_operation(request)?;
                 let plan = crate::managed::plan(&self.catalog, &op)?
                     .ok_or_else(|| Fault::invalid("managed launch intent is required"))?;
@@ -1525,6 +1543,23 @@ impl Worker {
         }
     }
 
+    fn check_managed_launch(&self, r: &Request) -> Result<Value> {
+        let (_, _, expected) = r.scope()?;
+        let op = self.catalog.matching_operation(r)?;
+        self.catalog.verify_launch(&op, expected)?;
+        let plan = crate::managed::plan(&self.catalog, &op)?
+            .ok_or_else(|| Fault::invalid("missing managed launch intent"))?;
+        if crate::managed::live_claim(&self.catalog, &op.operation_id)?.is_some() {
+            return Ok(json!({"claimed": true}));
+        }
+        if let Some(restore) = plan.restore.as_ref()
+            .filter(|restore| plan.machine.kernel_cow() && restore.durable.is_none())
+        {
+            crate::kernel_mm_anchor::require_pinned(&self.catalog, &restore.batch_id, &restore.capture_id)?;
+        }
+        Ok(json!({"claimed": false}))
+    }
+
     fn issue_permit(&mut self, r: &Request) -> Result<Value> {
         let (_, bundle, expected) = r.scope()?;
         let op = self.catalog.matching_operation(r)?;
@@ -1533,7 +1568,8 @@ impl Worker {
         }
         self.catalog.verify_launch(&op, expected)?;
         let target: Target = r.payload()?;
-        self.permits.retain(|_, p| p.expires > Instant::now());
+        let now = Instant::now();
+        self.permits.retain(|_, p| p.expires > now && !pid_exited(&p.pidfd).unwrap_or(false));
         if let Some((credential, prior)) = self
             .permits
             .iter()
@@ -1805,21 +1841,7 @@ impl Worker {
         if let Some(pidfd) = self.executions.get(&execution.incarnation_id) {
             return pid_exited(pidfd).map_err(broker_error);
         }
-        // The restarted Worker may have missed the exit before it could
-        // reconnect. A pidfd also observes a zombie with the same start time.
-        let pidfd = match process_fd(execution.pid) {
-            Ok(fd) => fd,
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(true),
-            Err(error) => return Err(broker_error(error)),
-        };
-        if pid_exited(&pidfd).map_err(broker_error)? {
-            return Ok(true);
-        }
-        match pid_start(execution.pid) {
-            Ok(start) => Ok(start != execution.pid_start_time),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-            Err(error) => Err(broker_error(error)),
-        }
+        recorded_process_exited(execution.pid, execution.pid_start_time).map_err(broker_error)
     }
 
     fn finalize_scoped_execution(&mut self, execution: Execution) -> Result<Value> {
@@ -2645,6 +2667,12 @@ fn serve(
     let mut next_stop_check = Instant::now() + Duration::from_secs(1);
     loop {
         if Instant::now() >= next_stop_check {
+            if let Err(error) = worker.reconcile_capture_source_exits() {
+                eprintln!("resourced capture source recovery: {error}");
+            }
+            if let Err(error) = crate::kernel_mm_anchor::reconcile(&worker.catalog) {
+                eprintln!("resourced Kernel CoW anchor recovery: {error}");
+            }
             if let Err(error) = worker.recover_live_descriptors() {
                 eprintln!("resourced native recovery: {error}");
             }
@@ -2659,12 +2687,6 @@ fn serve(
             }
             if let Err(e)=worker.lifecycle.tick(&mut worker.catalog,&worker.boot) {
                 eprintln!("resourced lifecycle controller: {} {}",e.code,e.message);
-            }
-            if let Err(error) = worker.reconcile_capture_source_exits() {
-                eprintln!("resourced capture source recovery: {error}");
-            }
-            if let Err(error) = crate::kernel_mm_anchor::reconcile(&worker.catalog) {
-                eprintln!("resourced Kernel CoW anchor recovery: {error}");
             }
             worker
                 .forks

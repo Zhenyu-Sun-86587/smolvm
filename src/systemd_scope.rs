@@ -581,6 +581,45 @@ pub(crate) fn verify_boot_scope(scope: &str) -> Result<()> {
 /// the bus call failed); the caller should fall back to plain cgroup placement
 /// rather than failing the launch.
 pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<()> {
+    adopt_scope(machine_id, pid, caps, false)
+}
+
+#[cfg(feature = "deep-runtime")]
+pub(crate) fn adopt_managed_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<()> {
+    adopt_scope(machine_id, pid, caps, true)
+}
+
+#[cfg(feature = "deep-runtime")]
+pub(crate) fn wait_for_managed_adoption(
+    machine_id: &str,
+    child: &mut std::process::Child,
+) -> Result<()> {
+    let scope = scope_name(machine_id);
+    let wanted = format!("0::/{}/{scope}", vm_slice()?);
+    let groups = format!("/proc/{}/cgroup", child.id());
+    let deadline = Instant::now() + BUSCTL_TIMEOUT;
+    loop {
+        // The unreaped Child also prevents PID reuse until after this check.
+        if child.try_wait()?.is_some() {
+            return Err(Error::agent(
+                "VM scope",
+                "managed launch process exited before scope adoption",
+            ));
+        }
+        if std::fs::read_to_string(&groups)?.lines().any(|line| line == wanted) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::agent(
+                "VM scope",
+                "managed launch process did not enter its exact scope",
+            ));
+        }
+        std::thread::sleep(BUSCTL_POLL_INTERVAL);
+    }
+}
+
+fn adopt_scope(machine_id: &str, pid: i32, caps: &ScopeCaps, managed: bool) -> Result<()> {
     #[cfg(feature = "deep-runtime")]
     crate::deep_state::require_instance()?;
     let busctl = busctl_path()
@@ -591,15 +630,25 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
     cmd.args(&args);
     let mut out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
     if !out.status.success() && scope_start_collided(&out.stderr) {
-        // A previous VM of this name left its scope loaded in the `failed` state
-        // (it was SIGKILLed by `kill_scope`, or ran out of resources). systemd
-        // never garbage-collects failed units on its own, so every later start
-        // of this machine would collide forever. ResetFailedUnit only unloads a
-        // unit that is failed, so it cannot disturb a live VM's scope.
-        reset_failed_scope(&busctl, &name)?;
-        let mut cmd = Command::new(&busctl);
-        cmd.args(&args);
-        out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+        // Failed and empty active units can both outlast their original VM.
+        #[cfg(feature = "deep-runtime")]
+        let retry = if managed {
+            stop_empty_managed_scope(machine_id)?
+        } else {
+            reset_failed_scope(&busctl, &name)?;
+            true
+        };
+        #[cfg(not(feature = "deep-runtime"))]
+        let retry = {
+            debug_assert!(!managed);
+            reset_failed_scope(&busctl, &name)?;
+            true
+        };
+        if retry {
+            let mut cmd = Command::new(&busctl);
+            cmd.args(&args);
+            out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+        }
     }
     if !out.status.success() {
         return Err(Error::agent(
@@ -807,11 +856,14 @@ pub fn set_scope_cpu_quota(machine_id: &str, usec_per_sec: u64) -> Result<()> {
 pub fn stop_scope(machine_id: &str) -> Result<()> {
     #[cfg(feature = "deep-runtime")]
     crate::deep_state::require_instance()?;
+    stop_named_scope(&scope_name(machine_id), "replace")
+}
+
+fn stop_named_scope(name: &str, mode: &str) -> Result<()> {
     let busctl = busctl_path()
         .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot stop scope"))?;
-    let name = scope_name(machine_id);
     let mut cmd = Command::new(&busctl);
-    cmd.args(scope_stop_args(&name));
+    cmd.args(scope_stop_args(name, mode));
     let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
     if out.status.success() || scope_already_gone(&out.stderr) {
         tracing::info!(scope = %name, "stopped VM scope left by a failed launch");
@@ -826,7 +878,7 @@ pub fn stop_scope(machine_id: &str) -> Result<()> {
     ))
 }
 
-fn scope_stop_args(name: &str) -> Vec<String> {
+fn scope_stop_args(name: &str, mode: &str) -> Vec<String> {
     // StopUnit(name: s, mode: s).
     [
         "call",
@@ -836,11 +888,72 @@ fn scope_stop_args(name: &str) -> Vec<String> {
         "StopUnit",
         "ss",
         name,
-        "replace",
+        mode,
     ]
     .into_iter()
     .map(str::to_string)
     .collect()
+}
+
+#[cfg(feature = "deep-runtime")]
+fn managed_scope_matches(properties: &str, machine: &str, name: &str, slice: &str) -> bool {
+    let property = |key| {
+        properties.lines().find_map(|line| {
+            let (field, value) = line.split_once('=')?;
+            (field == key).then_some(value)
+        })
+    };
+    let cgroup = format!("/{slice}/{name}");
+    property("Id") == Some(name)
+        && property("LoadState") == Some("loaded")
+        && property("Transient") == Some("yes")
+        && property("Slice") == Some(slice)
+        && property("Description") == Some(format!("smolvm VM {machine}").as_str())
+        && matches!(property("ActiveState"), Some("active" | "inactive" | "failed"))
+        && matches!(property("Job"), None | Some("" | "0"))
+        && property("ControlGroup").is_some_and(|path| path.is_empty() || path == cgroup)
+}
+
+/// Repair an empty transient scope while the caller holds the launch lock.
+#[cfg(feature = "deep-runtime")]
+pub(crate) fn stop_empty_managed_scope(machine_id: &str) -> Result<bool> {
+    crate::deep_state::require_instance()?;
+    let slice = vm_slice()?;
+    let name = scope_name(machine_id);
+    let mut cmd = Command::new("systemctl");
+    cmd.args([
+        "show",
+        "--all",
+        "--property=Id,LoadState,Transient,Slice,Description,ActiveState,Job,ControlGroup",
+        &name,
+    ]);
+    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    if !out.status.success()
+        || !managed_scope_matches(&String::from_utf8_lossy(&out.stdout), machine_id, &name, slice)
+    {
+        return Ok(false);
+    }
+    let root = Path::new("/sys/fs/cgroup");
+    if !root.join("cgroup.controllers").is_file() {
+        return Ok(false);
+    }
+    let cgroup = root.join(slice).join(&name);
+    let empty = match std::fs::read_to_string(cgroup.join("cgroup.events")) {
+        Ok(events) => events.lines().any(|line| line == "populated 0"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::symlink_metadata(&cgroup).is_err_and(|error| {
+                error.kind() == std::io::ErrorKind::NotFound
+            })
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !empty {
+        return Ok(false);
+    }
+    // A racing job must leave the existing unit alone. StopUnit is asynchronous;
+    // the next dispatch can retry if the empty scope is still unloading.
+    stop_named_scope(&name, "fail")?;
+    Ok(true)
 }
 
 /// Whether a unit call failed only because the unit no longer exists.
@@ -1201,13 +1314,32 @@ mod tests {
     #[test]
     fn scope_stop_targets_only_the_named_unit() {
         assert_eq!(
-            scope_stop_args("smolvm-vm-m.scope")[4..],
+            scope_stop_args("smolvm-vm-m.scope", "replace")[4..],
             ["StopUnit", "ss", "smolvm-vm-m.scope", "replace"]
         );
         assert!(scope_already_gone(
             b"Call failed: Unit smolvm-vm-m.scope not loaded."
         ));
         assert!(!scope_already_gone(b"Call failed: Access denied"));
+    }
+
+    #[cfg(feature = "deep-runtime")]
+    #[test]
+    fn managed_scope_repair_requires_exact_unit_and_no_pending_job() {
+        let scope = "smolvmdeep-vm-test.scope";
+        let slice = "smolvmdeep.slice";
+        let properties = format!("Id={scope}\nLoadState=loaded\nTransient=yes\nSlice={slice}\n\
+            Description=smolvm VM child\nActiveState=active\nJob=0\nControlGroup=/{slice}/{scope}\n");
+        assert!(managed_scope_matches(&properties, "child", scope, slice));
+        for (field, unexpected) in [
+            ("Transient=yes", "Transient=no"),
+            ("Job=0", "Job=10"),
+            ("ActiveState=active", "ActiveState=activating"),
+            ("Description=smolvm VM child", "Description=smolvm VM sibling"),
+            ("ControlGroup=/smolvmdeep.slice", "ControlGroup=/another.slice"),
+        ] {
+            assert!(!managed_scope_matches(&properties.replace(field, unexpected), "child", scope, slice));
+        }
     }
 
     /// A process that exits before systemd moves it leaves an empty scope

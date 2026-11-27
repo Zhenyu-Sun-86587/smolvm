@@ -162,6 +162,19 @@ impl Client<'_> {
         )?;
         Ok(permit.launch_permit)
     }
+    pub fn managed_launch_claimed(&self, launch: &Launch) -> Result<bool, QueryError> {
+        #[derive(Deserialize)]
+        struct Claim {
+            claimed: bool,
+        }
+        let claim: Claim = self.call(
+            "CheckManagedLaunch",
+            Some(&launch.execution),
+            Some((&launch.operation_id, &launch.request_digest)),
+            empty(),
+        )?;
+        Ok(claim.claimed)
+    }
     pub fn register(&self, launch: &Launch, permit: &str) -> Result<(), QueryError> {
         let r: Value = self.call(
             "RegisterExecution",
