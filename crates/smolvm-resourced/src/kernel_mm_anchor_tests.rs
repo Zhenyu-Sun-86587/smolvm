@@ -189,7 +189,8 @@ fn recovery_settles_the_original_lost_cut_across_boot_without_launching() {
     assert_eq!(catalog.complete_recovery("second").unwrap()["state"], "ready");
     assert!(helper.0.try_wait().unwrap().is_none(), "must not signal an earlier boot's PID");
     crate::managed_fork::Actor::default()
-        .tick(&mut catalog, &mut crate::escrow::Escrow::default(), "boot-b").unwrap();
+        .tick(&mut catalog, &fs::File::open(tmp.path()).unwrap(), &mut crate::escrow::Escrow::default(), "boot-b")
+        .unwrap();
     assert_eq!(catalog.resource("cut").unwrap()["state"], "lost");
     let operation = catalog.operation("op").unwrap();
     let receipt = operation.fork.unwrap();
