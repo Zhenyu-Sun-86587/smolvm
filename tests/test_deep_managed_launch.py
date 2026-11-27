@@ -122,11 +122,18 @@ def durable_points(endpoint, source, name, logfile):
     print("A separate restore from the original checkpoint reproduced the RAM and two-disk boundary in another logical instance.",flush=True)
 
 
-def partial_fork(endpoint, root, ref):
+def fork_parameters(names, backend):
+    parameters = {"children": names}
+    if backend is not None:
+        parameters["memory_fork_backend"] = backend
+    return parameters
+
+
+def partial_fork(endpoint, root, ref, backend=None):
     import threading
     names=["partial-keep","partial-retry"]
     key="partial-batch"
-    req=dict(kind="fork_batch",operation_id=key,request_digest=digest(key.encode()),expected=ref,parameters={"children":names})
+    req=dict(kind="fork_batch",operation_id=key,request_digest=digest(key.encode()),expected=ref,parameters=fork_parameters(names, backend))
     killed=threading.Event()
     def interrupt_unpublished():
         dbfile=root/"catalog/catalog.sqlite"
@@ -167,7 +174,7 @@ def partial_fork(endpoint, root, ref):
 
 def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint, fork_faults, lifecycle=False, *,
            observer=None, stage_bundle=True, worker_binary=None, check_launch_rejections=True, guest_files=(),
-           guest_vcpus=2):
+           guest_vcpus=2, memory_fork_backend=None):
     for name in ("var-lib", "home", "ipc", "root-tree", "local-run"):
         (root / name).mkdir(mode=0o755)
     subprocess.run(["mount", "--bind", root / "var-lib", "/var/lib"], check=True)
@@ -274,6 +281,8 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
                 assert observation["attachments"][0]["state"] == "reserved", observation
                 wanted_heads[volume] = observation["head_resource_id"]
         parameters = dict(name=name,boot_profile="oci-v1",cpus=guest_vcpus,memory_mib=512,disks=disks,init="/counter",args=[])
+        if memory_fork_backend in ("auto", "kernel_cow"):
+            parameters["memory_fork_profile"] = "kernel_cow_anon_v1"
         if system_image:parameters.update(boot_profile="system-debian-v1",init="/sbin/init",args=["--unit=multi-user.target","--log-target=console"])
         submit = dict(operation_id="launch-managed", request_digest=digest(json.dumps(parameters).encode()),
                       expected={k: before[k] for k in ("instance_id","incarnation_id","execution_epoch")},kind="launch",parameters=parameters)
@@ -382,7 +391,7 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
         assert rpc(worker,"QueryWorkerBudget")["allocated"]["vcpus"]==guest_vcpus
         if fork:
             names=["alpha-branch","beta-branch"]
-            call=dict(operation_id="fork-counter-batch",request_digest=digest(b"counter-batch"),expected=ref,kind="fork_batch",parameters={"children":names})
+            call=dict(operation_id="fork-counter-batch",request_digest=digest(b"counter-batch"),expected=ref,kind="fork_batch",parameters=fork_parameters(names, memory_fork_backend))
             batch=http(endpoint,EXT+"/operations",call)
             assert batch["phase"]=="NEW" and len(batch["fork"]["children"])==2
             capture=batch["fork"]["capture_id"]
@@ -397,6 +406,12 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
             try:finished=until(forked,150)
             except TimeoutError:raise AssertionError(latest)
             assert finished["fork"]["source_released"] and all(ch["phase"]=="COMPLETED" for ch in finished["fork"]["children"]),finished
+            if memory_fork_backend is not None:
+                receipt = finished["fork"]
+                expected = "kernel_cow" if memory_fork_backend == "auto" else memory_fork_backend
+                assert receipt["requested_memory_fork_backend"] == memory_fork_backend, receipt
+                assert receipt["selected_memory_fork_backend"] == expected, receipt
+                assert receipt["memory_fork_profile"] == parameters.get("memory_fork_profile", "native"), receipt
             assert http(endpoint,EXT+"/operations",call)==finished
             source_ticks=[line.split() for line in guest_log().splitlines() if line.startswith("PARKED_BLOCK_TICK")]
             boundary=None
@@ -442,7 +457,7 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
             native("standby",first_ref,"standby-branch-a",{"mode":"managed"})
             child_inv=f"{EXT}/instances/{first_ref['instance_id']}/inventory"
             assert http(endpoint,child_inv)["inventory"]["source_disposition"]=="STANDBY"
-            descendant=native("independent_fork",first_ref,"fork-after-parent-exit",{"children":["grandchild"]})["fork"]
+            descendant=native("independent_fork",first_ref,"fork-after-parent-exit",fork_parameters(["grandchild"], memory_fork_backend))["fork"]
             assert descendant["original_source_disposition"]=="STANDBY" and descendant["source_released"]
             assert http(endpoint,child_inv)["inventory"]["source_disposition"]=="STANDBY"
             grandchild,=descendant["children"]
@@ -465,7 +480,7 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
             if fork_faults or statepoint:
                 grand_ref=http(endpoint,f"{EXT}/machines/grandchild/execution")
                 if fork_faults:
-                    partial_fork(endpoint,root,grand_ref)
+                    partial_fork(endpoint,root,grand_ref,memory_fork_backend)
                     if statepoint:fence_machine("partial-keep")
                 if statepoint:durable_points(endpoint,grand_ref,"grandchild",logfile)
             return
@@ -533,20 +548,28 @@ def main():
     parser.add_argument("--lifecycle",action="store_true",help="verify Worker idle policy, leases, two-stage sleep and coalesced wake")
     parser.add_argument("--statepoint",action="store_true",help="checkpoint the guest and hibernate from managed standby")
     parser.add_argument("--fork-faults",action="store_true",help="kill one unpublished target and retry it from the original capture")
+    parser.add_argument("--memory-fork-backend", choices=("native", "auto", "kernel_cow"),
+                        help="exercise this fork backend; auto and kernel_cow launch on the fixed anonymous RAM profile")
     args=parser.parse_args()
+    if args.memory_fork_backend:
+        args.fork = True
     if args.fork_faults: args.fork=True
     if os.geteuid()!=0:parser.error("requires root, KVM and systemd")
     if not os.environ.get("SMOLVM_MANAGED_TEST_ISOLATED"):
         args_for_child=["unshare","--mount","--propagation","private","--net","--",sys.executable,__file__,"--bundle",str(args.bundle.resolve())]
         for flag,path in (("--guest",args.guest),("--system-image",args.system_image)):
             if path:args_for_child.extend([flag,str(path.resolve())])
+        if args.memory_fork_backend:
+            args_for_child.extend(["--memory-fork-backend", args.memory_fork_backend])
         for flag,enabled in (("--lifecycle",args.lifecycle),("--fork",args.fork),("--product-volumes",args.product_volumes),("--statepoint",args.statepoint),("--fork-faults",args.fork_faults)):
             if enabled:args_for_child.append(flag)
         os.execvpe("unshare",args_for_child,{**os.environ,"SMOLVM_MANAGED_TEST_ISOLATED":"1"})
     with tempfile.TemporaryDirectory(dir="/var/tmp",prefix="smm-") as tmp:
         root=Path(tmp)
         root.chmod(0o755)
-        try: verify(args.bundle.resolve(),root,args.guest,args.system_image,args.fork,args.product_volumes,args.statepoint,args.fork_faults,args.lifecycle)
+        try: verify(args.bundle.resolve(),root,args.guest,args.system_image,args.fork,args.product_volumes,args.statepoint,args.fork_faults,args.lifecycle,
+                    guest_vcpus=1 if args.memory_fork_backend else 2, memory_fork_backend=args.memory_fork_backend,
+                    stage_bundle=args.memory_fork_backend is None)
         except BaseException:
             for log in [root/"serve.log",root/"worker.log",*(root/"state/managed").glob("*.log")]:
                 if log.exists():print(f"{log.name}\n{log.read_text(errors='replace')[-7000:]}",file=sys.stderr)
