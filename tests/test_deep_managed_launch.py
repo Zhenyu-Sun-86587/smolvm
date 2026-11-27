@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import select
 import socket
 import struct
 import sqlite3
@@ -141,7 +142,10 @@ def terminate_pinned_anchor(catalog, capture_id):
     handle = os.pidfd_open(pid)
     try:
         assert int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]) == start
+        ended = select.poll()
+        ended.register(handle, select.POLLIN)
         signal.pidfd_send_signal(handle, signal.SIGKILL)
+        assert ended.poll(5000), "anchor did not exit"
     finally:
         os.close(handle)
 
