@@ -115,6 +115,13 @@ fn nonce() -> Result<String> {
     getrandom::fill(&mut bytes).map_err(|e| Fault::new("E_HOST_IO", e.to_string()))?;
     Ok(hex::encode(bytes))
 }
+fn standby_scope(c: &Catalog, incarnation: &str) -> Result<(u32, String, String)> {
+    c.db.query_row(
+        "SELECT n.session,n.token,n.anchor FROM native_standby s
+         JOIN native_transitions n USING(operation_id) WHERE s.incarnation_id=? AND n.mode='managed'",
+         [incarnation], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()?.ok_or_else(|| conflict("source requires managed standby"))
+}
 pub(crate) fn restore(c: &Catalog, child: &str) -> Result<Option<Restore>> {
     Ok(c.db.query_row("SELECT b.operation_id,b.capture_id,b.anchor,b.helper_digest,b.pivot_json IS NOT NULL FROM managed_fork_children ch JOIN managed_fork_batches b ON b.operation_id=ch.batch_id WHERE ch.operation_id=? AND b.source_released=1",[child],
         |r|Ok(Restore{batch_id:r.get(0)?,capture_id:r.get(1)?,anchor:r.get(2)?,helper_digest:r.get(3)?,source_pivot:r.get(4)?,durable:None})).optional()?)
@@ -271,8 +278,13 @@ pub(crate) fn submit(
     let (native, kernel, _) = memory_fork_backends(&inv, Some(&template.machine), bundle);
     let selected = requested.select(fork, native, kernel)?;
     let (session, token, anchor) = if inv.source_disposition == "STANDBY" {
-        c.db.query_row("SELECT n.session,n.token,n.anchor FROM native_standby s JOIN native_transitions n USING(operation_id) WHERE s.incarnation_id=? AND n.mode='managed'",[incarnation],
-            |r|Ok((r.get::<_,u32>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?.ok_or_else(||conflict("source requires managed standby"))?
+        let (standby_session, standby_token, anchor) = standby_scope(c, incarnation)?;
+        if selected == "kernel_cow" {
+            let last = inv.last_session.max(standby_session);
+            (crate::native_operations::next_session(c, incarnation, last)?, nonce()?, anchor)
+        } else {
+            (standby_session, standby_token, anchor)
+        }
     } else {
         (
             crate::native_operations::next_session(c, incarnation, inv.last_session)?,
@@ -861,10 +873,14 @@ impl Actor {
             }
             "holding" => {
                 let started = Instant::now();
-                let command = if j.kernel_cow {
-                    format!("CAPTURE_KERNEL_PREPARE {scope}")
-                } else {
+                let command = if !j.kernel_cow {
                     format!("CAPTURE_PREPARE {scope} parked")
+                } else if j.original == "STANDBY" {
+                    let (session, token, anchor) = standby_scope(c, &j.inc)?;
+                    j.check_anchor(&anchor)?;
+                    format!("CAPTURE_KERNEL_PREPARE {scope} {session} {token}")
+                } else {
+                    format!("CAPTURE_KERNEL_PREPARE {scope}")
                 };
                 let status = match ep.command(&command) {
                     Err(fault) if fault.code=="E_NATIVE_REFUSED" && (fault.message.starts_with("ENOTSUP") || fault.message.starts_with("EIO held capture:")) => {
@@ -1001,7 +1017,7 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
     )?;
     let base: Machine = serde_json::from_str(&template).map_err(invalid)?;
     let disks: BTreeMap<String, (String,String)> = serde_json::from_str(&disks).map_err(invalid)?;
-    let pending = {
+    let mut pending = {
         let mut q=c.db.prepare("SELECT ch.operation_id,ch.name,ch.instance_id,ch.prior_epoch FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.batch_id=? AND o.operation_id IS NULL AND ch.cancelled=0 AND ch.admission_error IS NULL ORDER BY ch.ordinal")?;
         let rows = q
             .query_map([&j.id], |r| {
@@ -1015,6 +1031,26 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
+    if j.kernel_cow && !pending.is_empty() {
+        if let Err(error) = crate::kernel_mm_anchor::acquire(c, &j.id, &j.resource) {
+            if error.code != "E_CAPTURE_LOST" {
+                return Err(error);
+            }
+            let tx = c.db.transaction()?;
+            tx.execute(
+                "UPDATE managed_fork_children AS ch SET admission_error='E_CAPTURE_LOST'
+                 WHERE batch_id=? AND cancelled=0 AND admission_error IS NULL
+                   AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.operation_id=ch.operation_id)",
+                [&j.id],
+            )?;
+            tx.execute(
+                "UPDATE managed_fork_batches SET error=? WHERE operation_id=?",
+                params![error.message, j.id],
+            )?;
+            tx.commit()?;
+            pending.clear();
+        }
+    }
     for (op, name, instance, epoch) in pending {
         let mut machine = base.clone();
         machine.name = name.clone();

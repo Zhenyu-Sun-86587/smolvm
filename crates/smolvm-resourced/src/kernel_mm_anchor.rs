@@ -425,6 +425,15 @@ fn mark_lost(c: &Catalog, record: &Record) -> Result<()> {
          AND owner_kind='kernel_anchor_export' AND state='active'",
         [&record.capture_id],
     )?;
+    if record.resource_state.is_some() {
+        // The batch cannot retry this cut. Each dispatched child keeps its
+        // own operation references until its separate launch resolves.
+        tx.execute(
+            "UPDATE root_refs SET state='dropped',revision=revision+1
+             WHERE owner_kind='fork_capture' AND owner_id=? AND state='active'",
+            [&record.operation_id],
+        )?;
+    }
     tx.commit()?;
     remove_socket(c, record)
 }
@@ -759,6 +768,8 @@ pub(crate) fn reconcile(c: &Catalog) -> Result<()> {
     // the helper after the deletion fence and confirms its actual exit.
     c.db.execute("UPDATE resources SET state='deleting',revision=revision+1
         WHERE state='available' AND EXISTS(SELECT 1 FROM kernel_mm_anchors a WHERE a.resource_id=resources.resource_id)
+         AND EXISTS(SELECT 1 FROM operations o WHERE o.operation_id=resources.created_by_operation
+           AND o.phase IN ('COMPLETED','ABORTED'))
          AND NOT EXISTS(SELECT 1 FROM root_refs p WHERE p.resource_id=resources.resource_id AND p.state='active')
          AND NOT EXISTS(SELECT 1 FROM resource_edges e WHERE e.child_resource_id=resources.resource_id)
          AND NOT EXISTS(SELECT 1 FROM fd_leases f WHERE f.resource_id=resources.resource_id AND f.state<>'released')
