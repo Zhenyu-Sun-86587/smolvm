@@ -99,6 +99,9 @@ pub(crate) fn memory_fork_inventory(c: &Catalog, execution: &Execution, inv: &In
     if !reason.is_empty() {
         observed["unavailable_reason"] = json!(reason);
     }
+    if kernel {
+        observed["kernel_cow_abi_digest"] = json!(crate::managed_kernel_cow::ABI_DIGEST);
+    }
     Ok(observed)
 }
 fn conflict(reason: impl ToString) -> Fault {
@@ -158,10 +161,14 @@ pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
         _ => "pending",
     };
     let profile = if selected == "kernel_cow" { PROFILE } else { "native" };
-    Ok(Some(json!({"stage":stage, "capture_id":capture, "original_source_disposition":original, "admission":admission,
+    let mut receipt = json!({"stage":stage, "capture_id":capture, "original_source_disposition":original, "admission":admission,
         "requested_memory_fork_backend":requested, "selected_memory_fork_backend":selected, "memory_fork_profile":profile,
         "source_released":released, "children":rows, "completed_count":successful,
-        "failed_count":failed, "outcome":outcome, "error":error})))
+        "failed_count":failed, "outcome":outcome, "error":error});
+    if selected == "kernel_cow" {
+        receipt["kernel_cow_abi_digest"] = json!(crate::managed_kernel_cow::ABI_DIGEST);
+    }
+    Ok(Some(receipt))
 }
 pub(crate) fn submit(
     c: &mut Catalog,
@@ -325,7 +332,9 @@ pub(crate) fn submit(
         storage_bytes: storage,
     };
     c.begin_with(r,kind,|tx|{
-        if !fork {
+        if !fork && selected == "kernel_cow" {
+            admission::require_kernel_capture_space(tx, capacity.memory_mib)?;
+        } else if !fork {
             admission::require_capture_space(tx, capacity.memory_mib)?;
         }
         if selected == "kernel_cow" {
@@ -395,9 +404,8 @@ pub(crate) fn retry(c: &mut Catalog, r: &Request, control: Control) -> Result<Op
         [id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let tx = c.db.unchecked_transaction()?;
     let failed = {
-        let mut stmt = tx.prepare("SELECT ch.ordinal,ch.attempt,ch.instance_id,b.execution_epoch,
+        let mut stmt = c.db.prepare("SELECT ch.ordinal,ch.attempt,ch.instance_id,b.execution_epoch,
             h.vcpus,h.memory_mib,h.storage_bytes
             FROM managed_fork_children ch JOIN operations o ON ch.operation_id=o.operation_id
             JOIN managed_budget_holds h ON h.operation_id=o.operation_id AND h.instance_id=ch.instance_id
@@ -415,6 +423,7 @@ pub(crate) fn retry(c: &mut Catalog, r: &Request, control: Control) -> Result<Op
     if selected == "kernel_cow" {
         crate::kernel_mm_anchor::acquire(c, id, &capture)?;
     }
+    let tx = c.db.transaction()?;
     for (ordinal, prior_attempt, instance, epoch, capacity) in failed {
         admission::reserve(&tx,id,&instance,capacity)?;
         let attempt=prior_attempt+1;
@@ -588,7 +597,7 @@ impl Job {
                 })
         };
         match result {
-            Err(error) if expired || matches!(error.code.as_str(),
+            Err(error) if expired || matches!(error.code,
                 "E_CAPTURE_LOST" | "E_KERNEL_ANCHOR_UNAVAILABLE" | "E_FENCE_UNPROVEN" | "E_INVALID_REQUEST" | "E_STATE_CONFLICT") =>
             {
                 c.db.execute(
@@ -628,7 +637,8 @@ impl Job {
 
 #[cfg(test)]
 mod backend_tests {
-    use super::MemoryForkBackend;
+    use super::{retry, Catalog, Control, MemoryForkBackend, Request};
+    use serde_json::json;
 
     #[test]
     fn requested_backend_is_chosen_before_capture() {
@@ -647,6 +657,52 @@ mod backend_tests {
         assert_eq!(auto.select(true, false, true).unwrap(), "kernel_cow");
         assert!(auto.select(true, false, false).is_err());
         assert_eq!(default.select(false, false, true).unwrap(), "kernel_cow");
+    }
+
+    #[test]
+    fn retry_records_original_anchor_loss_before_reserving_a_new_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::open(&dir.path().join("catalog.sqlite"), "boot", "session").unwrap();
+        let bundle = format!("sha256:{}", "3".repeat(64));
+        let digest = format!("sha256:{}", "1".repeat(64));
+        catalog.register_bundle(&bundle, &digest).unwrap();
+        catalog.db.execute_batch(
+            "INSERT INTO operations
+               SELECT 'batch','fork_batch',executable_sha256,'deep','source-vm',bundle_digest,
+                      1,'source-inc','COMPLETED','NONE',2 FROM runtime_bundles;
+             INSERT INTO operations
+               SELECT 'child-attempt','restore_target',executable_sha256,'deep','child-vm',bundle_digest,
+                      0,NULL,'ABORTED','ABORT',2 FROM runtime_bundles;
+             INSERT INTO executions(incarnation_id,route_id,instance_id,execution_epoch,bundle_digest,host_boot_id,
+                                    pid,pid_start_time,uid,phase,last_operation_id)
+               SELECT 'source-inc','deep','source-vm',1,bundle_digest,'boot',123,1,1001,'exited','batch'
+               FROM runtime_bundles;
+             INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,
+               session,token,anchor,network_gate,original,stage,source_released,memory_fork_backend,selected_memory_fork_backend)
+               VALUES('batch','source-inc','serve','cut','{}','[]',1,'hold','gate',0,'RUNNING','complete',1,'auto','kernel_cow');
+             INSERT INTO instance_bindings VALUES('deep','child-vm',0,NULL,NULL);
+             INSERT INTO managed_fork_children(batch_id,ordinal,name,instance_id,operation_id,prior_epoch)
+               VALUES('batch',0,'child','child-vm','child-attempt',0);
+             INSERT INTO managed_budget_holds(instance_id,operation_id,vcpus,memory_mib,storage_bytes,state)
+               VALUES('child-vm','child-attempt',1,64,1,'released');
+             INSERT INTO resources VALUES('cut','descriptor','available','volatile',1,'{}','sha256:ram','batch',1);
+             INSERT INTO root_refs VALUES('fork_capture','batch','cut','active',1,'batch');
+             INSERT INTO kernel_mm_anchors(capture_id,operation_id,source_incarnation,source_epoch,source_session,
+               host_boot_id,regions_json,layout_digest,helper_id,helper_pid,helper_start,executable_dev,executable_ino,resource_id)
+               VALUES('cut','batch','source-inc',1,1,'boot','[{\x22guest_start\x22:0,\x22size\x22:4096}]','layout',
+                      '1234567890abcdef1234567890abcdef',2147483647,1,1,1,'cut');"
+        ).unwrap();
+        let request: Request = serde_json::from_value(json!({
+            "protocol":"WorkerResource/1","method":"RetryManagedFork","request_id":"retry",
+            "route_id":"deep","operation_id":"batch","request_digest":digest,"bundle_digest":bundle,
+            "expected":{"instance_id":"source-vm","incarnation_id":"source-inc","execution_epoch":1},
+        })).unwrap();
+        let error = retry(&mut catalog, &request, Control { expected_revision: 2 }).unwrap_err();
+        assert_eq!(error.code, "E_CAPTURE_LOST");
+        assert_eq!(catalog.resource("cut").unwrap()["state"], "lost");
+        let operation = catalog.operation("batch").unwrap();
+        assert_eq!(operation.phase, "COMPLETED");
+        assert_eq!(operation.fork.unwrap()["children"][0]["attempt"], 0);
     }
 }
 
