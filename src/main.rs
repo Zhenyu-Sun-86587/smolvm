@@ -223,6 +223,16 @@ fn state_dir_from_args(
 }
 
 fn main() {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "deep-runtime"))]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("_worker-kernel-mm-anchor"))
+    {
+        if let Err(error) = smolvm_resourced::run_kernel_mm_anchor() {
+            eprintln!("smolvm kernel CoW anchor: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     cli::broken_pipe::install();
     cli::broken_pipe::run(run_cli);
 }

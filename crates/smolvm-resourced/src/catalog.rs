@@ -1064,9 +1064,12 @@ impl Catalog {
     }
 
     pub fn resource(&self, id: &str) -> Result<Value> {
-        self.db.query_row("SELECT r.resource_id,r.kind,CASE WHEN f.state='missing' THEN 'missing' ELSE r.state END,
+        self.db.query_row("SELECT r.resource_id,
+            CASE WHEN k.resource_id IS NOT NULL THEN 'kernel_mm_anchor' ELSE r.kind END,
+            CASE WHEN f.state='missing' THEN 'missing' ELSE r.state END,
             r.durability,r.immutable,r.descriptor_json,r.descriptor_digest,r.created_by_operation,r.revision,f.state
             FROM resources r LEFT JOIN fd_transfers f ON f.resource_id=r.resource_id AND f.state!='staging'
+            LEFT JOIN kernel_mm_anchors k ON k.resource_id=r.resource_id
             WHERE r.resource_id=?", [id], |r| {
             let descriptor: String = r.get(5)?;
             let parsed: Value = serde_json::from_str(&descriptor)
@@ -1133,6 +1136,7 @@ impl Catalog {
                 | "backup"
                 | "backup_import"
                 | "fork_capture"
+                | "kernel_anchor_export"
                 | "managed_execution"
                 | "product_snapshot"
                 | "product_attachment"

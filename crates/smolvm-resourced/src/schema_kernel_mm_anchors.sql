@@ -4,6 +4,7 @@ ALTER TABLE managed_fork_batches ADD COLUMN
 ALTER TABLE managed_fork_batches ADD COLUMN
     selected_memory_fork_backend TEXT NOT NULL DEFAULT 'native'
     CHECK (selected_memory_fork_backend IN ('native','kernel_cow'));
+ALTER TABLE managed_fork_batches ADD COLUMN kernel_export_deadline INTEGER;
 
 -- The resource graph owns pins and collection. This journal owns the
 -- process identity for the typed descriptor, including incomplete launches.
@@ -31,4 +32,11 @@ CREATE TABLE kernel_cow_imports (
     incarnation_id TEXT PRIMARY KEY REFERENCES executions(incarnation_id),
     capture_id TEXT NOT NULL REFERENCES kernel_mm_anchors(capture_id),
     proof_digest TEXT NOT NULL
+);
+
+-- Enough of the volatile cut to restart its durable export after the source
+-- has returned from the gate. Published StatePoints only keep durable chunks.
+CREATE TABLE kernel_statepoint_checkpoints (
+    capture_id TEXT PRIMARY KEY REFERENCES statepoints(capture_id),
+    checkpoint BLOB NOT NULL
 );

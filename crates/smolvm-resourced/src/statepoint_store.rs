@@ -1,7 +1,7 @@
 //! Durable representation of a parked point using the upstream chunk store.
 
 use crate::catalog::Execution;
-use crate::statepoint_capture::{Capture, Device, Export, MAX_CHECKPOINT_BYTES};
+use crate::statepoint_capture::{Capture, Device, Export, KernelCapture, MAX_CHECKPOINT_BYTES};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use smolvm_checkpoint::{Writer, format::PackManifest, store::{self, ChunkedFile}};
@@ -71,6 +71,40 @@ impl Point {
             devices: capture.devices.clone(),
             disk_generations,
         }
+    }
+
+    pub fn new_kernel(
+        source: &Execution,
+        export: &Export,
+        capture: &KernelCapture,
+        layout_digest: String,
+        disk_generations: Vec<String>,
+    ) -> Self {
+        Self {
+            schema: "StatePoint/1".into(),
+            capture_id: export.capture_id.clone(),
+            representation_id: export.representation_id.clone(),
+            incarnation_id: source.incarnation_id.clone(),
+            execution_epoch: source.execution_epoch,
+            source_ram_digest: layout_digest,
+            checkpoint_digest: digest(&capture.checkpoint),
+            checkpoint_bytes: capture.checkpoint.len() as u64,
+            capture_anchor: capture.anchor.clone(),
+            helper_digest: capture.helper_digest.clone(),
+            regions: capture.regions.iter().map(|region| Region {
+                gpa: region.guest_start,
+                length: region.size,
+            }).collect(),
+            devices: capture.devices.clone(),
+            disk_generations,
+        }
+    }
+
+    pub fn validate_checkpoint(&self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.len() as u64 != self.checkpoint_bytes || digest(bytes) != self.checkpoint_digest {
+            return Err(invalid("checkpoint bytes differ from StatePoint"));
+        }
+        Ok(())
     }
 
     pub fn memory_bytes(&self) -> io::Result<u64> {
@@ -188,7 +222,7 @@ impl Read for RamReader<'_> {
     }
 }
 
-pub(crate) fn write(
+pub(crate) fn write_native(
     directory: &Path,
     point: Point,
     required_bundle: String,
@@ -196,6 +230,27 @@ pub(crate) fn write(
     capture: Capture,
     disks: BTreeMap<String, File>,
 ) -> io::Result<Manifest> {
+    write(
+        directory,
+        point,
+        required_bundle,
+        commit_id,
+        &capture.checkpoint,
+        &mut RamReader::new(&capture),
+        disks,
+    )
+}
+
+pub(crate) fn write(
+    directory: &Path,
+    point: Point,
+    required_bundle: String,
+    commit_id: String,
+    checkpoint: &[u8],
+    ram: &mut impl Read,
+    disks: BTreeMap<String, File>,
+) -> io::Result<Manifest> {
+    point.validate_checkpoint(checkpoint)?;
     let staging = tempfile::Builder::new()
         .prefix(".statepoint-")
         .tempdir_in(directory)?;
@@ -204,13 +259,13 @@ pub(crate) fn write(
         CHECKPOINT,
         point.checkpoint_bytes,
         0o400,
-        &mut Cursor::new(&capture.checkpoint),
+        &mut Cursor::new(checkpoint),
     )?;
     let ram = writer.ingest(
         MEMORY,
         point.memory_bytes()?,
         0o400,
-        &mut RamReader::new(&capture),
+        ram,
     )?;
     // This internal chunk index has no bootable OCI payload. Native identity,
     // disk generations and the exact reader are in CaptureManifest below.
@@ -222,7 +277,6 @@ pub(crate) fn write(
     );
     writer.finish(staging.path(), index_manifest, vec![cpu, ram])?;
     drop(writer);
-    drop(capture);
     let manifest = Manifest {
         schema: "CaptureManifest/1".into(),
         closure_digest: digest(&serde_json::to_vec(&point)?),
@@ -342,10 +396,8 @@ pub(crate) fn materialize_in(
     (&mut checkpoint)
         .take(MAX_CHECKPOINT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != manifest.statepoint.checkpoint_bytes
-        || digest(&bytes) != manifest.statepoint.checkpoint_digest
-        || memory.metadata()?.len() != manifest.statepoint.memory_bytes()?
-    {
+    manifest.statepoint.validate_checkpoint(&bytes)?;
+    if memory.metadata()?.len() != manifest.statepoint.memory_bytes()? {
         return Err(invalid(
             "materialized checkpoint or RAM layout differs from StatePoint",
         ));
