@@ -1,5 +1,6 @@
 //! Native durable state publication and restore preparation on the Worker.
 
+use crate::blocks::{self, VerifiedBacking};
 use crate::catalog::{Catalog, Execution, Operation};
 use crate::escrow_catalog::LeaseRecord;
 use crate::ipc::{Fault, FdEntry, Request, Result, valid_id};
@@ -65,11 +66,12 @@ pub(crate) struct Prepared {
 }
 
 type Materialized = (String, File, File);
+type VerifiedRestore = (Materialized, Vec<VerifiedBacking>);
 
 pub(crate) struct StatePoints {
     directory: PathBuf,
     exports: HashMap<String, JoinHandle<io::Result<Manifest>>>,
-    restores: HashMap<String, JoinHandle<io::Result<Materialized>>>,
+    restores: HashMap<String, JoinHandle<io::Result<VerifiedRestore>>>,
     prepared: Option<(String, Materialized)>,
 }
 
@@ -86,6 +88,21 @@ fn limits() -> Fault {
 
 fn integrity(error: io::Error) -> Fault {
     Fault::new("E_STATEPOINT_CORRUPT", error.to_string())
+}
+
+pub(crate) fn terminal_backing_fault(error: &Fault) -> bool {
+    matches!(
+        error.code,
+        "E_BLOCK_BACKING_CHANGED" | "E_BLOCK_BACKING_MISSING" | "E_BACKING_IDENTITY_UNPROVEN"
+    )
+}
+
+fn statepoint_backing_fault(error: Fault) -> Fault {
+    if matches!(error.code, "E_BLOCK_BACKING_CHANGED" | "E_BLOCK_BACKING_MISSING" | "E_NOT_FOUND") {
+        Fault::new("E_STATEPOINT_CORRUPT", &error.message)
+    } else {
+        error
+    }
 }
 
 impl StatePoints {
@@ -160,7 +177,7 @@ impl StatePoints {
         }
         let capture = statepoint_capture::acquire(&endpoint, &export)?;
         let disks =
-            statepoint_capture::disk_roots(catalog, &operation, source, &export, &capture.devices)?;
+            statepoint_capture::disk_roots(catalog, objects, &operation, source, &export, &capture.devices)?;
         let opened = statepoint_capture::open_disks(catalog, objects, &disks)?;
         let point = Point::new(source, &export, &capture, disks);
         let record = match prior {
@@ -227,7 +244,7 @@ impl StatePoints {
                 return Err(Fault::new("E_STATE_CONFLICT", "observed StatePoint gate changed"));
             }
             let disks = statepoint_capture::disk_roots(
-                catalog, &operation, source, &export, &capture.devices,
+                catalog, objects, &operation, source, &export, &capture.devices,
             )?;
             let receipt = kernel_mm_anchor::register(
                 catalog,
@@ -435,19 +452,27 @@ impl StatePoints {
         } else {
             Vec::new()
         };
+        // Exact restore reattaches the existing writable successors. They are
+        // outside the captured disk digest, so a historical identity on a
+        // changed device cannot be checked using the immutable StatePoint.
+        for head in &exact_heads {
+            let layers = catalog.block_closure(&head.head_resource_id)?;
+            blocks::open_object(objects, &layers[0], true)?;
+        }
         let ready = json!({"phase":"prepared", "capture_id":input.capture_id, "manifest_digest":record.manifest_digest,
             "volume_restore_policy":input.volume_restore_policy.as_str(),"exact_heads":exact_heads});
         if let Some(job) = self.restores.get(&input.capture_id) {
             if !job.is_finished() {
                 return Ok(json!({"phase":"preparing", "capture_id":input.capture_id}));
             }
-            let materialized = self
+            let (materialized, proofs) = self
                 .restores
                 .remove(&input.capture_id)
                 .unwrap()
                 .join()
                 .map_err(|_| Fault::new("E_HOST_IO", "StatePoint materialization worker exited"))?
                 .map_err(integrity)?;
+            catalog.commit_verified_backings(&proofs).map_err(statepoint_backing_fault)?;
             self.prepared = Some((input.capture_id, materialized));
             return Ok(ready);
         }
@@ -460,8 +485,9 @@ impl StatePoints {
             return Err(limits());
         }
         let directory = self.directory.clone();
-        let disks =
-            statepoint_capture::open_disks(catalog, objects, &record.point.disk_generations)?;
+        let (disks, proofs) = statepoint_capture::open_restore_disks(
+            catalog, objects, &record.point.disk_generations,
+        ).map_err(statepoint_backing_fault)?;
         let job = thread::Builder::new()
             .name("statepoint-restore".into())
             .spawn(move || {
@@ -480,7 +506,7 @@ impl StatePoints {
                 }
                 let (checkpoint, ram) =
                     statepoint_store::materialize(&directory, &manifest, disks)?;
-                Ok((digest, checkpoint, ram))
+                Ok(((digest, checkpoint, ram), proofs))
             })
             .map_err(host_io)?;
         self.restores.insert(input.capture_id.clone(), job);

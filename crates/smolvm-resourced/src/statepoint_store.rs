@@ -439,3 +439,111 @@ pub(crate) fn collect(directory: &Path, resource: &str) -> io::Result<()> {
     store::prune_in_batches(&directory.join(".chunks"), 128)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{backing_identity, blocks, catalog::Catalog};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn historical_layer_requires_the_committed_bytes_before_adopting_its_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = File::open(temp.path()).unwrap();
+        fs::create_dir(temp.path().join("disk")).unwrap();
+        let data = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(temp.path().join("disk/data"))
+            .unwrap();
+        data.set_len(512).unwrap();
+        data.set_permissions(fs::Permissions::from_mode(0o400)).unwrap();
+        let (dev, ino) = backing_identity::live(&data).unwrap();
+        let durable = backing_identity::durable(&data).unwrap();
+        let recorded_dev = if durable.is_some() { dev ^ 1 } else { dev };
+        let mut object = blocks::BlockObject {
+            spec: blocks::BlockSpec {
+                resource_id: "disk".into(),
+                capacity_bytes: 512,
+                volume_id: Some("volume".into()),
+                backing_id: None,
+                content_sha256: None,
+                sealed: true,
+            },
+            format: "raw".into(),
+            backing_identity: format!("inode:{recorded_dev}:{ino}"),
+            verified_identity: None,
+        };
+        let checkpoint = b"checkpoint";
+        let point = Point {
+            schema: "StatePoint/1".into(),
+            capture_id: "point".into(),
+            representation_id: "artifact".into(),
+            incarnation_id: "source".into(),
+            execution_epoch: 1,
+            source_ram_digest: digest(b"ram-layout"),
+            checkpoint_digest: digest(checkpoint),
+            checkpoint_bytes: checkpoint.len() as u64,
+            capture_anchor: "anchor".into(),
+            helper_digest: digest(b"helper"),
+            regions: vec![Region { gpa: 0, length: 4096 }],
+            devices: Vec::new(),
+            disk_generations: vec!["disk".into()],
+        };
+        let disk = |file| BTreeMap::from([("disk".to_string(), file)]);
+        let manifest = write(
+            temp.path(),
+            point.clone(),
+            digest(b"bundle"),
+            "commit".into(),
+            checkpoint,
+            &mut io::repeat(0),
+            disk(data.try_clone().unwrap()),
+        ).unwrap();
+        let committed = manifest.digest().unwrap();
+        let manifest = read(temp.path(), &point, &digest(b"bundle"), "commit").unwrap();
+        assert_eq!(committed, manifest.digest().unwrap());
+        let (file, proof) = blocks::open_for_statepoint_verification(&root, &object).unwrap();
+        assert_eq!(proof.is_some(), durable.is_some());
+        data.write_all_at(b"changed", 0).unwrap();
+        assert_eq!(
+            materialize(temp.path(), &manifest, disk(file)).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        data.write_all_at(b"\0\0\0\0\0\0\0", 0).unwrap();
+        let (file, _) = blocks::open_for_statepoint_verification(&root, &object).unwrap();
+        materialize(temp.path(), &manifest, disk(file)).unwrap();
+
+        if let Some(proof) = proof {
+            use rusqlite::{params, Connection};
+            let catalog = Catalog { db: Connection::open_in_memory().unwrap() };
+            catalog.db.execute_batch(
+                "CREATE TABLE managed_blocks(resource_id TEXT PRIMARY KEY, backing_identity TEXT);
+                 CREATE TABLE resources(resource_id TEXT PRIMARY KEY, immutable INTEGER, state TEXT);"
+            ).unwrap();
+            catalog.db.execute_batch(include_str!("schema_backing_identities.sql")).unwrap();
+            catalog.db.execute(
+                "INSERT INTO managed_blocks VALUES (?,?)",
+                params![proof.resource_id, proof.legacy_identity],
+            ).unwrap();
+            catalog.db.execute(
+                "INSERT INTO resources VALUES (?,1,'available')", [&proof.resource_id],
+            ).unwrap();
+            let wire = serde_json::to_vec(&object).unwrap();
+            assert_eq!(
+                blocks::open_object(&root, &object, false).unwrap_err().code,
+                "E_BACKING_IDENTITY_UNPROVEN"
+            );
+            catalog.commit_verified_backings(&[proof]).unwrap();
+            object.verified_identity = catalog.db.query_row(
+                "SELECT durable_identity FROM verified_block_backings WHERE resource_id='disk'",
+                [],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(wire, serde_json::to_vec(&object).unwrap());
+            blocks::open_object(&root, &object, false).unwrap();
+        }
+        assert_eq!(committed, manifest.digest().unwrap());
+    }
+}

@@ -1087,8 +1087,9 @@ impl Worker {
                     "capture_id":restore.capture_id,"volume_restore_policy":durable.mode
                 }));
                 match self.statepoints.prepare_restore(&self.catalog, &self.objects, &prepare) {
-                    Err(error) if matches!(error.code, "E_STATEPOINT_CORRUPT" | "E_VOLUME_GENERATION_MISMATCH"
-                        | "E_RESOURCE_UNAVAILABLE" | "E_BUNDLE_UNAVAILABLE" | "E_FENCE_UNPROVEN") => {
+                    Err(error) if crate::statepoints::terminal_backing_fault(&error)
+                        || matches!(error.code, "E_STATEPOINT_CORRUPT" | "E_VOLUME_GENERATION_MISMATCH"
+                            | "E_RESOURCE_UNAVAILABLE" | "E_BUNDLE_UNAVAILABLE" | "E_FENCE_UNPROVEN") => {
                         crate::managed_state_restore::fail(&self.catalog, &op.operation_id, &error)?;
                         self.catalog.finish(request, true, op.revision)?;
                         Ok(json!({"phase":"aborted"}))
@@ -2298,16 +2299,26 @@ impl Worker {
             crate::product_volumes::require_writer(&self.catalog, &head.volume_id, &execution)?;
             self.catalog.require_unsealed_head(&head.head_resource_id)?;
             let wanted = self.catalog.volume_identity(&head)?;
-            let (file, identity) = self.open_backing(&head.head_resource_id)?;
-            if identity != wanted {
-                return Err(Fault::new(
-                    "E_STALE_REVISION",
-                    "volume backing identity changed",
-                ));
-            }
-            ofd_lock(&file)?;
+            let file = if self.catalog.has_managed_block(&head.head_resource_id)? {
+                let layers = self.catalog.block_closure(&head.head_resource_id)?;
+                if layers[0].spec.volume_id.as_deref() != Some(&head.volume_id)
+                    || layers[0].backing_identity != wanted
+                {
+                    return Err(fence_unproven("volume reservation does not match the managed head"));
+                }
+                crate::blocks::lock_writer(&self.objects, &layers[0])?
+            } else {
+                // Preserve registered aliases of unmanaged files. They can
+                // reserve an OFD but cannot obtain a managed WriterSet grant.
+                let (file, identity) = self.open_backing(&head.head_resource_id)?;
+                if identity != wanted {
+                    return Err(Fault::new("E_STALE_REVISION", "volume backing identity changed"));
+                }
+                ofd_lock(&file)?;
+                file
+            };
             locks.push(file);
-            registered.push((head, identity));
+            registered.push((head, wanted));
         }
         self.catalog.reserve_writers(&op, &execution, &registered)?;
         self.reserved.insert(op.operation_id.clone(), locks);
@@ -2347,14 +2358,13 @@ impl Worker {
                         error
                     }
                 })?;
-            if layers[0].spec.volume_id.as_ref() != Some(&head.volume_id)
-                || crate::blocks::backing_identity(lock).map_err(broker_error)?
-                    != layers[0].backing_identity
-            {
+            if layers[0].spec.volume_id.as_ref() != Some(&head.volume_id) {
                 return Err(fence_unproven(
                     "writer reservation does not match the managed head",
                 ));
             }
+            let expected = crate::blocks::open_object(&self.objects, &layers[0], true)?;
+            prove_live_ofd(&expected, lock)?;
             for (index, layer) in layers.iter().enumerate() {
                 if !provided.insert(layer.spec.resource_id.clone()) {
                     if index == 0 {
@@ -2668,7 +2678,7 @@ fn serve(
             }
             worker
                 .forks
-                .tick(&mut worker.catalog, &mut worker.escrow, &worker.boot)
+                .tick(&mut worker.catalog, &worker.objects, &mut worker.escrow, &worker.boot)
                 .map_err(|e| io::Error::other(e.message))?;
             if let Err(error)=worker.reconcile_fork_cancellations() {
                 eprintln!("resourced fork cancellation: {error}");

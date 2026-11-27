@@ -66,3 +66,19 @@ supply tmpfs scratch, mount separate, root-owned tmpfs filesystems at
 Size those filesystems from the Worker budget. A directory or bind mount
 backed by the shared `/dev/shm` filesystem leaves the state-directory
 scratch path in use.
+
+The Worker records generation-bearing file handles for new managed blocks
+on ext4 and btrfs. These can identify the same backing when Linux assigns a
+different device number after reboot. Live writer authorization still
+requires the original exclusive open-file-description lock. On storage
+without stable file handles, the Worker requires the recorded device and
+inode numbers to match.
+
+For a historical StatePoint on ext4 or btrfs, the Worker can recover its
+immutable disk generations after a device-number change. It verifies the
+committed manifest and the length and SHA-256 of each disk layer before
+recording the current handles. The existing manifest and its digest are
+preserved. An exact restore whose legacy writable head has an unprovable
+identity fails with `E_BACKING_IDENTITY_UNPROVEN`. Use the
+`clone_conflicts` volume restore policy on the same machine to restore
+the verified StatePoint into newly created writable volumes.

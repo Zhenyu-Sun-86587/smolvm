@@ -272,9 +272,8 @@ pub fn prepare(
     let mut layouts = Vec::new();
     for ((head, mut layers), fd) in plan.heads.iter().zip(sources).zip(capabilities) {
         let next = candidate(catalog, root, id, &head.next_resource_id)?;
-        if blocks::backing_identity(fd).map_err(io_fault)? != next.backing_identity {
-            return Err(fence_unproven("offered writer pivot FD identity changed"));
-        }
+        let expected = blocks::open_object(root, &next, true)?;
+        prove_live_ofd(&expected, fd)?;
         layers.insert(0, next);
         for (index, object) in layers.iter().enumerate() {
             if !ids.insert(object.spec.resource_id.clone()) {
@@ -290,7 +289,7 @@ pub fn prepare(
                 0 => fd.try_clone().map_err(io_fault)?,
                 // Only the authenticated old writer receives this prepared
                 // alias. It may install it only with the entire device set held.
-                1 => blocks::open_final(root, object, false).map_err(io_fault)?,
+                1 => blocks::open_final(root, object, false)?,
                 _ => blocks::open_object(root, object, false)?,
             };
             table.push(FdEntry {

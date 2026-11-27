@@ -147,16 +147,17 @@ pub fn verify_restore_writer(
         }
         let expected = crate::blocks::open_object(root, &closure[0], true)?;
         prove_live_ofd(&expected, &File::from(descriptor))?;
-        if closure.len() != head.layers.len()
-            || closure
-                .iter()
-                .zip(&head.layers)
-                .any(|(object, (dev, ino))| object.backing_identity != format!("inode:{dev}:{ino}"))
-        {
+        if closure.len() != head.layers.len() {
             return Err(fence_unproven(
-                "restore disk uses different opened ancestor files",
+                "restore disk uses a different number of ancestor files",
             ));
         }
+        for (layer, &(dev, ino)) in closure.iter().skip(1).zip(head.layers.iter().skip(1)) {
+            let file = crate::blocks::open_object(root, layer, false)?;
+            require_live_identity(&file, dev, ino)?;
+        }
+        let (dev, ino) = head.layers[0];
+        require_live_identity(&expected, dev, ino)?;
     }
     if let Some((policy, capture)) = &lease_scope {
         if crate::backup_import::imported(catalog, capture)? {
@@ -213,6 +214,14 @@ pub fn fence_unproven(message: &str) -> Fault {
     Fault::new("E_FENCE_UNPROVEN", message)
 }
 
+pub(crate) fn require_live_identity(file: &File, dev: u64, ino: u64) -> Result<()> {
+    if crate::backing_identity::live(file).is_ok_and(|actual| actual == (dev, ino)) {
+        Ok(())
+    } else {
+        Err(fence_unproven("managed block proof uses a different opened file"))
+    }
+}
+
 fn ofd_conflict(file: &File) -> io::Result<Option<i16>> {
     let mut lock = libc::flock {
         l_type: libc::F_WRLCK as i16,
@@ -228,12 +237,13 @@ fn ofd_conflict(file: &File) -> io::Result<Option<i16>> {
 }
 
 pub fn prove_live_ofd(expected: &File, held: &File) -> Result<()> {
+    let expected_identity = crate::backing_identity::live(expected).ok();
     let flags = unsafe { libc::fcntl(held.as_raw_fd(), libc::F_GETFL) };
     if flags < 0
         || flags & libc::O_ACCMODE != libc::O_RDWR
         || flags & (libc::O_PATH | libc::O_APPEND | libc::O_DIRECT) != 0
-        || crate::blocks::backing_identity(expected).ok()
-            != crate::blocks::backing_identity(held).ok()
+        || expected_identity.is_none()
+        || expected_identity != crate::backing_identity::live(held).ok()
         || !matches!(ofd_conflict(expected), Ok(Some(kind)) if kind == libc::F_WRLCK as i16)
         || !matches!(ofd_conflict(held), Ok(None))
     {
