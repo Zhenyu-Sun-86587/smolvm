@@ -8,6 +8,22 @@ const PAGE: u64 = 4096;
 const HOST_BASE: u64 = 0x4000_0000_0000;
 const HOST_LIMIT: u64 = 0x4800_0000_0000;
 
+pub fn boot_capability(supported: Option<bool>) -> super::Capability {
+    let (status, reason) = match supported {
+        Some(true) => ("supported", ""),
+        Some(false) => ("unsupported", "WORKER_KERNEL_COW_UNAVAILABLE"),
+        None => ("unknown", "WORKER_KERNEL_COW_UNVERIFIED"),
+    };
+    let supported = supported == Some(true);
+    super::Capability {
+        status: status.into(),
+        supported,
+        reason_code: reason.into(),
+        contract_version: supported.then_some(1),
+        verified_profile: supported.then(|| PROFILE.to_owned()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[repr(C)]
@@ -45,6 +61,26 @@ pub fn packed_size(regions: &[Region]) -> Result<u64, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_capability_uses_the_runtime_handshake_status_vocabulary() {
+        for (observation, status) in [
+            (Some(true), "supported"),
+            (Some(false), "unsupported"),
+            (None, "unknown"),
+        ] {
+            let serialized = serde_json::to_value(boot_capability(observation)).unwrap();
+            assert_eq!(serialized["status"], status);
+            assert_eq!(serialized["supported"], status == "supported");
+            if status == "supported" {
+                assert_eq!(serialized["contract_version"], 1);
+                assert_eq!(serialized["verified_profile"], PROFILE);
+            } else {
+                assert!(serialized.get("contract_version").is_none());
+                assert!(serialized.get("verified_profile").is_none());
+            }
+        }
+    }
 
     #[test]
     fn fixed_layout_is_ordered_aligned_and_bounded() {

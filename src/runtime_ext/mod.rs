@@ -144,7 +144,7 @@ pub(crate) async fn capabilities() -> Result<Json<Handshake>, ApiError> {
     };
     #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
     let handshake = {
-        use smolvm_runtime_protocol::{kernel_cow::PROFILE, Capability};
+        use smolvm_runtime_protocol::kernel_cow::{boot_capability, PROFILE};
         let mut handshake = handshake;
         let observed = if let Some(socket) = launch::worker_socket() {
             let bundle = handshake.bundle_digest.clone();
@@ -154,16 +154,14 @@ pub(crate) async fn capabilities() -> Result<Json<Handshake>, ApiError> {
         } else {
             None
         };
-        let capability = observed.filter(|value| !value.supported
-            || (value.status == "supported" && value.contract_version == Some(1)
-                && value.verified_profile.as_deref() == Some(PROFILE)))
-            .unwrap_or_else(|| Capability {
-                status: "unavailable".into(),
-                supported: false,
-                reason_code: "WORKER_KERNEL_COW_UNAVAILABLE".into(),
-                contract_version: None,
-                verified_profile: None,
-            });
+        let capability = observed
+            .filter(|value| match value.status.as_str() {
+                "supported" => value.supported && value.contract_version == Some(1)
+                    && value.verified_profile.as_deref() == Some(PROFILE),
+                "unsupported" | "unknown" => !value.supported,
+                _ => false,
+            })
+            .unwrap_or_else(|| boot_capability(None));
         handshake.capabilities.insert("boot.kernel_cow_ram".into(), capability);
         handshake
     };
