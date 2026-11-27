@@ -174,7 +174,7 @@ pub(crate) fn tick(c:&mut Catalog, points:&mut StatePoints, objects:&File, boot:
             Err(error)=>{
                 c.db.execute("UPDATE managed_fork_batches SET error=? WHERE operation_id=? AND error IS NOT ?",params![error.message,job.id,error.message])?;
                 if job.kernel && (error.code == "E_CAPTURE_LOST" || job.stage == "exporting"
-                    && matches!(error.code.as_str(), "E_CAPTURE_TIMEOUT" | "E_KERNEL_ANCHOR_UNAVAILABLE" | "E_STATE_CONFLICT" | "E_INVALID_REQUEST"))
+                    && matches!(error.code, "E_CAPTURE_TIMEOUT" | "E_KERNEL_ANCHOR_UNAVAILABLE" | "E_STATE_CONFLICT" | "E_INVALID_REQUEST"))
                 {
                     let (released, phase) = c.db.query_row(
                         "SELECT b.source_released,p.phase FROM managed_fork_batches b

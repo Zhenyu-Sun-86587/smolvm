@@ -18,9 +18,17 @@ const MIB: u64 = 1 << 20;
 const CAPTURE_OVERHEAD: u64 = crate::statepoint_capture::MAX_CHECKPOINT_BYTES as u64 + 4 * MIB;
 const ANCHOR_OVERHEAD_MIB: u64 = 16;
 const MIB_PER_LEAF_TABLE_MIB: u64 = 512;
+const KERNEL_RAM_SCALE: u64 = 2;
 
 pub(crate) fn capture_storage(memory_mib: u64) -> u64 {
     memory_mib.saturating_mul(MIB).saturating_add(CAPTURE_OVERHEAD)
+}
+
+// Below the MMIO gap the bundled kernel starts inside the configured memory
+// budget, and libkrun adds its span and the leading low region to that budget.
+// With no external firmware, their combined size cannot exceed configured RAM.
+pub(crate) fn kernel_capture_ram_mib(memory_mib: u64) -> u64 {
+    memory_mib.saturating_mul(KERNEL_RAM_SCALE)
 }
 
 fn unavailable(e: impl ToString) -> Fault {
@@ -83,7 +91,7 @@ fn used(db: &Connection) -> Result<Capacity> {
     // abort ends the reservation as part of the operation's terminal commit.
     Ok(db.query_row("SELECT COALESCE(SUM(vcpus),0),COALESCE(SUM(memory_mib),0) + (
             SELECT COALESCE(SUM(ram + (ram + ?3 - 1) / ?3 + ?4),0) FROM (
-              SELECT CAST(json_extract(b.template,'$.memory_mib') AS INTEGER) AS ram
+              SELECT CAST(json_extract(b.template,'$.memory_mib') AS INTEGER) * ?5 AS ram
               FROM managed_fork_batches b JOIN operations o USING(operation_id)
               LEFT JOIN kernel_mm_anchors a USING(capture_id)
               LEFT JOIN resources r ON r.resource_id=a.resource_id
@@ -92,11 +100,12 @@ fn used(db: &Connection) -> Result<Capacity> {
                  OR (o.phase='NEW' AND r.state IS NULL))
             )),
         COALESCE(SUM(storage_bytes),0) + (SELECT COALESCE(SUM(
-            CAST(json_extract(b.template,'$.memory_mib') AS INTEGER) * ?1 + ?2),0)
+            CAST(json_extract(b.template,'$.memory_mib') AS INTEGER) * ?1 *
+            CASE WHEN b.selected_memory_fork_backend='kernel_cow' THEN ?5 ELSE 1 END + ?2),0)
             FROM managed_fork_batches b JOIN operations o USING(operation_id)
             WHERE o.phase='NEW' AND o.kind IN ('vm_snapshot','hibernate','vm_rollback'))
         FROM managed_budget_holds WHERE state!='released'",
-        params![MIB as i64, CAPTURE_OVERHEAD as i64, MIB_PER_LEAF_TABLE_MIB as i64, ANCHOR_OVERHEAD_MIB as i64],
+        params![MIB as i64, CAPTURE_OVERHEAD as i64, MIB_PER_LEAF_TABLE_MIB as i64, ANCHOR_OVERHEAD_MIB as i64, KERNEL_RAM_SCALE as i64],
         |r|Ok(Capacity{vcpus:r.get::<_,i64>(0)? as u64,memory_mib:r.get::<_,i64>(1)? as u64,storage_bytes:r.get::<_,i64>(2)? as u64}))?)
 }
 pub(crate) fn status(db: &Connection) -> Result<serde_json::Value> {
@@ -118,11 +127,16 @@ pub(crate) fn require_capture_space(db: &Connection, memory_mib: u64) -> Result<
     Ok(())
 }
 
+pub(crate) fn require_kernel_capture_space(db: &Connection, memory_mib: u64) -> Result<()> {
+    require_capture_space(db, kernel_capture_ram_mib(memory_mib))
+}
+
 /// The source can dirty every shared page after it resumes. Budget the
 /// retained pages and estimated 4 KiB leaf page tables until the anchor dies.
 pub(crate) fn require_kernel_anchor_room(db: &rusqlite::Transaction<'_>, memory_mib: u64) -> Result<()> {
-    let estimated = memory_mib
-        .saturating_add(memory_mib.div_ceil(MIB_PER_LEAF_TABLE_MIB))
+    let ram = kernel_capture_ram_mib(memory_mib);
+    let estimated = ram
+        .saturating_add(ram.div_ceil(MIB_PER_LEAF_TABLE_MIB))
         .saturating_add(ANCHOR_OVERHEAD_MIB);
     check_room(db, Capacity { vcpus: 0, memory_mib: estimated, storage_bytes: 0 })
 }

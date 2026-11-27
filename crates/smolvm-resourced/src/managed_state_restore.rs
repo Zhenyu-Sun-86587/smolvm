@@ -263,6 +263,7 @@ fn queue(
         BTreeMap::new()
     };
     let mut machine = source_plan.machine;
+    machine.memory_fork_profile = None;
     if imported {
         machine.network = match (machine.network.as_ref(), input.network_id.as_deref()) {
             (Some(archived), Some(target)) => {

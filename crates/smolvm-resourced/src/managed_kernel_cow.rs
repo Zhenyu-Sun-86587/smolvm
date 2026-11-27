@@ -8,6 +8,9 @@ pub(crate) struct Import {
 }
 
 pub(crate) const UNAVAILABLE: &str = "worker_kernel_cow_unavailable";
+// libkrun's QUERY succeeds only after discovering this UAPI layout.
+pub(crate) const ABI_DIGEST: &str =
+    "sha256:03e38c51fd9ac381993e22a9e9116060a0d867f39da57de3b717a2c6fa3a37a2";
 
 pub(crate) fn require_worker(bundle: &str) -> Result<()> {
     if worker_available(bundle) {
@@ -77,6 +80,12 @@ pub(crate) fn worker_available(bundle: &str) -> bool {
             use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_LAZY};
             let _firmware = Library::open(Some(firmware), RTLD_GLOBAL | RTLD_LAZY).ok()?;
             let krun = Library::open(Some(lib), RTLD_LAZY).ok()?;
+            for required in [
+                b"krun_enable_worker_kernel_cow_v1\0".as_slice(),
+                b"krun_import_worker_kernel_cow_v1\0".as_slice(),
+            ] {
+                krun.get::<*const libc::c_void>(required).ok()?;
+            }
             let probe = krun.get::<unsafe extern "C" fn() -> i32>(
                 b"krun_probe_worker_kernel_cow_v1\0",
             ).ok()?;

@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+#[path = "kernel_mm_anchor_tests.rs"]
+mod tests;
+
 // Immediately above the reserved deep execution range.
 pub(super) const ANCHOR_UID: u32 = 202_000_000;
 
@@ -25,13 +29,14 @@ pub(super) const ANCHOR_UID: u32 = 202_000_000;
 #[serde(deny_unknown_fields)]
 pub(super) struct Init {
     pub directory: PathBuf,
+    pub capture_id: String,
     pub helper_id: String,
     pub bundle_digest: String,
     pub executable_digest: String,
     pub regions: Vec<Region>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct Receipt {
     pub regions: Vec<Region>,
     pub layout_digest: String,
@@ -305,6 +310,7 @@ fn launch(
         // The journal precedes the only transfer of the live source pidfd.
         let init = Init {
             directory: path,
+            capture_id: capture.to_owned(),
             helper_id,
             bundle_digest: source.bundle_digest.clone(),
             executable_digest,
@@ -483,7 +489,8 @@ pub(crate) fn register(
                 "kernel CoW anchor is outside the admitted capture",
             )
         })?;
-    if packed > memory_mib.saturating_mul(1 << 20) || source.host_boot_id != boot_id(c)? {
+    let ram_limit = crate::admission::kernel_capture_ram_mib(memory_mib).saturating_mul(1 << 20);
+    if packed > ram_limit || source.host_boot_id != boot_id(c)? {
         return Err(Fault::invalid(
             "kernel CoW RAM differs from the admitted size or boot",
         ));

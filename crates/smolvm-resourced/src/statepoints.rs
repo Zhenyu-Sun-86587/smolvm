@@ -367,8 +367,9 @@ impl StatePoints {
                  JOIN kernel_statepoint_checkpoints k USING(capture_id)
                  WHERE o.phase='ABORTED' AND p.phase IN ('exporting','durable')",
             )?;
-            query.query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+            let rows = query.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
         };
         for capture in captures {
             if !self.export_in_progress(&capture) {
