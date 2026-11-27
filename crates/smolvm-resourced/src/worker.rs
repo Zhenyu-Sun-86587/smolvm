@@ -2094,7 +2094,9 @@ impl Worker {
         };
         let mut state = command(&format!("CAPTURE_QUERY {token}"))?;
         if state["phase"] == "prepared" {
-            endpoint.command(&format!("CAPTURE_STOP_UNRESERVE {token}"))?;
+            if !kernel || state["stop_reserved"] == true {
+                endpoint.command(&format!("CAPTURE_STOP_UNRESERVE {token}"))?;
+            }
             if kernel {
                 endpoint.command(&format!("CAPTURE_KERNEL_ABANDON {token}"))?;
             }
