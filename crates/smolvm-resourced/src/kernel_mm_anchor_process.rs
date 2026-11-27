@@ -12,7 +12,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type Import = unsafe extern "C" fn(libc::c_int, *const Region, usize, u32, u32) -> i32;
 type Export = unsafe extern "C" fn(libc::c_int) -> i32;
@@ -232,7 +232,7 @@ pub(super) fn run() -> io::Result<()> {
     if !in_scope(std::process::id() as i32, &init.helper_id)? {
         return Err(invalid("kernel CoW anchor is outside its Worker scope"));
     }
-    packed_size(&init.regions).map_err(invalid)?;
+    let bytes = packed_size(&init.regions).map_err(invalid)?;
     let (dir, address) = command_address(&init.directory, &init.helper_id)?;
     let listener = Socket::new(Domain::UNIX, Type::STREAM, None)?;
     listener.bind(&address)?;
@@ -241,6 +241,7 @@ pub(super) fn run() -> io::Result<()> {
     let (import, export) = libraries(&init)?;
     // SAFETY: this is the dedicated final helper process, with an authenticated
     // held donor, valid C layouts and no other threads.
+    let started = Instant::now();
     let status = unsafe {
         import(
             donor.into_raw_fd(),
@@ -250,6 +251,13 @@ pub(super) fn run() -> io::Result<()> {
             ANCHOR_UID,
         )
     };
+    eprintln!(
+        "smolvm kernel CoW anchor capture={} import_bootstrap_us={} ram_bytes={} status={}",
+        init.capture_id,
+        started.elapsed().as_micros(),
+        bytes,
+        status,
+    );
     if status != 0 {
         return Err(io::Error::from_raw_os_error(-status));
     }
@@ -279,6 +287,65 @@ pub(super) fn run() -> io::Result<()> {
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
             Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
+
+    const SANDBOX_TEST: &str = "SMOLVM_TEST_ONLY_ANCHOR_SECCOMP";
+
+    #[test]
+    fn restricts_mprotect_after_import_even_with_maywrite() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "kernel_mm_anchor_process::tests::sandbox_child",
+                "--nocapture",
+            ])
+            .env(SANDBOX_TEST, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.signal(), Some(libc::SIGSYS));
+        assert!(output.stdout.windows(7).any(|bytes| bytes == b"locked\n"));
+    }
+
+    #[test]
+    fn sandbox_child() {
+        if std::env::var_os(SANDBOX_TEST).is_none() {
+            return;
+        }
+        let byte = 4096;
+        // SAFETY: use a dedicated read-only test mapping. Leave no core file.
+        let page = unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0), 0);
+            libc::mmap(
+                std::ptr::null_mut(),
+                byte,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        lockdown().unwrap();
+        let marker = b"locked\n";
+        // SAFETY: stdout is the test pipe and the mapping is valid. The
+        // protection change is explicitly disallowed by the helper sandbox.
+        unsafe {
+            libc::write(1, marker.as_ptr().cast(), marker.len());
+            libc::syscall(
+                libc::SYS_mprotect,
+                page,
+                byte,
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
+            libc::_exit(66);
         }
     }
 }
