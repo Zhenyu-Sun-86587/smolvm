@@ -13,6 +13,8 @@ const OP_COLUMNS: &str = "operation_id,kind,request_digest,route_id,instance_id,
     expected_execution_epoch,expected_incarnation_id,phase,decision,revision";
 const EXEC_COLUMNS: &str = "incarnation_id,route_id,instance_id,execution_epoch,bundle_digest,
     host_boot_id,pid,pid_start_time,uid,phase,last_operation_id";
+const ADD_FORK_RELAY_HOLD: &str = "ALTER TABLE managed_fork_batches ADD COLUMN credential_relay_hold TEXT;
+    PRAGMA user_version=30;";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Operation {
@@ -292,9 +294,9 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_managed_retirements.sql"))?;
                 tx.execute_batch(include_str!("schema_network_recovery.sql"))?;
                 tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
-                tx.execute_batch("PRAGMA user_version=29")?;
+                tx.execute_batch(ADD_FORK_RELAY_HOLD)?;
             }
-            1..=29 => {
+            1..=30 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -381,7 +383,9 @@ impl Catalog {
                 }
                 if version < 29 {
                     tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=29")?;
+                }
+                if version < 30 {
+                    tx.execute_batch(ADD_FORK_RELAY_HOLD)?;
                 }
                 crate::packet_wake::recover(&tx)?;
                 crate::lifecycle_controller::recover(&tx)?;

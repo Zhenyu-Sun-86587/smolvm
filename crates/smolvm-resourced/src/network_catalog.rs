@@ -720,7 +720,8 @@ mod tests {
             }
             if case == "legacy schema" {
                 catalog.db.execute_batch(
-                    "DROP TABLE product_machine_volumes; DROP TABLE network_kernel_receipts; PRAGMA user_version=27;"
+                    "ALTER TABLE managed_fork_batches DROP COLUMN credential_relay_hold;
+                     DROP TABLE product_machine_volumes; DROP TABLE network_kernel_receipts; PRAGMA user_version=27;"
                 ).unwrap();
             }
             drop(catalog);
