@@ -360,7 +360,8 @@ pub(crate) fn catalog(
                 } else {
                     "raw".into()
                 },
-                backing_identity: blocks::backing_identity(&file).map_err(invalid)?,
+                backing_identity: crate::backing_identity::recorded(&file).map_err(invalid)?,
+                verified_identity: None,
             };
             tx.execute(
                 "INSERT INTO managed_blocks VALUES(?,?,?,NULL)",

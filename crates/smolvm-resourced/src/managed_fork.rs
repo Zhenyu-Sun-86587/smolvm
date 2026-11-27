@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use smolvm_runtime_protocol::kernel_cow::PROFILE;
 use std::{
     collections::{BTreeMap, HashSet},
+    fs::File,
     sync::mpsc,
     thread,
     time::Instant,
@@ -573,7 +574,7 @@ impl Job {
         }
         Ok(fields[2].to_owned())
     }
-    fn capture(&self, c: &Catalog, escrow: &mut Escrow, ep: &Endpoint) -> Result<()> {
+    fn capture(&self, c: &Catalog, objects: &File, escrow: &mut Escrow, ep: &Endpoint) -> Result<()> {
         let started = Instant::now();
         let op = c.operation(&self.id)?;
         let source = c.execution(&self.inc)?;
@@ -587,7 +588,7 @@ impl Job {
         let (checkpoint, helper_digest, roots, disks) = if self.kernel_cow {
             let capture = statepoint_capture::acquire_kernel(ep, &export)?;
             self.check_anchor(&capture.anchor)?;
-            let roots = statepoint_capture::disk_roots(c, &op, &source, &export, &capture.devices)?;
+            let roots = statepoint_capture::disk_roots(c, objects, &op, &source, &export, &capture.devices)?;
             let disks = Self::capture_disks(&capture.devices);
             let import_started = Instant::now();
             crate::kernel_mm_anchor::register(
@@ -598,7 +599,7 @@ impl Job {
         } else {
             let mut capture = statepoint_capture::acquire(ep, &export)?;
             self.check_anchor(&capture.anchor)?;
-            let roots = statepoint_capture::disk_roots(c, &op, &source, &export, &capture.devices)?;
+            let roots = statepoint_capture::disk_roots(c, objects, &op, &source, &export, &capture.devices)?;
             let disks = Self::capture_disks(&capture.devices);
             escrow.import_native(c, &self.resource, &op, &source, &mut capture)?;
             (capture.checkpoint, capture.helper_digest, roots, disks)
@@ -631,7 +632,7 @@ impl Job {
             .map(|(d, (g,v))| (d.to_string(), (g.to_string(),v.to_string())))
             .collect()
     }
-    fn kernel_export(&self, c: &Catalog, escrow: &mut Escrow, ep: &Endpoint) -> Result<()> {
+    fn kernel_export(&self, c: &Catalog, objects: &File, escrow: &mut Escrow, ep: &Endpoint) -> Result<()> {
         // Allow rediscovery of the same paused point after a broker restart.
         // The deadline starts after the writer transition is reconciled.
         let expired: bool = c.db.query_row(
@@ -644,7 +645,7 @@ impl Job {
         let result = if expired {
             Err(Fault::new("E_CAPTURE_TIMEOUT", "Kernel CoW anchor import did not settle while the source was held"))
         } else if self.stage == "exporting" {
-            self.capture(c, escrow, ep)
+            self.capture(c, objects, escrow, ep)
         } else {
             let started = Instant::now();
             crate::kernel_mm_anchor::acquire(c, &self.id, &self.resource)
@@ -875,7 +876,7 @@ impl Default for Actor {
     }
 }
 impl Actor {
-    pub(crate) fn tick(&mut self, c: &mut Catalog, escrow: &mut Escrow, boot: &str) -> Result<()> {
+    pub(crate) fn tick(&mut self, c: &mut Catalog, objects: &File, escrow: &mut Escrow, boot: &str) -> Result<()> {
         while let Ok((id, result)) = self.rx.try_recv() {
             self.active.remove(&id);
             match result {
@@ -927,7 +928,7 @@ impl Actor {
             result
         };
         for job in jobs {
-            if let Err(e) = self.step(c, escrow, boot, &job) {
+            if let Err(e) = self.step(c, objects, escrow, boot, &job) {
                 if job.stage == "kernel_abandon" {
                     eprintln!("resourced Kernel CoW source return {}: {}", job.id, e.message);
                     continue;
@@ -937,7 +938,7 @@ impl Actor {
         }
         Ok(())
     }
-    fn step(&mut self, c: &mut Catalog, escrow: &mut Escrow, boot: &str, j: &Job) -> Result<()> {
+    fn step(&mut self, c: &mut Catalog, objects: &File, escrow: &mut Escrow, boot: &str, j: &Job) -> Result<()> {
         if j.stage == "children" {
             return dispatch_children(c, j);
         }
@@ -1087,9 +1088,9 @@ impl Actor {
                     });
                 }
             }
-            "exporting" | "kernel_confirming" if j.kernel_cow => j.kernel_export(c, escrow, &ep)?,
+            "exporting" | "kernel_confirming" if j.kernel_cow => j.kernel_export(c, objects, escrow, &ep)?,
             "kernel_abandon" => j.kernel_abandon(c, &ep)?,
-            "exporting" => j.capture(c, escrow, &ep)?,
+            "exporting" => j.capture(c, objects, escrow, &ep)?,
             "source_return" => {
                 let started = Instant::now();
                 let status = ep.command(&format!("CAPTURE_FINISH {scope} RETURN_STANDBY"))?;

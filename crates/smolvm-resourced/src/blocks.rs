@@ -1,5 +1,6 @@
 //! Managed raw bases and qcow2 heads addressed by their resource IDs.
 
+use crate::backing_identity;
 use crate::catalog::{Catalog, Execution, VolumeHead};
 use crate::escrow::{Acquire, Escrow, LeasePacket};
 use crate::escrow_catalog::LeaseRecord;
@@ -41,6 +42,14 @@ pub struct BlockObject {
     pub spec: BlockSpec,
     pub format: String,
     pub backing_identity: String,
+    #[serde(skip)]
+    pub(crate) verified_identity: Option<String>,
+}
+
+pub(crate) struct VerifiedBacking {
+    pub resource_id: String,
+    pub legacy_identity: String,
+    pub durable_identity: String,
 }
 
 #[derive(Deserialize)]
@@ -111,17 +120,6 @@ fn staging_name(operation_id: &str, resource_id: &str) -> String {
     )
 }
 
-pub fn backing_identity(file: &File) -> io::Result<String> {
-    let info = file.metadata()?;
-    if !info.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "block storage is not a regular file",
-        ));
-    }
-    Ok(format!("inode:{}:{}", info.dev(), info.ino()))
-}
-
 fn publish_directory(root: &File, from: &str, to: &str) -> io::Result<()> {
     let from = CString::new(from)?;
     let to = CString::new(to)?;
@@ -140,30 +138,105 @@ fn publish_directory(root: &File, from: &str, to: &str) -> io::Result<()> {
     root.sync_all()
 }
 
-pub(crate) fn open_final(root: &File, object: &BlockObject, writable: bool) -> io::Result<File> {
+fn backing_changed(message: &str) -> Fault {
+    Fault::new("E_BLOCK_BACKING_CHANGED", message)
+}
+
+fn backing_open_fault(error: io::Error) -> Fault {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => Fault::new("E_BLOCK_BACKING_MISSING", "managed block backing is missing"),
+        Some(libc::ELOOP | libc::ENOTDIR | libc::EISDIR) => {
+            backing_changed("managed block backing path changed")
+        }
+        _ => io_fault(error),
+    }
+}
+
+fn identity_unproven(message: &str) -> Fault {
+    Fault::new("E_BACKING_IDENTITY_UNPROVEN", message)
+}
+
+pub(crate) fn verify_recorded_identity(file: &File, recorded: &str) -> Result<()> {
+    if let Some((dev, ino)) = backing_identity::legacy(recorded) {
+        let (actual_dev, actual_ino) = backing_identity::live(file).map_err(io_fault)?;
+        if actual_ino != ino {
+            return Err(backing_changed("managed block inode changed"));
+        }
+        if actual_dev != dev {
+            return Err(identity_unproven(
+                "legacy block device changed and durable backing identity is unavailable",
+            ));
+        }
+        return Ok(());
+    }
+    if !recorded.starts_with("handle-v1:") {
+        return Err(backing_changed("managed block backing identity is invalid"));
+    }
+    let actual = backing_identity::durable(file).map_err(io_fault)?.ok_or_else(|| {
+        identity_unproven("storage cannot verify the recorded durable block identity")
+    })?;
+    if actual != recorded {
+        return Err(backing_changed("managed block filesystem or inode generation changed"));
+    }
+    Ok(())
+}
+
+fn open_final_backing(root: &File, object: &BlockObject, writable: bool) -> Result<File> {
     let directory = crate::worker::openat(
         root,
         &object.spec.resource_id,
         libc::O_RDONLY | libc::O_DIRECTORY,
-    )?;
+    )
+    .map_err(backing_open_fault)?;
     let access = if writable {
         libc::O_RDWR
     } else {
         libc::O_RDONLY
     };
-    let file = crate::worker::openat(&directory, "data", access | libc::O_NONBLOCK)?;
-    let meta = file.metadata()?;
+    let file = crate::worker::openat(&directory, "data", access | libc::O_NONBLOCK)
+        .map_err(backing_open_fault)?;
+    let meta = file.metadata().map_err(io_fault)?;
     let mode = if object.spec.mutable() { 0o600 } else { 0o400 };
-    if meta.mode() & 0o777 != mode
-        || meta.nlink() != 1
-        || backing_identity(&file)? != object.backing_identity
+    if !meta.is_file()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o7777 != mode
         || (object.format == "raw" && meta.len() != object.spec.capacity_bytes)
+        || !backing_identity::same_mount(root, &file, &meta).map_err(io_fault)?
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "managed block backing identity changed",
+        return Err(backing_changed(
+            "managed block backing type, owner, permissions, size or mount changed",
         ));
     }
+    Ok(file)
+}
+
+pub(crate) fn open_final(root: &File, object: &BlockObject, writable: bool) -> Result<File> {
+    let file = open_final_backing(root, object, writable)?;
+    let recorded = if object.spec.mutable() {
+        &object.backing_identity
+    } else {
+        object.verified_identity.as_deref().unwrap_or(&object.backing_identity)
+    };
+    verify_recorded_identity(&file, recorded)?;
+    require_single_link(&file)?;
+    Ok(file)
+}
+
+fn require_single_link(file: &File) -> Result<()> {
+    if file.metadata().map_err(io_fault)?.nlink() != 1 {
+        return Err(backing_changed("managed block backing link count changed"));
+    }
+    Ok(())
+}
+
+pub(crate) fn lock_writer(root: &File, object: &BlockObject) -> Result<File> {
+    if !object.spec.mutable() {
+        return Err(crate::grants::fence_unproven("writer reservation requires a mutable head"));
+    }
+    let file = open_final_backing(root, object, true)?;
+    verify_recorded_identity(&file, &object.backing_identity)?;
+    crate::worker::ofd_lock(&file)?;
+    require_single_link(&file)?;
     Ok(file)
 }
 
@@ -171,7 +244,41 @@ pub fn open_object(root: &File, object: &BlockObject, writable: bool) -> Result<
     if writable != object.spec.mutable() {
         return Err(Fault::new("E_VOLUME_WRITER_CONFLICT", "mutable heads require a writer grant and immutable generations require read-only access"));
     }
-    open_final(root, object, writable).map_err(io_fault)
+    open_final(root, object, writable)
+}
+
+/// The caller may use a legacy layer only to verify a committed StatePoint's
+/// bytes. It must establish the manifest digest and verify every layer before
+/// publishing the returned candidate or authorizing access to any layer.
+pub(crate) fn open_for_statepoint_verification(
+    root: &File,
+    object: &BlockObject,
+) -> Result<(File, Option<VerifiedBacking>)> {
+    if object.spec.mutable() {
+        return Err(backing_changed("StatePoint references a writable block head"));
+    }
+    let Some((legacy_dev, legacy_ino)) = backing_identity::legacy(&object.backing_identity)
+        .filter(|_| object.verified_identity.is_none())
+    else {
+        return Ok((open_object(root, object, false)?, None));
+    };
+    let file = open_final_backing(root, object, false)?;
+    require_single_link(&file)?;
+    let (dev, ino) = backing_identity::live(&file).map_err(io_fault)?;
+    if ino != legacy_ino {
+        return Err(backing_changed("legacy StatePoint block inode changed"));
+    }
+    let durable = backing_identity::durable(&file).map_err(io_fault)?;
+    if durable.is_none() && dev != legacy_dev {
+        return Err(identity_unproven(
+            "changed legacy StatePoint device requires a stable filesystem handle",
+        ));
+    }
+    Ok((file, durable.map(|durable_identity| VerifiedBacking {
+        resource_id: object.spec.resource_id.clone(),
+        legacy_identity: object.backing_identity.clone(),
+        durable_identity,
+    })))
 }
 
 fn import_bytes(source: File, target: &File, spec: &BlockSpec) -> Result<()> {
@@ -298,7 +405,7 @@ pub(crate) fn read_published(root: &File, spec: &BlockSpec) -> Result<Option<Blo
     if &object.spec != spec || object.format != spec.format() {
         return Err(conflict("object publication does not match its intent"));
     }
-    open_final(root, &object, spec.mutable()).map_err(io_fault)?;
+    open_final(root, &object, spec.mutable())?;
     Ok(Some(object))
 }
 
@@ -400,9 +507,10 @@ pub(crate) fn materialize_with(
             .map_err(io_fault)?;
         initialize(&spec, &data)?;
         let object = BlockObject {
-            backing_identity: backing_identity(&data).map_err(io_fault)?,
+            backing_identity: backing_identity::recorded(&data).map_err(io_fault)?,
             format: spec.format().into(),
             spec,
+            verified_identity: None,
         };
         drop(data);
         let marker = OpenOptions::new()
@@ -471,12 +579,13 @@ pub fn collect(catalog: &Catalog, root: &File, resource: &str) -> Result<()> {
     let object = BlockObject {
         format: spec.format().into(),
         spec,
+        verified_identity: catalog.verified_backing(resource, &identity)?,
         backing_identity: identity,
     };
     match open_final(root, &object, false) {
         Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io_fault(error)),
+        Err(error) if error.code == "E_BLOCK_BACKING_MISSING" => {}
+        Err(error) => return Err(error),
     };
     remove_object_dir(root, resource)
 }
@@ -714,8 +823,8 @@ pub fn reconcile_read(
             || flags < 0
             || flags & libc::O_ACCMODE != libc::O_RDONLY
             || flags & libc::O_PATH != 0
-            || backing_identity(&expected).map_err(io_fault)?
-                != backing_identity(&held).map_err(io_fault)?
+            || backing_identity::live(&expected).map_err(io_fault)?
+                != backing_identity::live(&held).map_err(io_fault)?
         {
             return Err(crate::grants::fence_unproven(
                 "block lease re-export does not match its immutable closure",
@@ -737,6 +846,45 @@ pub fn reconcile_read(
 }
 
 impl Catalog {
+    fn verified_backing(&self, resource: &str, legacy_identity: &str) -> Result<Option<String>> {
+        if backing_identity::legacy(legacy_identity).is_none() {
+            return Ok(None);
+        }
+        let proof: Option<(String, String)> = self.db.query_row(
+            "SELECT legacy_identity,durable_identity FROM verified_block_backings WHERE resource_id=?",
+            [resource],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        match proof {
+            Some((legacy, durable)) if legacy == legacy_identity => Ok(Some(durable)),
+            Some(_) => Err(backing_changed("verified block backing has a different catalog identity")),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn commit_verified_backings(&self, proofs: &[VerifiedBacking]) -> Result<()> {
+        if proofs.is_empty() {
+            return Ok(());
+        }
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        for proof in proofs {
+            let applied = tx.execute(
+                "INSERT INTO verified_block_backings (resource_id,legacy_identity,durable_identity)
+                 SELECT resource_id,backing_identity,? FROM managed_blocks
+                 JOIN resources USING(resource_id)
+                 WHERE resource_id=? AND backing_identity=? AND immutable=1 AND state='available'
+                 ON CONFLICT(resource_id) DO UPDATE SET durable_identity=excluded.durable_identity
+                 WHERE legacy_identity=excluded.legacy_identity AND durable_identity=excluded.durable_identity",
+                params![proof.durable_identity, proof.resource_id, proof.legacy_identity],
+            )?;
+            if applied != 1 {
+                return Err(backing_changed("legacy block changed during StatePoint verification"));
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn has_managed_block(&self, resource: &str) -> Result<bool> {
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM managed_blocks WHERE resource_id=?)",
@@ -814,11 +962,13 @@ impl Catalog {
             let (_, spec, identity) = self
                 .block_intent(&target)?
                 .ok_or_else(|| Fault::new("E_NOT_FOUND", "managed block object is absent"))?;
+            let backing_identity = identity.ok_or_else(|| {
+                Fault::new("E_RESOURCE_UNAVAILABLE", "managed block object is staging")
+            })?;
             let object = BlockObject {
                 format: spec.format().into(),
-                backing_identity: identity.ok_or_else(|| {
-                    Fault::new("E_RESOURCE_UNAVAILABLE", "managed block object is staging")
-                })?,
+                verified_identity: self.verified_backing(&target, &backing_identity)?,
+                backing_identity,
                 spec,
             };
             if self.resource(&object.spec.resource_id)?["state"] != "available"
@@ -981,4 +1131,63 @@ pub(crate) fn publish_seal_record(
         params![op, id, op],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changed_legacy_device_and_replaced_generation_cannot_take_the_writer_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = File::open(temp.path()).unwrap();
+        let spec = BlockSpec {
+            resource_id: "head".into(),
+            capacity_bytes: 4096,
+            volume_id: Some("volume".into()),
+            backing_id: None,
+            content_sha256: None,
+            sealed: false,
+        };
+        let head = materialize(&root, "create", spec, None, None).unwrap();
+        let owner = lock_writer(&root, &head).unwrap();
+        let independent = open_object(&root, &head, true).unwrap();
+        crate::grants::prove_live_ofd(&independent, &owner).unwrap();
+        assert_eq!(
+            lock_writer(&root, &head).unwrap_err().code,
+            "E_VOLUME_WRITER_CONFLICT"
+        );
+        let (dev, ino) = backing_identity::live(&owner).unwrap();
+        let mut legacy = head.clone();
+        legacy.backing_identity = format!("inode:{}:{ino}", dev ^ 1);
+        assert_eq!(
+            lock_writer(&root, &legacy).unwrap_err().code,
+            "E_BACKING_IDENTITY_UNPROVEN"
+        );
+
+        if head.backing_identity.starts_with("handle-v1:") {
+            let mut wrong_generation = head.clone();
+            let last = wrong_generation.backing_identity.pop().unwrap();
+            wrong_generation.backing_identity.push(if last == '0' { '1' } else { '0' });
+            assert_eq!(
+                lock_writer(&root, &wrong_generation).unwrap_err().code,
+                "E_BLOCK_BACKING_CHANGED"
+            );
+        }
+        let name = temp.path().join("head/data");
+        let kept = name.with_file_name("old-data");
+        std::fs::rename(&name, &kept).unwrap();
+        let replacement = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(name)
+            .unwrap();
+        replacement.set_len(4096).unwrap();
+        assert_eq!(
+            lock_writer(&root, &head).unwrap_err().code,
+            "E_BLOCK_BACKING_CHANGED"
+        );
+        crate::grants::prove_live_ofd(&independent, &owner).unwrap();
+    }
 }

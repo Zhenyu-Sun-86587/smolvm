@@ -348,6 +348,7 @@ pub(crate) fn acquire_kernel(endpoint: &Endpoint, export: &Export) -> Result<Ker
 
 pub(crate) fn disk_roots(
     catalog: &Catalog,
+    objects: &File,
     operation: &Operation,
     source: &Execution,
     export: &Export,
@@ -404,15 +405,15 @@ pub(crate) fn disk_roots(
                 .map(|layer| &layer.spec.resource_id)
                 .eq(&attachment.layers)
             || closure.len() != block.managed_backing_identities.len()
-            || closure
-                .iter()
-                .zip(&block.managed_backing_identities)
-                .any(|(layer, (dev, ino))| layer.backing_identity != format!("inode:{dev}:{ino}"))
         {
             return Err(Fault::new(
                 "E_FENCE_UNPROVEN",
                 "captured block graph differs from its sealed generation",
             ));
+        }
+        for (layer, &(dev, ino)) in closure.iter().zip(&block.managed_backing_identities) {
+            let file = crate::blocks::open_object(objects, layer, false)?;
+            crate::grants::require_live_identity(&file, dev, ino)?;
         }
         roots.insert(root.clone(), ());
     }
@@ -443,6 +444,26 @@ pub(crate) fn open_disks(
         }
     }
     Ok(available)
+}
+
+pub(crate) fn open_restore_disks(
+    catalog: &Catalog,
+    objects: &File,
+    roots: &[String],
+) -> Result<(BTreeMap<String, File>, Vec<crate::blocks::VerifiedBacking>)> {
+    let mut available = BTreeMap::new();
+    let mut proofs = Vec::new();
+    for root in roots {
+        for layer in catalog.block_closure(root)? {
+            let id = layer.spec.resource_id.clone();
+            if let std::collections::btree_map::Entry::Vacant(entry) = available.entry(id) {
+                let (file, proof) = crate::blocks::open_for_statepoint_verification(objects, &layer)?;
+                entry.insert(file);
+                proofs.extend(proof);
+            }
+        }
+    }
+    Ok((available, proofs))
 }
 
 #[cfg(test)]

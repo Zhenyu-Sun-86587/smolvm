@@ -68,6 +68,7 @@ fn upgrades_both_version_30_capture_journals_without_losing_their_rows() {
         let work = tempfile::tempdir().unwrap();
         let path = work.path().join("catalog.sqlite");
         let old = Catalog::open(&path, "boot", "old").unwrap();
+        old.db.execute_batch("DROP TABLE verified_block_backings").unwrap();
         old.register_bundle(&format!("sha256:{}", "1".repeat(64)), &format!("sha256:{}", "2".repeat(64))).unwrap();
         old.db.execute_batch(
             "INSERT INTO operations SELECT 'fork','fork_batch',executable_sha256,'deep','parent',bundle_digest,
@@ -116,6 +117,7 @@ fn upgrades_both_version_30_capture_journals_without_losing_their_rows() {
             assert_eq!(journal.0, if cow { "kernel_cow" } else { "native" });
             assert_eq!(journal.1.as_deref(), relay.then_some("access-old"));
             assert_eq!(journal.2, i64::from(cow));
+            assert_eq!(current.db.query_row("SELECT count(*) FROM verified_block_backings", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
             assert_eq!(current.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 31);
         }
     }

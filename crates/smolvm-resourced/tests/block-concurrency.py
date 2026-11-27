@@ -316,7 +316,7 @@ def exercise(worker, root, worker_identity):
         table = [{"index": 0, "resource_id": "main-head", "role": "block_writer"}]
         reexport = {**first, "fd_table": table}
         aliased = owner.call(reexport, "ReconcileWriterSet", update, send=["main-head"],
-                             receive=True, error="E_HOST_IO")
+                             receive=True, error="E_BLOCK_BACKING_CHANGED")
         assert call("QueryWriterSet", operation_id=first["operation_id"])["state"] == "unknown"
         hardlink.unlink()
         reopened = owner.command("reopen", resource="independent-fd", path=str(main))

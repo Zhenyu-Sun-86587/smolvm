@@ -31,6 +31,7 @@ fn migrate_capture_journal(tx: &Transaction<'_>) -> Result<()> {
     if !relay {
         tx.execute_batch(ADD_FORK_RELAY_HOLD)?;
     }
+    tx.execute_batch(include_str!("schema_backing_identities.sql"))?;
     tx.pragma_update(None, "user_version", 31)?;
     Ok(())
 }

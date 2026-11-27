@@ -195,7 +195,8 @@ pub(crate) fn tick(c:&mut Catalog, points:&mut StatePoints, objects:&File, boot:
                         )?;
                     }
                 }
-                if job.stage=="restore_preflight" && matches!(error.code,"E_STATEPOINT_CORRUPT"|"E_VOLUME_GENERATION_MISMATCH"|"E_BUNDLE_UNAVAILABLE") {
+                if job.stage=="restore_preflight" && (crate::statepoints::terminal_backing_fault(&error)
+                    || matches!(error.code,"E_STATEPOINT_CORRUPT"|"E_VOLUME_GENERATION_MISMATCH"|"E_BUNDLE_UNAVAILABLE")) {
                     let tx=c.db.transaction()?;
                     tx.execute("UPDATE operations SET phase='ABORTED',decision='ABORT',revision=revision+1 WHERE operation_id=? AND phase='NEW'",[&job.id])?;
                     tx.execute("UPDATE managed_fork_batches SET stage='aborted',source_released=1 WHERE operation_id=?",[&job.id])?;
