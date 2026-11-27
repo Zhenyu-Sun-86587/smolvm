@@ -516,6 +516,7 @@ impl StatePoints {
     pub fn acquire_restore(
         &self,
         catalog: &mut Catalog,
+        objects: &File,
         request: &Request,
         target: &Execution,
     ) -> Result<Prepared> {
@@ -595,7 +596,11 @@ impl StatePoints {
         let mut disk_identities = HashMap::new();
         for root in &point.point.disk_generations {
             for layer in catalog.block_closure(root)? {
-                disk_identities.insert(layer.spec.resource_id, layer.backing_identity);
+                let file = crate::blocks::open_object(objects, &layer, false).map_err(statepoint_backing_fault)?;
+                let (dev, ino) = crate::backing_identity::live(&file).map_err(host_io)?;
+                // The target compares this proof to the read-only FDs in its
+                // current execution. The durable catalog identity stays local.
+                disk_identities.insert(layer.spec.resource_id, format!("inode:{dev}:{ino}"));
             }
         }
         let lease = catalog.acquire_lease(&LeaseRecord {

@@ -632,7 +632,7 @@ impl Worker {
                 let execution = self.authenticated_execution(request, peer)?;
                 let restore =
                     self.statepoints
-                        .acquire_restore(&mut self.catalog, request, &execution)?;
+                        .acquire_restore(&mut self.catalog, &self.objects, request, &execution)?;
                 return Ok(Reply {
                     result: restore.result,
                     table: restore.table,
