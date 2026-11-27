@@ -64,11 +64,14 @@ fn lost_anchor_leaves_activation_authority_only_for_the_imported_execution() {
 
 #[test]
 fn upgrades_both_version_30_capture_journals_without_losing_their_rows() {
-    for (version, cow, relay) in [(29, false, false), (30, true, false), (30, false, true)] {
+    for (version, cow, relay) in [(29, false, false), (30, true, false), (30, false, true), (31, true, false)] {
         let work = tempfile::tempdir().unwrap();
         let path = work.path().join("catalog.sqlite");
         let old = Catalog::open(&path, "boot", "old").unwrap();
         old.db.execute_batch("DROP TABLE verified_block_backings").unwrap();
+        if version < 31 {
+            old.db.execute_batch("ALTER TABLE managed_fork_children DROP COLUMN capture_lost").unwrap();
+        }
         old.register_bundle(&format!("sha256:{}", "1".repeat(64)), &format!("sha256:{}", "2".repeat(64))).unwrap();
         old.db.execute_batch(
             "INSERT INTO operations SELECT 'fork','fork_batch',executable_sha256,'deep','parent',bundle_digest,
@@ -118,7 +121,7 @@ fn upgrades_both_version_30_capture_journals_without_losing_their_rows() {
             assert_eq!(journal.1.as_deref(), relay.then_some("access-old"));
             assert_eq!(journal.2, i64::from(cow));
             assert_eq!(current.db.query_row("SELECT count(*) FROM verified_block_backings", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
-            assert_eq!(current.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 31);
+            assert_eq!(current.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 32);
         }
     }
 }

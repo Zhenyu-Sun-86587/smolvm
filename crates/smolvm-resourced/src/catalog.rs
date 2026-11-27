@@ -19,11 +19,13 @@ const ADD_FORK_RELAY_HOLD: &str =
 // Two pre-release version-30 catalogs exist. They committed either the
 // CoW journal or the relay hold column. Preserve each layout's data.
 fn migrate_capture_journal(tx: &Transaction<'_>) -> Result<()> {
-    let (cow, relay): (bool, bool) = tx.query_row(
+    let (cow, relay, capture_loss, verified_backings): (bool, bool, bool, bool) = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='kernel_mm_anchors'),
-                EXISTS(SELECT 1 FROM pragma_table_info('managed_fork_batches') WHERE name='credential_relay_hold')",
+                EXISTS(SELECT 1 FROM pragma_table_info('managed_fork_batches') WHERE name='credential_relay_hold'),
+                EXISTS(SELECT 1 FROM pragma_table_info('managed_fork_children') WHERE name='capture_lost'),
+                EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='verified_block_backings')",
         [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     if !cow {
         tx.execute_batch(include_str!("schema_kernel_mm_anchors.sql"))?;
@@ -31,8 +33,13 @@ fn migrate_capture_journal(tx: &Transaction<'_>) -> Result<()> {
     if !relay {
         tx.execute_batch(ADD_FORK_RELAY_HOLD)?;
     }
-    tx.execute_batch(include_str!("schema_backing_identities.sql"))?;
-    tx.pragma_update(None, "user_version", 31)?;
+    if !capture_loss {
+        tx.execute_batch(include_str!("schema_kernel_fork_capture_loss.sql"))?;
+    }
+    if !verified_backings {
+        tx.execute_batch(include_str!("schema_backing_identities.sql"))?;
+    }
+    tx.pragma_update(None, "user_version", 32)?;
     Ok(())
 }
 
@@ -317,7 +324,7 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
                 migrate_capture_journal(&tx)?;
             }
-            1..=31 => {
+            1..=32 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -405,7 +412,7 @@ impl Catalog {
                 if version < 29 {
                     tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
                 }
-                if version < 31 {
+                if version < 32 {
                     migrate_capture_journal(&tx)?;
                 }
                 crate::packet_wake::recover(&tx)?;
@@ -481,6 +488,26 @@ impl Catalog {
         Ok(())
     }
 
+    pub(crate) fn can_complete_managed_recovery(&self) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM executions e JOIN native_endpoints n USING(incarnation_id)
+                            WHERE e.phase='registered' OR (e.phase='exited' AND e.host_boot_id<>(SELECT host_boot_id FROM worker_state)))
+                 OR EXISTS (SELECT 1 FROM managed_launches m JOIN operations o USING(operation_id)
+                            WHERE o.phase='NEW')
+                 OR EXISTS (SELECT 1 FROM managed_fork_batches b JOIN operations o USING(operation_id)
+                            JOIN executions e ON e.incarnation_id=b.source_incarnation
+                            JOIN kernel_mm_anchors a ON a.operation_id=o.operation_id AND a.capture_id=b.capture_id
+                            WHERE o.phase IN ('NEW','COMPLETED') AND b.selected_memory_fork_backend='kernel_cow'
+                              AND b.source_released=1 AND b.stage IN ('children','complete') AND e.phase='exited'
+                              AND o.route_id=e.route_id AND o.bundle_digest=e.bundle_digest AND o.instance_id=e.instance_id
+                              AND o.expected_incarnation_id=e.incarnation_id AND o.expected_execution_epoch=e.execution_epoch
+                              AND a.source_incarnation=e.incarnation_id AND a.source_epoch=e.execution_epoch
+                              AND a.source_session=b.session AND a.host_boot_id=e.host_boot_id)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn complete_recovery(&mut self, session: &str) -> Result<Value> {
         let tx = self
             .db
@@ -491,7 +518,7 @@ impl Catalog {
         // them on the same recovery barrier when they acquire resources.
         let outstanding: bool = tx.query_row(
             "WITH accounted_kernel_cuts AS (
-                 SELECT a.capture_id,a.operation_id,a.source_incarnation,a.source_epoch,a.source_session,a.host_boot_id
+                 SELECT a.capture_id,a.operation_id,a.source_incarnation,a.source_epoch,a.source_session,a.host_boot_id,ram.state
                  FROM kernel_mm_anchors a JOIN resources ram ON ram.resource_id=a.resource_id
                  WHERE a.resource_id=a.capture_id AND ram.created_by_operation=a.operation_id
                    AND ram.kind='descriptor' AND ram.durability='volatile'
@@ -501,7 +528,7 @@ impl Catalog {
                            AND p.owner_kind='fork_capture' AND p.owner_id=a.operation_id AND p.state='active'))
                         OR (ram.state='lost' AND a.failure IS NOT NULL))
              ), replayable_forks AS (
-                 SELECT b.operation_id,o.route_id,o.bundle_digest FROM managed_fork_batches b
+                 SELECT b.operation_id,b.serve_instance,o.route_id,o.bundle_digest FROM managed_fork_batches b
                  JOIN operations o USING(operation_id)
                  JOIN executions e ON e.incarnation_id=b.source_incarnation
                  LEFT JOIN native_endpoints n ON n.incarnation_id=e.incarnation_id
@@ -512,11 +539,11 @@ impl Catalog {
                    AND k.source_incarnation=e.incarnation_id AND k.source_epoch=e.execution_epoch
                    AND k.source_session=b.session AND k.host_boot_id=e.host_boot_id
                  WHERE o.kind IN ('independent_fork','fork_batch') AND o.phase='NEW'
-                   AND e.host_boot_id=(SELECT host_boot_id FROM worker_state)
                    AND o.route_id=e.route_id AND o.bundle_digest=e.bundle_digest AND o.instance_id=e.instance_id
                    AND o.expected_incarnation_id=e.incarnation_id AND o.expected_execution_epoch=e.execution_epoch
-                   AND ((e.phase='registered' AND n.incarnation_id IS NOT NULL)
-                        OR (k.operation_id IS NOT NULL AND e.phase='exited' AND b.source_released=1 AND b.stage='children'))
+                   AND ((e.host_boot_id=(SELECT host_boot_id FROM worker_state) AND e.phase='registered' AND n.incarnation_id IS NOT NULL)
+                        OR (k.operation_id IS NOT NULL AND e.phase='exited' AND b.source_released=1 AND b.stage='children'
+                            AND (e.host_boot_id=(SELECT host_boot_id FROM worker_state) OR k.state='lost')))
                    AND ((b.checkpoint IS NULL AND f.resource_id IS NULL) OR
                         (b.selected_memory_fork_backend='native' AND f.state='committed'
                          AND r.state='available' AND f.incarnation_id=e.incarnation_id
@@ -530,7 +557,17 @@ impl Catalog {
                  JOIN operations o ON o.operation_id=ch.operation_id
                  WHERE o.kind='restore_target' AND o.instance_id=ch.instance_id
                    AND o.route_id=f.route_id AND o.bundle_digest=f.bundle_digest
-                   AND o.expected_execution_epoch=ch.prior_epoch
+                   AND o.expected_execution_epoch=ch.prior_epoch AND o.expected_incarnation_id IS NULL
+                   AND m.serve_instance=f.serve_instance AND m.machine_name=ch.name
+                 UNION ALL
+                 SELECT o.operation_id FROM managed_launches m JOIN operations o USING(operation_id)
+                 JOIN instance_bindings b ON b.route_id=o.route_id AND b.instance_id=o.instance_id
+                 WHERE (o.kind='launch' OR (o.kind='restore_target' AND EXISTS (
+                            SELECT 1 FROM managed_state_restores s WHERE s.operation_id=o.operation_id)))
+                   AND o.phase='NEW' AND o.expected_incarnation_id IS NULL
+                   AND b.active_operation_id=o.operation_id AND b.incarnation_id IS NULL
+                   AND b.execution_epoch=o.expected_execution_epoch
+                   AND NOT EXISTS (SELECT 1 FROM executions e WHERE e.incarnation_id=m.incarnation_id)
              )
              SELECT EXISTS (SELECT 1 FROM executions WHERE phase='unknown')
                 OR EXISTS (SELECT 1 FROM operations o WHERE o.phase='NEW'
@@ -756,6 +793,9 @@ impl Catalog {
             return Err(conflict("E_STALE_REVISION", "operation revision changed"));
         }
         let id = &operation.operation_id;
+        if abort && crate::managed::live_claim(self, id)?.is_some() {
+            return Err(conflict("E_OPERATION_IN_PROGRESS", "managed launch process still exists"));
+        }
         let restored_products = if !abort && operation.kind == "restore_target" {
             crate::product_volumes::independent_restore_products(self, &operation)?
         } else {
@@ -896,6 +936,13 @@ impl Catalog {
             || expected.incarnation_id.is_none()
             || operation.phase != "NEW"
         {
+            return Err(stale());
+        }
+        let planned: Option<String> = self.db.query_row(
+            "SELECT incarnation_id FROM managed_launches WHERE operation_id=?",
+            [&operation.operation_id], |row| row.get(0),
+        ).optional()?;
+        if planned.is_some() && planned != expected.incarnation_id {
             return Err(stale());
         }
         Ok(())

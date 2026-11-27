@@ -594,7 +594,7 @@ fn pinned(c: &Catalog, operation_id: &str, capture_id: &str) -> Result<Record> {
             "kernel CoW anchor belongs to another capture operation",
         ));
     }
-    if record.resource_state.as_deref() != Some("available")
+    if record.failed || record.resource_state.as_deref() != Some("available")
         || !c.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM root_refs WHERE resource_id=? AND state='active')",
             [capture_id],
@@ -604,6 +604,10 @@ fn pinned(c: &Catalog, operation_id: &str, capture_id: &str) -> Result<Record> {
         return Err(lost());
     }
     Ok(record)
+}
+
+pub(crate) fn require_pinned(c: &Catalog, operation_id: &str, capture_id: &str) -> Result<()> {
+    pinned(c, operation_id, capture_id).map(|_| ())
 }
 
 pub(crate) fn acquire(

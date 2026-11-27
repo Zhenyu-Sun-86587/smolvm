@@ -89,14 +89,18 @@ fn directory(path: &Path, mode: u32, uid: u32, gid: u32) -> Result<()> {
     Ok(())
 }
 
-fn paths(plan: &Plan) -> Result<(PathBuf, PathBuf, u32, u32)> {
-    let serve = deep_state::require_instance()?;
+fn logs_dir() -> Result<PathBuf> {
     let state = PathBuf::from(
         std::env::var_os("SMOLVM_DATA_DIR").ok_or_else(|| failed("missing state directory"))?,
     );
     let logs = state.join("managed");
     deep_state::require_private_path(&logs)?;
     directory(&logs, 0o700, 0, 0)?;
+    Ok(logs)
+}
+
+fn paths(plan: &Plan, logs: &Path) -> Result<(PathBuf, PathBuf, u32, u32)> {
+    let serve = deep_state::require_instance()?;
     let incarnation = plan
         .launch
         .execution
@@ -138,6 +142,23 @@ fn paths(plan: &Plan) -> Result<(PathBuf, PathBuf, u32, u32)> {
 
 fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
     let launch = &plan.launch;
+    let logs = logs_dir()?;
+    // Serialize the same scope across Serve processes and retry attempts.
+    let scope = systemd_scope::scope_name(&plan.machine.name);
+    let scope_lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(logs.join(format!("{scope}.lock")))?;
+    if unsafe { libc::flock(scope_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
     let binding = client
         .binding(&launch.execution.instance_id)
         .map_err(failed)?;
@@ -149,13 +170,25 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
     {
         return abort_launch(client, plan, &binding.expected());
     }
-    if binding.incarnation_id.is_none()
-        && plan.restore.as_ref().is_some_and(|restore| restore.durable.is_some())
-        && !client.prepare_state_restore(launch, &binding.expected()).map_err(failed)?
-    {
-        return Ok(());
+    if binding.incarnation_id.is_none() {
+        let prior = binding.expected();
+        match client.managed_launch_claimed(launch) {
+            Ok(true) => return Ok(()),
+            Ok(false) => (),
+            Err(error) if error.code == "E_CAPTURE_LOST" => {
+                return abort_launch(client, plan, &prior);
+            }
+            Err(error) => return Err(failed(error)),
+        }
+        if plan.restore.as_ref().is_some_and(|restore| restore.durable.is_some())
+            && !client.prepare_state_restore(launch, &prior).map_err(failed)?
+        {
+            return Ok(());
+        }
+    } else if binding.expected() != launch.execution {
+        return Err(failed("active incarnation differs from pending launch"));
     }
-    let (control, log, uid, gid) = paths(plan)?;
+    let (control, log, uid, gid) = paths(plan, &logs)?;
     let mut child = None;
     if binding.incarnation_id.is_none() {
         let prior = binding.expected();
@@ -205,7 +238,8 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
                 cpu_quota_usec_per_sec: Some(u64::from(plan.machine.cpus) * 1_000_000),
                 tasks_max: Some(256),
             };
-            systemd_scope::adopt_into_scope(&plan.machine.name, pid, &caps)?;
+            systemd_scope::adopt_managed_scope(&plan.machine.name, pid, &caps)?;
+            systemd_scope::wait_for_managed_adoption(&plan.machine.name, &mut proc)?;
             let permit = client.issue_permit(launch, pid, uid).map_err(failed)?;
             let boot = Boot {
                 plan: plan.clone(),
@@ -216,7 +250,7 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
                 helper: super::launch::measured_helper()?,
                 uid,
                 gid,
-                scope: systemd_scope::scope_name(&plan.machine.name),
+                scope,
                 network,
             };
             let mut channel = proc
@@ -229,12 +263,12 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
         if let Err(e) = setup {
             drop(proc.stdin.take());
             let _ = proc.kill();
-            let _ = proc.wait();
+            if proc.wait().is_ok() {
+                repair_empty_scope(plan);
+            }
             return Err(e);
         }
         child = Some(proc);
-    } else if binding.expected() != launch.execution {
-        return Err(failed("active incarnation differs from pending launch"));
     }
     // Reconcile a surviving child through its credential-checked native endpoint.
     // Before registration a second process can never obtain the original claim.
@@ -326,7 +360,15 @@ fn abort_launch(client: &Client<'_>, plan: &Plan, expected: &ExecutionRef) -> Re
     .map_err(failed)?;
     client
         .finish_launch(&plan.launch, expected, true, op.revision)
-        .map_err(failed)
+        .map_err(failed)?;
+    repair_empty_scope(plan);
+    Ok(())
+}
+
+fn repair_empty_scope(plan: &Plan) {
+    if let Err(error) = systemd_scope::stop_empty_managed_scope(&plan.machine.name) {
+        tracing::warn!(machine=%plan.machine.name, %error, "Empty managed scope cleanup");
+    }
 }
 
 /// Internal VMM entry point. The parent sends the permit after systemd adopts this PID.

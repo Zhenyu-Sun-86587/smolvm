@@ -54,7 +54,7 @@ def worker_ready(path):
         peer.settimeout(5)
         peer.connect(str(path))
         peer.send(json.dumps(packet).encode())
-        return "result" in json.loads(peer.recv(65536))
+        return json.loads(peer.recv(65536)).get("result", {}).get("state") == "ready"
 
 def confirmed(endpoint, receipt, disposition):
     def query():

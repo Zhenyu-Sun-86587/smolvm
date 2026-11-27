@@ -271,8 +271,13 @@ impl Worker {
         // its other resources before dropping the execution's ownership.
         let previous_boot = {
             let mut query = self.catalog.db.prepare(
-                "SELECT e.incarnation_id FROM executions e JOIN native_endpoints n USING(incarnation_id)
-                 WHERE e.phase='unknown' AND e.host_boot_id<>?",
+                "SELECT e.incarnation_id FROM executions e
+                 WHERE e.phase='unknown' AND e.host_boot_id<>? AND (
+                    EXISTS (SELECT 1 FROM native_endpoints n WHERE n.incarnation_id=e.incarnation_id)
+                    OR EXISTS (SELECT 1 FROM managed_launches m JOIN operations o USING(operation_id)
+                        WHERE m.incarnation_id=e.incarnation_id AND m.operation_id=e.last_operation_id
+                          AND o.instance_id=e.instance_id AND o.route_id=e.route_id
+                          AND o.bundle_digest=e.bundle_digest AND o.expected_execution_epoch+1=e.execution_epoch))",
             )?;
             let rows = query.query_map([&self.boot], |row| row.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -342,14 +347,7 @@ impl Worker {
         if retired {
             self.network.cleanup_namespace_pins(&self.catalog)?;
         }
-        let confirmed_managed: bool = self.catalog.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM executions e
-            JOIN native_endpoints n USING(incarnation_id) WHERE e.phase='registered'
-                OR (e.phase='exited' AND e.host_boot_id<>?))",
-            [&self.boot],
-            |row| row.get(0),
-        )?;
-        if !confirmed_managed {
+        if !self.catalog.can_complete_managed_recovery()? {
             return Ok(());
         }
         let session = health["broker_session_id"]

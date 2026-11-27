@@ -498,7 +498,13 @@ pub(crate) fn pending(c: &Catalog, serve: &str, bundle: &str) -> Result<Vec<Plan
     }
     let mut q = c.db.prepare(
         "SELECT m.operation_id FROM managed_launches m JOIN operations o USING(operation_id)
-        WHERE m.serve_instance=? AND o.bundle_digest=? AND o.phase='NEW' ORDER BY m.rowid",
+        WHERE m.serve_instance=? AND o.bundle_digest=? AND o.phase='NEW'
+          AND ((SELECT NOT recovering FROM worker_state) OR EXISTS (
+              SELECT 1 FROM executions e WHERE e.incarnation_id=m.incarnation_id
+                AND e.last_operation_id=o.operation_id AND e.instance_id=o.instance_id
+                AND e.route_id=o.route_id AND e.bundle_digest=o.bundle_digest
+                AND e.execution_epoch=o.expected_execution_epoch+1))
+        ORDER BY m.rowid",
     )?;
     let ids = q.query_map(params![serve, bundle], |r| r.get::<_, String>(0))?;
     ids.map(|id| {
@@ -512,37 +518,36 @@ pub struct DiskSet {
     pub layers: Vec<BlockObject>,
 }
 
-/// Persist the exact pre-registration process across Worker and Serve restarts.
-pub(crate) fn claim(c: &Catalog, op: &str, boot: &str, pid: i32, start: i64) -> Result<()> {
-    let row: Option<(Option<String>, Option<i32>, Option<i64>)> =
+/// Resolve only the current boot's exact pre-registration process.
+pub(crate) fn live_claim(c: &Catalog, op: &str) -> Result<Option<(i32, i64)>> {
+    let row: Option<(Option<i32>, Option<i64>)> =
         c.db.query_row(
-            "SELECT claim_boot,claim_pid,claim_start FROM managed_launches WHERE operation_id=?",
+            "SELECT claim_pid,claim_start FROM managed_launches WHERE operation_id=?
+             AND claim_boot=(SELECT host_boot_id FROM worker_state)",
             [op],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((claimed_boot, old_pid, old_start)) = row else {
-        return Ok(());
+    let Some((pid, start)) = row else {
+        return Ok(None);
     };
-    if claimed_boot.as_deref() == Some(boot) {
-        let (old_pid, old_start) = old_pid
-            .zip(old_start)
-            .ok_or_else(|| Fault::new("E_CATALOG", "incomplete managed process claim"))?;
-        if old_pid == pid && old_start == start {
+    let claim = pid.zip(start)
+        .ok_or_else(|| Fault::new("E_CATALOG", "incomplete managed process claim"))?;
+    let exited = crate::worker::recorded_process_exited(claim.0, claim.1)
+        .map_err(|e| Fault::new("E_FENCE_UNPROVEN", e.to_string()))?;
+    Ok((!exited).then_some(claim))
+}
+
+/// Persist the exact pre-registration process across Worker and Serve restarts.
+pub(crate) fn claim(c: &Catalog, op: &str, boot: &str, pid: i32, start: i64) -> Result<()> {
+    if let Some(previous) = live_claim(c, op)? {
+        if previous == (pid, start) {
             return Ok(());
         }
-        match crate::worker::pid_start(old_pid) {
-            Ok(observed) if observed == old_start => {
-                return Err(Fault::new(
-                    "E_OPERATION_IN_PROGRESS",
-                    "previous launch process still exists",
-                ))
-            }
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(Fault::new("E_FENCE_UNPROVEN", e.to_string()))
-            }
-            _ => {}
-        }
+        return Err(Fault::new(
+            "E_OPERATION_IN_PROGRESS",
+            "previous launch process still exists",
+        ));
     }
     c.db.execute(
         "UPDATE managed_launches SET claim_boot=?,claim_pid=?,claim_start=? WHERE operation_id=?",

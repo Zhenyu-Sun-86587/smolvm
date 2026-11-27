@@ -722,6 +722,7 @@ mod tests {
                 catalog.db.execute_batch(
                     "DROP TABLE kernel_cow_imports; DROP TABLE kernel_mm_anchors; DROP TABLE kernel_statepoint_checkpoints;
                      DROP TABLE verified_block_backings;
+                     ALTER TABLE managed_fork_children DROP COLUMN capture_lost;
                      ALTER TABLE managed_fork_batches DROP COLUMN memory_fork_backend;
                      ALTER TABLE managed_fork_batches DROP COLUMN selected_memory_fork_backend;
                      ALTER TABLE managed_fork_batches DROP COLUMN kernel_export_deadline;

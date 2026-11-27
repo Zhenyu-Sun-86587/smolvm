@@ -160,8 +160,10 @@ pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
                r.get::<_,Option<String>>(8)?))).optional()? else {return Ok(None)};
     let mut stmt = c.db.prepare(
         "SELECT ch.name,ch.instance_id,ch.operation_id,
-             CASE WHEN (ch.cancelled=1 OR ch.admission_error IS NOT NULL) AND o.operation_id IS NULL THEN 'ABORTED' ELSE COALESCE(o.phase,'RESERVED') END,
-             m.incarnation_id,ch.prior_epoch,ch.attempt,ch.cancelled,ch.admission_error,
+             CASE WHEN (ch.cancelled=1 OR ch.capture_lost=1 OR ch.admission_error IS NOT NULL) AND o.operation_id IS NULL
+                 THEN 'ABORTED' ELSE COALESCE(o.phase,'RESERVED') END,
+             m.incarnation_id,ch.prior_epoch,ch.attempt,ch.cancelled,
+             CASE WHEN ch.capture_lost=1 THEN 'E_CAPTURE_LOST' ELSE ch.admission_error END,
              CASE WHEN o.phase='COMPLETED' THEN EXISTS(
                 SELECT 1 FROM product_volume_attachments a
                 WHERE a.instance_id=ch.instance_id AND a.declared_epoch=ch.prior_epoch
@@ -450,10 +452,13 @@ pub(crate) fn retry(c: &mut Catalog, r: &Request, control: Control) -> Result<Op
     if op.phase != "COMPLETED" {
         return Err(conflict("wait for the existing target attempts to settle"));
     }
-    let (capture, selected): (String, String) = c.db.query_row(
-        "SELECT capture_id,selected_memory_fork_backend FROM managed_fork_batches WHERE operation_id=?",
+    c.ready()?;
+    let (capture, selected, lost_child): (String, String, bool) = c.db.query_row(
+        "SELECT capture_id,selected_memory_fork_backend,EXISTS(SELECT 1 FROM managed_fork_children ch
+           WHERE ch.batch_id=b.operation_id AND ch.capture_lost=1)
+         FROM managed_fork_batches b WHERE operation_id=?",
         [id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let failed = {
         let mut stmt = c.db.prepare("SELECT ch.ordinal,ch.attempt,ch.instance_id,b.execution_epoch,
@@ -461,18 +466,18 @@ pub(crate) fn retry(c: &mut Catalog, r: &Request, control: Control) -> Result<Op
             FROM managed_fork_children ch JOIN operations o ON ch.operation_id=o.operation_id
             JOIN managed_budget_holds h ON h.operation_id=o.operation_id AND h.instance_id=ch.instance_id
             JOIN instance_bindings b ON b.route_id=o.route_id AND b.instance_id=ch.instance_id
-            WHERE ch.batch_id=? AND ch.cancelled=0 AND o.phase='ABORTED' AND h.state='released'
+            WHERE ch.batch_id=? AND ch.cancelled=0 AND ch.capture_lost=0 AND o.phase='ABORTED' AND h.state='released'
               AND b.incarnation_id IS NULL AND b.active_operation_id IS NULL")?;
         let rows=stmt.query_map([id],|row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,
             row.get::<_,String>(2)?,row.get::<_,i64>(3)?,Capacity { vcpus:row.get::<_,i64>(4)? as u64,memory_mib:row.get::<_,i64>(5)? as u64,storage_bytes:row.get::<_,i64>(6)? as u64 })))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
+    if selected == "kernel_cow" && (lost_child || !failed.is_empty()) {
+        crate::kernel_mm_anchor::acquire(c, id, &capture)?;
+    }
     if failed.is_empty() {
         return Err(conflict("batch has no fenced failed targets to retry"));
-    }
-    if selected == "kernel_cow" {
-        crate::kernel_mm_anchor::acquire(c, id, &capture)?;
     }
     let tx = c.db.transaction()?;
     for (ordinal, prior_attempt, instance, epoch, capacity) in failed {
@@ -506,7 +511,7 @@ pub(crate) fn cancel(c: &mut Catalog, r: &Request, control: Control) -> Result<O
     let tx=c.db.transaction()?;
     tx.execute("UPDATE managed_fork_batches SET cancel_requested=1,
         stage=CASE WHEN stage IN ('arming','parking') THEN 'cancel_gate' WHEN stage='restore_preflight' THEN 'cancel_preflight' ELSE stage END WHERE operation_id=?",[id])?;
-    tx.execute("UPDATE managed_fork_children AS ch SET cancelled=1 WHERE batch_id=? AND ch.admission_error IS NULL
+    tx.execute("UPDATE managed_fork_children AS ch SET cancelled=1 WHERE batch_id=? AND ch.capture_lost=0 AND ch.admission_error IS NULL
          AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.operation_id=ch.operation_id AND o.phase IN ('ABORTED','COMPLETED'))
          AND NOT EXISTS(SELECT 1 FROM target_activations a WHERE a.operation_id=ch.operation_id AND a.decision='commit')", [id])?;
     tx.execute("UPDATE operations SET revision=revision+1 WHERE operation_id=?",[id])?;
@@ -1190,7 +1195,7 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
     let base: Machine = serde_json::from_str(&template).map_err(invalid)?;
     let disks: BTreeMap<String, (String,String)> = serde_json::from_str(&disks).map_err(invalid)?;
     let mut pending = {
-        let mut q=c.db.prepare("SELECT ch.operation_id,ch.name,ch.instance_id,ch.prior_epoch FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.batch_id=? AND o.operation_id IS NULL AND ch.cancelled=0 AND ch.admission_error IS NULL ORDER BY ch.ordinal")?;
+        let mut q=c.db.prepare("SELECT ch.operation_id,ch.name,ch.instance_id,ch.prior_epoch FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.batch_id=? AND o.operation_id IS NULL AND ch.cancelled=0 AND ch.capture_lost=0 AND ch.admission_error IS NULL ORDER BY ch.ordinal")?;
         let rows = q
             .query_map([&j.id], |r| {
                 Ok((
@@ -1210,8 +1215,8 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
             }
             let tx = c.db.transaction()?;
             tx.execute(
-                "UPDATE managed_fork_children AS ch SET admission_error='E_CAPTURE_LOST'
-                 WHERE batch_id=? AND cancelled=0 AND admission_error IS NULL
+                "UPDATE managed_fork_children AS ch SET capture_lost=1
+                 WHERE batch_id=? AND cancelled=0 AND capture_lost=0 AND admission_error IS NULL
                    AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.operation_id=ch.operation_id)",
                 [&j.id],
             )?;
@@ -1222,6 +1227,11 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
             tx.commit()?;
             pending.clear();
         }
+    }
+    match c.ready() {
+        Ok(()) => (),
+        Err(error) if error.code == "E_RECOVERING" => pending.clear(),
+        Err(error) => return Err(error),
     }
     for (op, name, instance, epoch) in pending {
         let mut machine = base.clone();
@@ -1264,9 +1274,9 @@ fn dispatch_children(c: &mut Catalog, j: &Job) -> Result<()> {
         tx.commit()?;
     }
     let (total, done, failed, retryable): (i64,i64,i64,i64) = c.db.query_row(
-        "SELECT COUNT(*),COUNT(CASE WHEN o.phase IN ('COMPLETED','ABORTED') OR (o.phase IS NULL AND (ch.cancelled=1 OR ch.admission_error IS NOT NULL)) THEN 1 END),
-             COUNT(CASE WHEN o.phase='ABORTED' OR ch.cancelled=1 OR ch.admission_error IS NOT NULL THEN 1 END),
-             COUNT(CASE WHEN o.phase='ABORTED' AND ch.cancelled=0 THEN 1 END)
+        "SELECT COUNT(*),COUNT(CASE WHEN o.phase IN ('COMPLETED','ABORTED') OR (o.phase IS NULL AND (ch.cancelled=1 OR ch.capture_lost=1 OR ch.admission_error IS NOT NULL)) THEN 1 END),
+             COUNT(CASE WHEN o.phase='ABORTED' OR ch.cancelled=1 OR ch.capture_lost=1 OR ch.admission_error IS NOT NULL THEN 1 END),
+             COUNT(CASE WHEN o.phase='ABORTED' AND ch.cancelled=0 AND ch.capture_lost=0 THEN 1 END)
          FROM managed_fork_children ch LEFT JOIN operations o ON o.operation_id=ch.operation_id WHERE ch.batch_id=?",
          [&j.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     if total == done && total > 0 {

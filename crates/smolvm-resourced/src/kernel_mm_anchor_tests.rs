@@ -147,8 +147,10 @@ fn recovery_replays_only_the_original_accounted_kernel_cut() {
          DELETE FROM native_endpoints;
          UPDATE managed_fork_batches SET source_released=0;",
     ).unwrap();
+    assert!(!catalog.can_complete_managed_recovery().unwrap());
     blocked(&mut catalog);
     catalog.db.execute("UPDATE managed_fork_batches SET source_released=1", []).unwrap();
+    assert!(catalog.can_complete_managed_recovery().unwrap());
     assert_eq!(catalog.complete_recovery("second").unwrap()["state"], "ready");
     helper.exit();
     reconcile(&catalog).unwrap();
@@ -156,6 +158,123 @@ fn recovery_replays_only_the_original_accounted_kernel_cut() {
     assert_eq!(catalog.complete_recovery("second").unwrap()["state"], "ready");
     assert_eq!(catalog.resource("cut").unwrap()["state"], "lost");
     assert!(pinned(&catalog, "op", "cut").is_err());
+}
+
+#[test]
+fn recovery_settles_the_original_lost_cut_across_boot_without_launching() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("catalog.sqlite");
+    let source = TestProcess::start();
+    let mut helper = TestProcess::start();
+    let first = recorded(&path, &source, &helper, "fork_batch", "fork_capture");
+    first.db.execute_batch(
+        r#"UPDATE executions SET phase='exited';
+         UPDATE managed_fork_batches SET stage='children',source_released=1,checkpoint=x'01',
+            disk_json='{}',helper_digest='helper',
+            template='{"name":"template","boot_profile":"system","cpus":1,"memory_mib":64,"disks":[],"init":"/init"}';
+         INSERT INTO managed_fork_children (batch_id,ordinal,name,instance_id,operation_id,prior_epoch,attempt)
+            VALUES('op',0,'done','child-0','done-op',0,0),('op',1,'retry','child-1','retry-op',1,1);
+         INSERT INTO operations
+            SELECT 'done-op','restore_target','request','deep','child-0',bundle_digest,0,NULL,'COMPLETED','NONE',2
+            FROM runtime_bundles;
+         INSERT INTO managed_budget_holds VALUES('child-1','op',NULL,1,64,1,'reserved');
+         INSERT INTO managed_fork_retries VALUES('op',1);"#,
+    ).unwrap();
+    drop(first);
+
+    let mut catalog = Catalog::open(&path, "boot-b", "second").unwrap();
+    assert!(catalog.can_complete_managed_recovery().unwrap());
+    assert_eq!(catalog.complete_recovery("second").unwrap_err().code, "E_RECOVERING");
+    reconcile(&catalog).unwrap();
+    assert_eq!(catalog.complete_recovery("second").unwrap()["state"], "ready");
+    assert!(helper.0.try_wait().unwrap().is_none(), "must not signal an earlier boot's PID");
+    crate::managed_fork::Actor::default()
+        .tick(&mut catalog, &mut crate::escrow::Escrow::default(), "boot-b").unwrap();
+    assert_eq!(catalog.resource("cut").unwrap()["state"], "lost");
+    let operation = catalog.operation("op").unwrap();
+    let receipt = operation.fork.unwrap();
+    assert_eq!(operation.phase, "COMPLETED");
+    assert_eq!(receipt["capture_id"], "cut");
+    assert_eq!(receipt["children"][0]["phase"], "COMPLETED");
+    assert_eq!(receipt["children"][1], json!({
+        "name":"retry", "instance_id":"child-1", "operation_id":"retry-op", "phase":"ABORTED",
+        "incarnation_id":null, "execution_epoch":2, "attempt":1, "cancelled":false,
+        "admission_error":"E_CAPTURE_LOST", "has_product_volumes":false,
+    }));
+    assert_eq!(catalog.operation("retry-op").unwrap_err().code, "E_NOT_FOUND");
+    let holds: String = catalog.db.query_row("SELECT state FROM managed_budget_holds", [], |r| r.get(0)).unwrap();
+    assert_eq!(holds, "released");
+    let request: ipc::Request = serde_json::from_value(json!({
+        "protocol":ipc::PROTOCOL, "method":"RetryManagedFork", "request_id":"retry",
+        "route_id":"deep", "operation_id":"op", "request_digest":"request", "bundle_digest":digest(b"bundle"),
+        "expected":{"instance_id":"machine", "incarnation_id":"source", "execution_epoch":1},
+    })).unwrap();
+    use crate::managed_fork::retry;
+    let control = |revision| serde_json::from_value(json!({"expected_revision":revision})).unwrap();
+    assert_eq!(retry(&mut catalog, &request, control(operation.revision)).unwrap_err().code, "E_CAPTURE_LOST");
+    catalog.db.execute("UPDATE worker_state SET recovering=1", []).unwrap();
+    let replay = retry(&mut catalog, &request, control(1)).unwrap();
+    assert_eq!(replay.fork.unwrap(), receipt);
+    assert_eq!(retry(&mut catalog, &request, control(operation.revision)).unwrap_err().code, "E_RECOVERING");
+}
+
+#[test]
+fn recovery_hides_unregistered_target_and_fences_its_exact_process_claim() {
+    use crate::managed::{claim, live_claim, pending};
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("catalog.sqlite");
+    let source = TestProcess::start();
+    let helper = TestProcess::start();
+    let mut old = TestProcess::start();
+    let next = TestProcess::start();
+    let serve = "0123456789abcdef0123456789abcdef";
+    let bundle = digest(b"bundle");
+    let first = recorded(&path, &source, &helper, "fork_batch", "fork_capture");
+    first.db.execute_batch(
+        r#"UPDATE executions SET phase='exited';
+         UPDATE managed_fork_batches SET stage='children',source_released=1,checkpoint=x'01',helper_digest='helper',
+            serve_instance='0123456789abcdef0123456789abcdef';
+         INSERT INTO operations
+            SELECT 'target','restore_target','request','deep','target-vm',bundle_digest,0,NULL,'NEW','NONE',1
+            FROM runtime_bundles;
+         INSERT INTO managed_fork_children (batch_id,ordinal,name,instance_id,operation_id,prior_epoch)
+            VALUES('op',0,'target','target-vm','target',0);
+         INSERT INTO managed_launches(operation_id,incarnation_id,serve_instance,machine_name,spec_json,devices_json,vcpus,memory_mib)
+            VALUES('target','target-inc','0123456789abcdef0123456789abcdef','target',
+                '{"name":"target","boot_profile":"system","cpus":1,"memory_mib":64,"disks":[],"init":"/init"}', '[]',1,64);"#,
+    ).unwrap();
+    let old_start = pid_start(old.pid()).unwrap();
+    let next_start = pid_start(next.pid()).unwrap();
+    claim(&first, "target", "boot-a", old.pid(), old_start).unwrap();
+    drop(first);
+
+    let mut catalog = Catalog::open(&path, "boot-a", "second").unwrap();
+    assert!(pending(&catalog, serve, &bundle).unwrap().is_empty());
+    assert_eq!(live_claim(&catalog, "target").unwrap(), Some((old.pid(), old_start)));
+    assert_eq!(claim(&catalog, "target", "boot-a", next.pid(), next_start).unwrap_err().code, "E_OPERATION_IN_PROGRESS");
+    catalog.db.execute_batch(
+        "INSERT INTO operations SELECT 'unrelated','catalog','request','deep','another-vm',bundle_digest,0,NULL,'NEW','NONE',1 FROM runtime_bundles;",
+    ).unwrap();
+    assert_eq!(catalog.complete_recovery("second").unwrap_err().code, "E_RECOVERING");
+    catalog.db.execute("UPDATE operations SET phase='ABORTED' WHERE operation_id='unrelated'", []).unwrap();
+    assert_eq!(catalog.complete_recovery("second").unwrap()["state"], "ready");
+    assert_eq!(pending(&catalog, serve, &bundle).unwrap().len(), 1);
+    old.exit();
+    assert!(live_claim(&catalog, "target").unwrap().is_none());
+    claim(&catalog, "target", "boot-a", next.pid(), next_start).unwrap();
+    assert_eq!(live_claim(&catalog, "target").unwrap(), Some((next.pid(), next_start)));
+
+    // Recovery still allows Serve to reconnect a matching execution that
+    // registered before the broker went away.
+    catalog.db.execute(
+        "INSERT INTO executions(incarnation_id,route_id,instance_id,execution_epoch,bundle_digest,
+             host_boot_id,pid,pid_start_time,uid,phase,last_operation_id)
+         VALUES('target-inc','deep','target-vm',1,?,'boot-a',?,?,20101,'registered','target')",
+        params![bundle, next.pid(), next_start],
+    ).unwrap();
+    drop(catalog);
+    let catalog = Catalog::open(&path, "boot-a", "third").unwrap();
+    assert_eq!(pending(&catalog, serve, &bundle).unwrap().len(), 1);
 }
 
 #[test]
