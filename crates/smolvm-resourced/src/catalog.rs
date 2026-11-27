@@ -292,9 +292,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_managed_retirements.sql"))?;
                 tx.execute_batch(include_str!("schema_network_recovery.sql"))?;
                 tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
-                tx.execute_batch("PRAGMA user_version=29")?;
+                tx.execute_batch(include_str!("schema_kernel_mm_anchors.sql"))?;
+                tx.execute_batch("PRAGMA user_version=30")?;
             }
-            1..=29 => {
+            1..=30 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -381,7 +382,10 @@ impl Catalog {
                 }
                 if version < 29 {
                     tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=29")?;
+                }
+                if version < 30 {
+                    tx.execute_batch(include_str!("schema_kernel_mm_anchors.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=30")?;
                 }
                 crate::packet_wake::recover(&tx)?;
                 crate::lifecycle_controller::recover(&tx)?;
