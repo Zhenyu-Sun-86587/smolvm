@@ -33,6 +33,25 @@ pub(crate) fn worker_available(_: &str) -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn runtime_symbols_available(
+    vmm: impl FnMut(&[u8]) -> bool,
+    anchor: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    [
+        b"krun_enable_worker_kernel_cow_v1\0".as_slice(),
+        b"krun_import_worker_kernel_cow_v1\0".as_slice(),
+    ]
+    .into_iter()
+    .all(vmm)
+        && [
+            b"krun_import_worker_kernel_cow_anchor_v1\0".as_slice(),
+            b"krun_write_worker_kernel_cow_anchor_v1\0".as_slice(),
+        ]
+        .into_iter()
+        .all(anchor)
+}
+
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn worker_available(bundle: &str) -> bool {
     use std::{fs, io::Read, os::unix::fs::MetadataExt, path::Path};
 
@@ -64,8 +83,10 @@ pub(crate) fn worker_available(bundle: &str) -> bool {
             return None;
         }
         let lib = root.join("lib/libkrun.so");
-        let firmware = root.join("lib/libkrunfw.so");
+        let anchor_lib = root.join("lib/libkrun.so.2");
+        let firmware = root.join("lib/libkrunfw.so.5");
         trusted(&lib)?;
+        trusted(&anchor_lib)?;
         trusted(&firmware)?;
         // SAFETY: The installed runtime libraries are on a trusted, protected
         // path. The ABI is private to these paired Worker and runtime builds.
@@ -73,11 +94,12 @@ pub(crate) fn worker_available(bundle: &str) -> bool {
             use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_LAZY};
             let _firmware = Library::open(Some(firmware), RTLD_GLOBAL | RTLD_LAZY).ok()?;
             let krun = Library::open(Some(lib), RTLD_LAZY).ok()?;
-            for required in [
-                b"krun_enable_worker_kernel_cow_v1\0".as_slice(),
-                b"krun_import_worker_kernel_cow_v1\0".as_slice(),
-            ] {
-                krun.get::<*const libc::c_void>(required).ok()?;
+            let anchor = Library::open(Some(anchor_lib), RTLD_LAZY).ok()?;
+            if !runtime_symbols_available(
+                |symbol| krun.get::<*const libc::c_void>(symbol).is_ok(),
+                |symbol| anchor.get::<*const libc::c_void>(symbol).is_ok(),
+            ) {
+                return None;
             }
             let probe = krun.get::<unsafe extern "C" fn() -> i32>(
                 b"krun_probe_worker_kernel_cow_v1\0",
@@ -87,4 +109,29 @@ pub(crate) fn worker_available(bundle: &str) -> bool {
     }
 
     installed_probe(bundle) == Some(0)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::runtime_symbols_available;
+
+    #[test]
+    fn worker_availability_requires_the_cold_target_and_anchor_entry_points() {
+        fn available(_: &[u8]) -> bool {
+            true
+        }
+        assert!(runtime_symbols_available(available, available));
+        assert!(!runtime_symbols_available(
+            |symbol| symbol != b"krun_import_worker_kernel_cow_v1\0",
+            available,
+        ));
+        assert!(!runtime_symbols_available(
+            available,
+            |symbol| symbol != b"krun_import_worker_kernel_cow_anchor_v1\0",
+        ));
+        assert!(!runtime_symbols_available(
+            available,
+            |symbol| symbol != b"krun_write_worker_kernel_cow_anchor_v1\0",
+        ));
+    }
 }
