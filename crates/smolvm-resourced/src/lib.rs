@@ -29,9 +29,15 @@ mod guest_transport;
 #[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]
+mod kernel_mm_anchor;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod kernel_mm_anchor_process;
+#[cfg(target_os = "linux")]
 pub mod managed;
 #[cfg(target_os = "linux")]
 mod managed_fork;
+#[cfg(target_os = "linux")]
+mod managed_kernel_cow;
 pub mod managed_state_restore;
 #[cfg(target_os = "linux")]
 mod managed_retirement;
@@ -86,4 +92,10 @@ mod worker;
 #[doc(hidden)]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     worker::run()
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn run_kernel_mm_anchor() -> std::io::Result<()> {
+    kernel_mm_anchor_process::run()
 }

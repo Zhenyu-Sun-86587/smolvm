@@ -54,6 +54,7 @@ struct Job {
     original: String,
     target: Option<String>,
     mode: Option<String>,
+    kernel: bool,
 }
 
 impl Job {
@@ -103,7 +104,7 @@ impl Job {
         let cancel:bool=c.db.query_row("SELECT cancel_requested FROM managed_fork_batches WHERE operation_id=?",[&self.id],|r|r.get(0))?;
         if cancel {
             if c.statepoint(capture)?.is_none() {
-                self.next(c,"source_return")?;
+                self.next(c, if self.kernel { "kernel_abandon" } else { "source_return" })?;
             } else {
                 self.next(c,"abort_export")?;
             }
@@ -113,6 +114,17 @@ impl Job {
         let source=c.execution(incarnation)?;
         let mut record=c.statepoint(capture)?;
         if record.as_ref().is_none_or(|p|p.phase=="exporting") {
+            if self.kernel && self.stage == "exporting" && !points.export_in_progress(capture) {
+                let expired: bool = c.db.query_row(
+                    "UPDATE managed_fork_batches
+                     SET kernel_export_deadline=coalesce(kernel_export_deadline,unixepoch()+45)
+                     WHERE operation_id=? RETURNING kernel_export_deadline<=unixepoch()",
+                    [&self.id], |row| row.get(0),
+                )?;
+                if expired {
+                    return Err(Fault::new("E_CAPTURE_TIMEOUT", "kernel CoW StatePoint anchor did not settle while the source was held"));
+                }
+            }
             if record.is_some() {
                 record=Some(points.query(c,objects,&req,capture)?);
             }
@@ -146,11 +158,12 @@ impl Job {
 
 pub(crate) fn tick(c:&mut Catalog, points:&mut StatePoints, objects:&File, boot:&str)->Result<Vec<Request>> {
     let jobs={
-        let mut stmt=c.db.prepare("SELECT b.operation_id,b.stage,b.capture_id,b.session,b.token,b.original,b.restore_capture_id,b.volume_restore_policy
+        let mut stmt=c.db.prepare("SELECT b.operation_id,b.stage,b.capture_id,b.session,b.token,b.original,b.restore_capture_id,b.volume_restore_policy,
+          b.selected_memory_fork_backend='kernel_cow'
           FROM managed_fork_batches b JOIN operations o USING(operation_id)
           WHERE o.kind IN ('vm_snapshot','hibernate','vm_rollback') AND b.stage IN ('restore_preflight','exporting','checkpoint_export','durable_hold','rollback_target','rollback_activating')")?;
         let rows=stmt.query_map([],|r|Ok(Job {id:r.get(0)?,stage:r.get(1)?,capture:r.get(2)?,session:r.get(3)?,token:r.get(4)?,
-                                             original:r.get(5)?,target:r.get(6)?,mode:r.get(7)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                                             original:r.get(5)?,target:r.get(6)?,mode:r.get(7)?,kernel:r.get(8)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
     let mut stops=Vec::new();
@@ -160,6 +173,28 @@ pub(crate) fn tick(c:&mut Catalog, points:&mut StatePoints, objects:&File, boot:
             Ok(None)=>(),
             Err(error)=>{
                 c.db.execute("UPDATE managed_fork_batches SET error=? WHERE operation_id=? AND error IS NOT ?",params![error.message,job.id,error.message])?;
+                if job.kernel && (error.code == "E_CAPTURE_LOST" || job.stage == "exporting"
+                    && matches!(error.code.as_str(), "E_CAPTURE_TIMEOUT" | "E_KERNEL_ANCHOR_UNAVAILABLE" | "E_STATE_CONFLICT" | "E_INVALID_REQUEST"))
+                {
+                    let (released, phase) = c.db.query_row(
+                        "SELECT b.source_released,p.phase FROM managed_fork_batches b
+                         LEFT JOIN statepoints p USING(capture_id) WHERE b.operation_id=?",
+                        [&job.id], |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?)),
+                    )?;
+                    if released {
+                        if phase.as_deref() == Some("exporting") {
+                            let failed = c.require_statepoint(&job.capture)?;
+                            c.abort_statepoint(&failed)?;
+                        }
+                        crate::managed_fork::finish_abort(c, &job.id, Some(&error.message))?;
+                    } else {
+                        let next = if phase.is_some() { "abort_export" } else { "kernel_abandon" };
+                        c.db.execute(
+                            "UPDATE managed_fork_batches SET stage=? WHERE operation_id=? AND stage=?",
+                            params![next, job.id, job.stage],
+                        )?;
+                    }
+                }
                 if job.stage=="restore_preflight" && matches!(error.code,"E_STATEPOINT_CORRUPT"|"E_VOLUME_GENERATION_MISMATCH"|"E_BUNDLE_UNAVAILABLE") {
                     let tx=c.db.transaction()?;
                     tx.execute("UPDATE operations SET phase='ABORTED',decision='ABORT',revision=revision+1 WHERE operation_id=? AND phase='NEW'",[&job.id])?;

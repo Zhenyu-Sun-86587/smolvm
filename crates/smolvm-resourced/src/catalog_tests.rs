@@ -71,7 +71,7 @@ fn committed_restore_can_abort_after_exit_only_without_recorded_publication() {
         };
         let execution = catalog.register_execution(&operation, NewExecution {
             route: "deep", bundle: &bundle, expected: &target, boot: "boot",
-            pid: 123, start: 456, uid: 1000, permit_digest: &digest,
+            pid: 123, start: 456, uid: 1000, permit_digest: &digest, kernel_import: None,
         }).unwrap();
         catalog.db.execute(
             "INSERT INTO target_activations VALUES(?1,?2,?1,?1,1,'session','boot',?3,?4,
@@ -114,7 +114,7 @@ fn fork_receipt_reports_activation_for_current_attempt_only() {
     let operation = catalog.begin(&request, "restore_target").unwrap();
     catalog.register_execution(&operation, NewExecution {
         route: "deep", bundle: &bundle, boot: "boot", pid: 123, start: 456, uid: 1000,
-        permit_digest: &digest,
+        permit_digest: &digest, kernel_import: None,
         expected: &Expected {
             instance_id: "child".into(), incarnation_id: Some("target".into()), execution_epoch: 1,
         },

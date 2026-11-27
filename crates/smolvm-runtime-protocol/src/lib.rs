@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub mod cpu_quota;
+pub mod kernel_cow;
 
 /// Systemd scope shared by the Serve that launches a managed VMM and the
 /// Worker that verifies its process and accounts for its resources.

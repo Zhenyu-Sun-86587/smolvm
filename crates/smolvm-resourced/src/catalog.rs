@@ -116,6 +116,7 @@ pub struct NewExecution<'a> {
     pub start: i64,
     pub uid: u32,
     pub permit_digest: &'a str,
+    pub(crate) kernel_import: Option<&'a crate::managed_kernel_cow::Import>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -292,9 +293,10 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_managed_retirements.sql"))?;
                 tx.execute_batch(include_str!("schema_network_recovery.sql"))?;
                 tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
-                tx.execute_batch("PRAGMA user_version=29")?;
+                tx.execute_batch(include_str!("schema_kernel_mm_anchors.sql"))?;
+                tx.execute_batch("PRAGMA user_version=30")?;
             }
-            1..=29 => {
+            1..=30 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -381,7 +383,10 @@ impl Catalog {
                 }
                 if version < 29 {
                     tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
-                    tx.execute_batch("PRAGMA user_version=29")?;
+                }
+                if version < 30 {
+                    tx.execute_batch(include_str!("schema_kernel_mm_anchors.sql"))?;
+                    tx.execute_batch("PRAGMA user_version=30")?;
                 }
                 crate::packet_wake::recover(&tx)?;
                 crate::lifecycle_controller::recover(&tx)?;
@@ -903,6 +908,12 @@ impl Catalog {
         )?;
         tx.execute("UPDATE instance_bindings SET incarnation_id=?,execution_epoch=? WHERE route_id=? AND instance_id=?",
             params![incarnation, new.expected.execution_epoch, new.route, new.expected.instance_id])?;
+        if let Some(import) = new.kernel_import {
+            tx.execute(
+                "INSERT INTO kernel_cow_imports(incarnation_id,capture_id,proof_digest) VALUES(?,?,?)",
+                params![incarnation, import.capture_id, import.proof_digest],
+            )?;
+        }
         tx.commit()?;
         self.execution(incarnation)
     }
@@ -1053,9 +1064,12 @@ impl Catalog {
     }
 
     pub fn resource(&self, id: &str) -> Result<Value> {
-        self.db.query_row("SELECT r.resource_id,r.kind,CASE WHEN f.state='missing' THEN 'missing' ELSE r.state END,
+        self.db.query_row("SELECT r.resource_id,
+            CASE WHEN k.resource_id IS NOT NULL THEN 'kernel_mm_anchor' ELSE r.kind END,
+            CASE WHEN f.state='missing' THEN 'missing' ELSE r.state END,
             r.durability,r.immutable,r.descriptor_json,r.descriptor_digest,r.created_by_operation,r.revision,f.state
             FROM resources r LEFT JOIN fd_transfers f ON f.resource_id=r.resource_id AND f.state!='staging'
+            LEFT JOIN kernel_mm_anchors k ON k.resource_id=r.resource_id
             WHERE r.resource_id=?", [id], |r| {
             let descriptor: String = r.get(5)?;
             let parsed: Value = serde_json::from_str(&descriptor)
@@ -1122,6 +1136,7 @@ impl Catalog {
                 | "backup"
                 | "backup_import"
                 | "fork_capture"
+                | "kernel_anchor_export"
                 | "managed_execution"
                 | "product_snapshot"
                 | "product_attachment"

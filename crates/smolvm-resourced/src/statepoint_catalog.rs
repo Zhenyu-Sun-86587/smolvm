@@ -213,6 +213,11 @@ fn release_export(tx: &Transaction<'_>, record: &Record, publish: bool) -> Resul
         (SELECT 1 FROM resources WHERE resource_id=?1 AND state='lost')",
         [&record.volatile_id],
     )?;
+    crate::kernel_mm_anchor::release_export(tx, &record.operation_id, &record.point.capture_id)?;
+    tx.execute(
+        "DELETE FROM kernel_statepoint_checkpoints WHERE capture_id=?",
+        [&record.point.capture_id],
+    )?;
     Ok(())
 }
 
@@ -242,6 +247,7 @@ impl Catalog {
         op: &Operation,
         export: &Export,
         point: &Point,
+        kernel_checkpoint: Option<&[u8]>,
     ) -> Result<Record> {
         let volatile_id = format!("volatile-{:x}", Sha256::digest(point.capture_id.as_bytes()));
         let tx = self
@@ -278,6 +284,19 @@ impl Catalog {
             ));
         }
         add_disks(&tx, &volatile_id, &point.disk_generations)?;
+        if let Some(checkpoint) = kernel_checkpoint {
+            tx.execute(
+                "INSERT INTO kernel_statepoint_checkpoints VALUES(?,?)",
+                params![point.capture_id, checkpoint],
+            )?;
+            if tx.execute(
+                "INSERT INTO resource_edges SELECT ?,resource_id,'kernel_ram' FROM kernel_mm_anchors
+                 WHERE capture_id=? AND operation_id=? AND resource_id IS NOT NULL AND failure IS NULL",
+                params![volatile_id, point.capture_id, op.operation_id],
+            )? != 1 {
+                return Err(Fault::new("E_CAPTURE_LOST", "original kernel CoW RAM is unavailable"));
+            }
+        }
         tx.execute(
             "INSERT INTO root_refs VALUES('operation',?,?,'active',1,?)",
             params![op.operation_id, volatile_id, op.operation_id],
@@ -325,6 +344,13 @@ impl Catalog {
         self.db.execute("UPDATE statepoints SET error=?,revision=revision+1 WHERE capture_id=? AND phase='exporting' AND revision=?",
             params![error, record.export.capture_id, record.revision])?;
         self.require_statepoint(&record.export.capture_id)
+    }
+
+    pub(crate) fn kernel_statepoint_checkpoint(&self, capture: &str) -> Result<Vec<u8>> {
+        self.db.query_row(
+            "SELECT checkpoint FROM kernel_statepoint_checkpoints WHERE capture_id=?",
+            [capture], |row| row.get(0),
+        ).optional()?.ok_or_else(|| Fault::new("E_STATEPOINT_CORRUPT", "kernel CoW StatePoint checkpoint is unavailable"))
     }
 
     pub(crate) fn statepoint_stop(

@@ -7,6 +7,7 @@ use crate::native_control::Endpoint;
 use crate::worker::pid_exited;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use smolvm_runtime_protocol::kernel_cow::{Region as KernelRegion, packed_size};
 use socket2::Socket;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -127,6 +128,25 @@ pub(crate) struct Capture {
     pub helper_digest: String,
 }
 
+pub(crate) struct KernelCapture {
+    pub checkpoint: Vec<u8>,
+    pub devices: Vec<Device>,
+    pub regions: Vec<KernelRegion>,
+    pub source_pidfd: OwnedFd,
+    pub anchor: String,
+    pub helper_digest: String,
+}
+
+#[derive(Deserialize)]
+struct KernelHeader {
+    protocol: String,
+    session: u32,
+    hold_token: String,
+    checkpoint_bytes: usize,
+    regions: Vec<KernelRegion>,
+    devices: Vec<Device>,
+}
+
 #[derive(Deserialize)]
 struct ParkedGate {
     anchor: [u8; 16],
@@ -172,6 +192,22 @@ fn parked_gate(mut checkpoint: &[u8]) -> Result<ParkedGate> {
         return Err(invalid());
     }
     serde_json::from_value(gate.clone()).map_err(|_| invalid())
+}
+
+fn capture_gate(checkpoint: &[u8], export: &Export) -> Result<ParkedGate> {
+    let gate = parked_gate(checkpoint)?;
+    if gate.anchor == [0; 16]
+        || gate.helper == [0; 32]
+        || gate
+            .writer_hold_token
+            .as_deref()
+            .is_some_and(|token| token != export.hold_token)
+    {
+        return Err(Fault::invalid(
+            "native checkpoint has a different measured capture gate",
+        ));
+    }
+    Ok(gate)
 }
 
 pub(crate) fn host_io(error: io::Error) -> Fault {
@@ -227,18 +263,7 @@ pub(crate) fn acquire(endpoint: &Endpoint, export: &Export) -> Result<Capture> {
     let mut checkpoint = vec![0; header.checkpoint_bytes];
     let mut mapping = vec![0; header.descriptor_bytes];
     stream.read_exact(&mut checkpoint).map_err(host_io)?;
-    let gate = parked_gate(&checkpoint)?;
-    if gate.anchor == [0; 16]
-        || gate.helper == [0; 32]
-        || gate
-            .writer_hold_token
-            .as_deref()
-            .is_some_and(|token| token != export.hold_token)
-    {
-        return Err(Fault::invalid(
-            "native checkpoint has a different measured capture gate",
-        ));
-    }
+    let gate = capture_gate(&checkpoint, export)?;
     stream.read_exact(&mut mapping).map_err(host_io)?;
     let descriptor_json: Value = serde_json::from_slice(&mapping)
         .map_err(|_| Fault::invalid("native RAM mapping is invalid"))?;
@@ -278,6 +303,44 @@ pub(crate) fn acquire(endpoint: &Endpoint, export: &Export) -> Result<Capture> {
         descriptor_json,
         backings,
         devices: header.devices,
+        anchor: hex::encode(gate.anchor),
+        helper_digest: format!("sha256:{}", hex::encode(gate.helper)),
+    })
+}
+
+pub(crate) fn acquire_kernel(endpoint: &Endpoint, export: &Export) -> Result<KernelCapture> {
+    export.validate()?;
+    let (socket, source_pidfd) = endpoint.connect()?;
+    let mut stream = UnixStream::from(OwnedFd::from(socket));
+    let command = format!("CAPTURE_KERNEL_EXPORT {} {}", export.session, export.hold_token);
+    let header: KernelHeader = serde_json::from_value(control_reply(&stream, &command)?)
+        .map_err(|_| Fault::invalid("kernel CoW capture metadata is incomplete"))?;
+    if header.protocol != "KernelCowHeld/1"
+        || header.session != export.session
+        || header.hold_token != export.hold_token
+        || header.checkpoint_bytes == 0
+        || header.checkpoint_bytes > MAX_CHECKPOINT_BYTES
+        || header.devices.is_empty()
+    {
+        return Err(Fault::invalid(
+            "kernel CoW export does not describe the requested parked point",
+        ));
+    }
+    packed_size(&header.regions).map_err(Fault::invalid)?;
+    let mut checkpoint = vec![0; header.checkpoint_bytes];
+    stream.read_exact(&mut checkpoint).map_err(host_io)?;
+    let gate = capture_gate(&checkpoint, export)?;
+    if pid_exited(&source_pidfd).map_err(host_io)? {
+        return Err(Fault::new(
+            "E_STALE_EXECUTION",
+            "registered VMM exited during kernel CoW capture export",
+        ));
+    }
+    Ok(KernelCapture {
+        checkpoint,
+        devices: header.devices,
+        regions: header.regions,
+        source_pidfd,
         anchor: hex::encode(gate.anchor),
         helper_digest: format!("sha256:{}", hex::encode(gate.helper)),
     })

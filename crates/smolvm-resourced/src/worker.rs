@@ -175,6 +175,7 @@ struct Permit {
     start: i64,
     pidfd: OwnedFd,
     expires: Instant,
+    kernel_import: Option<crate::managed_kernel_cow::Import>,
 }
 
 struct Worker {
@@ -284,7 +285,7 @@ pub(crate) fn observe_pid(pid: i32) -> Result<(i64, OwnedFd)> {
     Ok((before, pidfd))
 }
 
-fn process_fd(pid: i32) -> io::Result<OwnedFd> {
+pub(crate) fn process_fd(pid: i32) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
     if fd < 0 {
         Err(io::Error::last_os_error())
@@ -388,6 +389,7 @@ impl Worker {
         let escrow = &mut self.escrow;
         let points = self.statepoints.directory();
         self.catalog.collect_gc(resource, revision, |catalog| {
+            crate::kernel_mm_anchor::collect(catalog, resource)?;
             crate::blocks::collect(catalog, objects, resource)?;
             let statepoint: bool = catalog.db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM statepoints WHERE representation_id=? AND manifest_digest IS NOT NULL)",
@@ -655,6 +657,7 @@ impl Worker {
                     delivered: None,
                 });
             }
+            "AcquireManagedKernelCow" => return self.acquire_managed_kernel_cow(request, peer),
             "PrepareManagedForkAuthority" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 let op = self.catalog.active_operation(request)?;
@@ -1005,6 +1008,15 @@ impl Worker {
         }
         match request.method.as_str() {
             "Health" => self.catalog.health(),
+            "QueryKernelCowBoot" => {
+                self.catalog.ready()?;
+                if request.payload != json!({}) {
+                    return Err(Fault::invalid("Kernel CoW probe requires an empty payload"));
+                }
+                let bundle = request.bundle_digest.as_deref()
+                    .ok_or_else(|| Fault::invalid("Kernel CoW probe requires a bundle identity"))?;
+                Ok(crate::managed_kernel_cow::capability(bundle))
+            }
             "QueryPrivateNetworkPeering" => {
                 self.catalog.ready()?;
                 self.network.peering_status(request)
@@ -1207,7 +1219,9 @@ impl Worker {
                     &execution.incarnation_id,
                     &self.boot,
                 )?;
-                Ok(json!({"execution":execution,"inventory":ep.inventory()?}))
+                let inventory = ep.inventory()?;
+                let memory_fork = crate::managed_fork::memory_fork_inventory(&self.catalog, &execution, &inventory)?;
+                Ok(json!({"execution":execution,"inventory":inventory,"memory_fork":memory_fork}))
             }
             "SubmitNativeOperation" => {
                 let op = crate::native_operations::submit(
@@ -1560,9 +1574,44 @@ impl Worker {
                 start,
                 pidfd,
                 expires: Instant::now() + Duration::from_secs(60),
+                kernel_import: None,
             },
         );
         Ok(json!({"launch_permit":credential, "pid_start_time":start}))
+    }
+
+    fn acquire_managed_kernel_cow(&mut self, request: &Request, peer: libc::ucred) -> Result<Reply> {
+        if peer.uid != 0 {
+            return Err(Fault::new("E_PERMISSION_DENIED", "Kernel CoW requires the privileged launch process"));
+        }
+        let supplied: Token = request.payload()?;
+        let (_, bundle, expected) = request.scope()?;
+        let op = self.catalog.matching_operation(request)?;
+        self.catalog.verify_launch(&op, expected)?;
+        let plan = crate::managed::plan(&self.catalog, &op)?
+            .filter(|plan| plan.machine.kernel_cow() && plan.restore.as_ref().is_some_and(|restore| restore.durable.is_none()))
+            .ok_or_else(|| Fault::invalid("Kernel CoW requires an admitted volatile fork target"))?;
+        if op.kind != "restore_target" || plan.launch.execution != *expected {
+            return Err(stale_execution());
+        }
+        crate::managed_kernel_cow::require_worker(bundle)?;
+        let permit = self.permits.get_mut(&supplied.launch_permit).filter(|permit| {
+            permit.operation == op.operation_id && permit.expected == *expected
+                && permit.pid == peer.pid && permit.uid != 0 && permit.expires > Instant::now()
+                && permit.kernel_import.is_none()
+        }).ok_or_else(|| Fault::new("E_LAUNCH_PERMIT", "an unused launch permit for this process is required"))?;
+        verify_executable(peer.pid, permit.start, &permit.pidfd, &self.catalog.bundle(bundle)?)?;
+        let start = permit.start;
+        self.verify_execution_scope(&op.operation_id, peer.pid)?;
+        let (result, table, descriptors, kernel_import) = crate::managed_fork::kernel_metadata(&self.catalog, &op)?;
+        let permit = self.permits.get_mut(&supplied.launch_permit).expect("validated permit exists");
+        if pid_start(peer.pid).ok() != Some(start) || pid_exited(&permit.pidfd).map_err(broker_error)? {
+            return Err(stale_execution());
+        }
+        // Charge this exact process before handing out the donor. An
+        // ambiguous delivery may only be recovered by a new process claim.
+        permit.kernel_import = Some(kernel_import);
+        Ok(Reply { result, table, descriptors, delivered: None })
     }
 
     fn register_execution(&mut self, r: &Request, peer: libc::ucred) -> Result<Value> {
@@ -1611,6 +1660,11 @@ impl Worker {
             &self.catalog.bundle(bundle)?,
         )?;
         self.verify_execution_scope(&op.operation_id, peer.pid)?;
+        if permit.kernel_import.is_none() && crate::managed::plan(&self.catalog, &op)?
+            .is_some_and(|plan| plan.machine.kernel_cow() && plan.restore.is_some())
+        {
+            return Err(Fault::new("E_LAUNCH_PERMIT", "Kernel CoW target has no authorized RAM import"));
+        }
         self.restore_managed_cpu_limit(&op, peer.pid, permit.start, &permit.pidfd)?;
         let execution = self.catalog.register_execution(
             &op,
@@ -1623,6 +1677,7 @@ impl Worker {
                 start: permit.start,
                 uid: peer.uid,
                 permit_digest: &permit_digest,
+                kernel_import: permit.kernel_import.as_ref(),
             },
         )?;
         let permit = self
@@ -1998,9 +2053,12 @@ impl Worker {
 
     fn abort_statepoint(&mut self, request: &Request) -> Result<Value> {
         let input: StatePointLookup = request.payload()?;
-        let record =
-            self.statepoints
-                .query(&mut self.catalog, &self.objects, request, &input.capture_id)?;
+        let record = match self.statepoints
+            .query(&mut self.catalog, &self.objects, request, &input.capture_id) {
+            Ok(record) => record,
+            Err(fault) if fault.code == "E_CAPTURE_LOST" => self.catalog.require_statepoint(&input.capture_id)?,
+            Err(fault) => return Err(fault),
+        };
         if record.phase == "aborted" {
             return Ok(json!(record));
         }
@@ -2013,6 +2071,10 @@ impl Worker {
                 "StatePoint cannot abort while exporting or after its durable decision",
             ));
         }
+        let kernel: bool = self.catalog.db.query_row(
+            "SELECT selected_memory_fork_backend='kernel_cow' FROM managed_fork_batches WHERE operation_id=?",
+            [&record.operation_id], |row| row.get(0),
+        ).optional()?.unwrap_or(false);
         self.catalog.active_operation(request)?;
         let source = self.scoped_execution(request)?;
         if source.incarnation_id != record.point.incarnation_id
@@ -2033,6 +2095,9 @@ impl Worker {
         let mut state = command(&format!("CAPTURE_QUERY {token}"))?;
         if state["phase"] == "prepared" {
             endpoint.command(&format!("CAPTURE_STOP_UNRESERVE {token}"))?;
+            if kernel {
+                endpoint.command(&format!("CAPTURE_KERNEL_ABANDON {token}"))?;
+            }
             let disposition = if state["from_standby"] == true {
                 "RETURN_STANDBY"
             } else {
@@ -2127,18 +2192,27 @@ impl Worker {
         {
             self.release_checkpoint_export(&record);
         }
+        self.statepoints.abort_orphaned_kernel_exports(&mut self.catalog)?;
         let cancellations = {
-            let mut q=self.catalog.db.prepare("SELECT operation_id,capture_id,original FROM managed_fork_batches WHERE stage='abort_export'")?;
-            let rows=q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut q=self.catalog.db.prepare("SELECT operation_id,capture_id,original,error,selected_memory_fork_backend='kernel_cow'
+                FROM managed_fork_batches WHERE stage='abort_export'")?;
+            let rows=q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,
+                r.get::<_,Option<String>>(3)?,r.get::<_,bool>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
-        for (id,capture,original) in cancellations {
+        for (id,capture,original,reason,kernel) in cancellations {
             let op=self.catalog.operation(&id)?;
             let request=crate::managed_statepoint::request(&op,json!({"capture_id":capture}));
             match self.abort_statepoint(&request) {
-                Ok(_) if original=="STANDBY" => crate::managed_fork::finish_abort(&mut self.catalog,&id,None)?,
+                Ok(_) if original=="STANDBY" => crate::managed_fork::finish_abort(&mut self.catalog,&id,if kernel { reason.as_deref() } else { None })?,
+                Ok(_) if kernel && reason.is_some() => {
+                    self.catalog.db.execute("UPDATE managed_fork_batches SET stage='kernel_abandon' WHERE operation_id=?",[id])?;
+                }
                 Ok(_) => {self.catalog.db.execute("UPDATE managed_fork_batches SET stage='waking',error=NULL WHERE operation_id=?",[id])?;},
-                Err(error)=> {self.catalog.db.execute("UPDATE managed_fork_batches SET error=? WHERE operation_id=?",rusqlite::params![error.message,id])?;}
+                Err(error) if !kernel || reason.is_none() => {
+                    self.catalog.db.execute("UPDATE managed_fork_batches SET error=? WHERE operation_id=?",rusqlite::params![error.message,id])?;
+                }
+                Err(_) => {}
             }
         }
         let stops=crate::managed_statepoint::tick(&mut self.catalog,&mut self.statepoints,&self.objects,&self.boot)?;
@@ -2547,6 +2621,8 @@ fn serve(
     worker
         .reconnect_native_endpoints()
         .map_err(|f| io::Error::other(f.message))?;
+    crate::kernel_mm_anchor::reconcile(&worker.catalog)
+        .map_err(|fault| io::Error::other(fault.message))?;
     worker
         .reconcile_statepoints()
         .map_err(|fault| io::Error::other(fault.message))?;
@@ -2584,6 +2660,9 @@ fn serve(
             }
             if let Err(error) = worker.reconcile_capture_source_exits() {
                 eprintln!("resourced capture source recovery: {error}");
+            }
+            if let Err(error) = crate::kernel_mm_anchor::reconcile(&worker.catalog) {
+                eprintln!("resourced Kernel CoW anchor recovery: {error}");
             }
             worker
                 .forks

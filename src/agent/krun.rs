@@ -279,8 +279,19 @@ impl KrunFunctions {
     /// Caller must ensure `lib_dir` contains compatible libkrun/libkrunfw
     /// libraries for the current host.
     pub unsafe fn load(lib_dir: &Path) -> Result<Self, String> {
+        Self::load_inner(lib_dir, true)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+    pub(crate) unsafe fn load_managed_kernel_cow(lib_dir: &Path) -> Result<Self, String> {
+        Self::load_inner(lib_dir, false)
+    }
+
+    unsafe fn load_inner(lib_dir: &Path, _gpu_dependencies: bool) -> Result<Self, String> {
         #[cfg(target_os = "linux")]
-        preload_linux_gpu_dependencies(lib_dir);
+        if _gpu_dependencies {
+            preload_linux_gpu_dependencies(lib_dir);
+        }
 
         let fw_lib_path = lib_dir.join(libkrunfw_filename());
         // libkrunfw must be loaded with RTLD_GLOBAL on Unix so libkrun can

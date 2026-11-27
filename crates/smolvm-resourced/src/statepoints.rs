@@ -3,6 +3,7 @@
 use crate::catalog::{Catalog, Execution, Operation};
 use crate::escrow_catalog::LeaseRecord;
 use crate::ipc::{Fault, FdEntry, Request, Result, valid_id};
+use crate::kernel_mm_anchor;
 use crate::managed_state_restore::{self, RestoreMode as VolumePolicy};
 use crate::native_control::Endpoint;
 use crate::statepoint_capture::{self, Export, Purpose, host_io};
@@ -136,6 +137,14 @@ impl StatePoints {
                 "StatePoint requires its own capture operation",
             ));
         }
+        let kernel: bool = catalog.db.query_row(
+            "SELECT selected_memory_fork_backend='kernel_cow' FROM managed_fork_batches WHERE operation_id=?",
+            [&operation.operation_id], |row| row.get(0),
+        ).optional()?.unwrap_or(false);
+        if kernel {
+            return self.begin_kernel(catalog, objects, boot, source, operation, export, prior);
+        }
+
         crate::product_volumes::require_capture_policy(catalog, source, false)?;
         let endpoint = Endpoint::load(&catalog.db, &source.incarnation_id, boot)?;
         if export.purpose != Purpose::Checkpoint {
@@ -159,7 +168,7 @@ impl StatePoints {
                 catalog.require_statepoint(&export.capture_id)?
             }
             Some(_) => return Err(conflict("held capture bytes changed on export replay")),
-            None => catalog.start_statepoint(&operation, &export, &point)?,
+            None => catalog.start_statepoint(&operation, &export, &point, None)?,
         };
         crate::activation_catalog::pin_statepoint_tap(
             catalog,
@@ -177,9 +186,79 @@ impl StatePoints {
         let job = thread::Builder::new()
             .name("statepoint-export".into())
             .spawn(move || {
-                statepoint_store::write(&directory, point, bundle, commit_id, capture, opened)
+                statepoint_store::write_native(&directory, point, bundle, commit_id, capture, opened)
             })
             .map_err(host_io)?;
+        self.exports.insert(export.capture_id, job);
+        Ok(record)
+    }
+
+    fn begin_kernel(
+        &mut self,
+        catalog: &mut Catalog,
+        objects: &File,
+        boot: &str,
+        source: &Execution,
+        operation: Operation,
+        export: Export,
+        prior: Option<Record>,
+    ) -> Result<Record> {
+        let (released, gate): (bool, String) = catalog.db.query_row(
+            "SELECT source_released,anchor FROM managed_fork_batches WHERE operation_id=?",
+            [&operation.operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let endpoint = if released {
+            None
+        } else {
+            Some(Endpoint::load(&catalog.db, &source.incarnation_id, boot)?)
+        };
+        let (record, checkpoint) = if let Some(record) = prior {
+            let checkpoint = catalog.kernel_statepoint_checkpoint(&export.capture_id)?;
+            record.point.validate_checkpoint(&checkpoint).map_err(integrity)?;
+            (record, checkpoint)
+        } else {
+            crate::product_volumes::require_capture_policy(catalog, source, false)?;
+            let ep = endpoint.as_ref().ok_or_else(|| Fault::new(
+                "E_CAPTURE_LOST", "kernel CoW StatePoint has no verified held capture",
+            ))?;
+            let capture = statepoint_capture::acquire_kernel(ep, &export)?;
+            if capture.anchor != gate {
+                return Err(Fault::new("E_STATE_CONFLICT", "observed StatePoint gate changed"));
+            }
+            let disks = statepoint_capture::disk_roots(
+                catalog, &operation, source, &export, &capture.devices,
+            )?;
+            let receipt = kernel_mm_anchor::register(
+                catalog,
+                &operation.operation_id,
+                &export.capture_id,
+                source,
+                capture.source_pidfd.try_clone().map_err(host_io)?,
+                &capture.regions,
+            )?;
+            let point = Point::new_kernel(source, &export, &capture, receipt.layout_digest, disks);
+            let record = catalog.start_statepoint(&operation, &export, &point, Some(&capture.checkpoint))?;
+            (record, capture.checkpoint)
+        };
+
+        crate::activation_catalog::pin_statepoint_tap(
+            catalog, &record, source, record.point.devices.iter().any(|device| device.is_network()),
+        )?;
+        if let Some(endpoint) = endpoint {
+            endpoint.command(&format!("CAPTURE_KERNEL_IMPORTED {} {}", export.session, export.hold_token))?;
+        }
+        let opened = statepoint_capture::open_disks(catalog, objects, &record.point.disk_generations)?;
+        let (receipt, mut ram) = kernel_mm_anchor::open_export(catalog, &operation.operation_id, &export.capture_id)?;
+        if receipt.layout_digest != record.point.source_ram_digest {
+            return Err(integrity(io::Error::other("kernel CoW StatePoint layout changed")));
+        }
+        let directory = self.directory.clone();
+        let point = record.point.clone();
+        let job = thread::Builder::new().name("statepoint-export".into()).spawn(move || {
+            statepoint_store::write(&directory, point, operation.bundle_digest, operation.operation_id,
+                &checkpoint, &mut ram, opened)
+        }).map_err(host_io)?;
         self.exports.insert(export.capture_id, job);
         Ok(record)
     }
@@ -245,7 +324,10 @@ impl StatePoints {
                         .map_err(integrity)?;
                     manifest
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(record),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    crate::kernel_mm_anchor::require_volatile_export(catalog, capture_id)?;
+                    return Ok(record);
+                }
                 Err(error) => return Err(integrity(error)),
             }
         };
@@ -276,6 +358,30 @@ impl StatePoints {
 
     pub fn export_in_progress(&self, capture_id: &str) -> bool {
         self.exports.contains_key(capture_id)
+    }
+
+    pub(crate) fn abort_orphaned_kernel_exports(&mut self, catalog: &mut Catalog) -> Result<()> {
+        let captures = {
+            let mut query = catalog.db.prepare(
+                "SELECT p.capture_id FROM statepoints p JOIN operations o USING(operation_id)
+                 JOIN kernel_statepoint_checkpoints k USING(capture_id)
+                 WHERE o.phase='ABORTED' AND p.phase IN ('exporting','durable')",
+            )?;
+            query.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for capture in captures {
+            if !self.export_in_progress(&capture) {
+                let record = catalog.require_statepoint(&capture)?;
+                if record.phase == "exporting" {
+                    // A previous Worker can have finished renaming just before
+                    // the source exit aborted the operation in the catalog.
+                    statepoint_store::collect(&self.directory, &record.point.representation_id).map_err(host_io)?;
+                }
+                catalog.abort_statepoint(&record)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn release_root(&mut self, catalog: &mut Catalog, request: &Request) -> Result<Value> {

@@ -360,7 +360,30 @@ pub fn boot() -> Result<()> {
         .parent()
         .ok_or_else(|| failed("missing control directory"))?;
     std::env::set_current_dir(work)?;
-    process::drop_privileges(boot.uid, boot.gid).map_err(failed)?;
+    let client = Client {
+        socket: &boot.worker,
+        bundle: &boot.bundle,
+    };
+    let kernel = boot.plan.machine.kernel_cow();
+    let mut imported = None;
+    if let Some(restore) = boot.plan.restore.as_ref().filter(|_| kernel) {
+        if restore.durable.is_some() {
+            return Err(failed("a durable checkpoint must use its portable RAM reader"));
+        }
+        let k = unsafe { KrunFunctions::load_managed_kernel_cow(&lib_dir) }.map_err(failed)?;
+        let ctx = create_context(&k)?;
+        let memory = client.kernel_fork_memory(&boot.plan.launch, restore, &boot.permit).map_err(failed)?;
+        let start = Instant::now();
+        if let Err(error) = k.import_managed_kernel_cow(ctx, memory, boot.uid, boot.gid) {
+            unsafe { (k.free_ctx)(ctx) };
+            return Err(failed(error));
+        }
+        tracing::info!(operation_id=%boot.plan.launch.operation_id, duration_us=start.elapsed().as_micros(),
+            "Kernel CoW target RAM imported");
+        imported = Some((k, ctx));
+    } else {
+        process::drop_privileges(boot.uid, boot.gid).map_err(failed)?;
+    }
     if std::env::var("SMOLVM_LANDLOCK").as_deref() == Ok("enforce") {
         let mut read_exec: Vec<PathBuf> = ["/usr", "/lib", "/lib64", "/etc", "/proc", "/sys"]
             .iter()
@@ -374,20 +397,21 @@ pub fn boot() -> Result<()> {
         writable.push(work.to_owned());
         process::restrict_filesystem(&read_exec, &writable).map_err(failed)?;
     }
-    let client = Client {
-        socket: &boot.worker,
-        bundle: &boot.bundle,
-    };
     client
         .register(&boot.plan.launch, &boot.permit)
         .map_err(failed)?;
-    let k = unsafe { KrunFunctions::load(&lib_dir) }.map_err(failed)?;
-    let ctx = unsafe { (k.create_ctx)() };
-    if ctx < 0 {
-        return Err(failed(format!("create VMM returned {ctx}")));
-    }
-    let ctx = ctx as u32;
+    let (k, ctx) = match imported {
+        Some(context) => context,
+        None => {
+            let k = unsafe { KrunFunctions::load(&lib_dir) }.map_err(failed)?;
+            let ctx = create_context(&k)?;
+            (k, ctx)
+        }
+    };
     let configured = (|| -> Result<()> {
+        if kernel && boot.plan.restore.is_none() {
+            k.enable_managed_kernel_cow(ctx).map_err(failed)?;
+        }
         let (sets, files) = client.managed_disks(&boot.plan).map_err(failed)?;
         let network = boot
             .network
@@ -413,6 +437,9 @@ pub fn boot() -> Result<()> {
         if let Some(restore) = &boot.plan.restore {
             if let Some(durable) = &restore.durable {
                 k.managed_statepoint(ctx, &boot.plan, restore, durable).map_err(failed)?;
+                let authority = client.restore_authority(&boot.plan.launch, restore).map_err(failed)?;
+                k.managed_target_authority(ctx, &boot.plan, restore, &authority).map_err(failed)?;
+            } else if kernel {
                 let authority = client.restore_authority(&boot.plan.launch, restore).map_err(failed)?;
                 k.managed_target_authority(ctx, &boot.plan, restore, &authority).map_err(failed)?;
             } else {
@@ -442,4 +469,9 @@ pub fn boot() -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn create_context(k: &KrunFunctions) -> Result<u32> {
+    let ctx = unsafe { (k.create_ctx)() };
+    u32::try_from(ctx).map_err(|_| failed(format!("create VMM returned {ctx}")))
 }

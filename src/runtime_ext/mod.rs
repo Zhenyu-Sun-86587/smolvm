@@ -142,6 +142,31 @@ pub(crate) async fn capabilities() -> Result<Json<Handshake>, ApiError> {
     } else {
         handshake
     };
+    #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+    let handshake = {
+        use smolvm_runtime_protocol::{kernel_cow::PROFILE, Capability};
+        let mut handshake = handshake;
+        let observed = if let Some(socket) = launch::worker_socket() {
+            let bundle = handshake.bundle_digest.clone();
+            tokio::task::spawn_blocking(move || {
+                smolvm_resourced::native_client::Client { socket, bundle: &bundle }.kernel_cow_boot()
+            }).await.ok().and_then(Result::ok)
+        } else {
+            None
+        };
+        let capability = observed.filter(|value| !value.supported
+            || (value.status == "supported" && value.contract_version == Some(1)
+                && value.verified_profile.as_deref() == Some(PROFILE)))
+            .unwrap_or_else(|| Capability {
+                status: "unavailable".into(),
+                supported: false,
+                reason_code: "WORKER_KERNEL_COW_UNAVAILABLE".into(),
+                contract_version: None,
+                verified_profile: None,
+            });
+        handshake.capabilities.insert("boot.kernel_cow_ram".into(), capability);
+        handshake
+    };
     Ok(Json(handshake))
 }
 
@@ -325,6 +350,7 @@ async fn native<T: serde::Serialize + Send + 'static>(
                 | "E_STALE_EXECUTION"
                 | "E_OPERATION_IN_PROGRESS"
                 | "E_STATE_CONFLICT"
+                | "E_CAPTURE_LOST"
                 | "E_VOLUME_BUSY"
                 | "E_VOLUME_CONFLICT"
                 | "E_VOLUME_REQUIRES_STOPPED"
