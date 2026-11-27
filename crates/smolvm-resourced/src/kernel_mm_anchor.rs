@@ -465,7 +465,7 @@ pub(crate) fn register(
     layout: &[Region],
 ) -> Result<Receipt> {
     let packed = packed_size(layout).map_err(Fault::invalid)?;
-    let (session, kind, memory_mib): (u32, String, u64) =
+    let (session, kind, memory_mib): (u32, String, u32) =
         c.db.query_row(
             "SELECT b.session,o.kind,json_extract(b.template,'$.memory_mib')
          FROM managed_fork_batches b JOIN operations o USING(operation_id)
@@ -489,7 +489,8 @@ pub(crate) fn register(
                 "kernel CoW anchor is outside the admitted capture",
             )
         })?;
-    let ram_limit = crate::admission::kernel_capture_ram_mib(memory_mib).saturating_mul(1 << 20);
+    let ram_limit =
+        crate::admission::kernel_capture_ram_mib(memory_mib.into()).saturating_mul(1 << 20);
     if packed > ram_limit || source.host_boot_id != boot_id(c)? {
         return Err(Fault::invalid(
             "kernel CoW RAM differs from the admitted size or boot",
