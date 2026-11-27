@@ -129,10 +129,28 @@ def fork_parameters(names, backend):
     return parameters
 
 
-def partial_fork(endpoint, root, ref, backend=None):
+def terminate_pinned_anchor(catalog, capture_id):
+    with sqlite3.connect(f"file:{catalog}?mode=ro", uri=True) as db:
+        row = db.execute(
+            "SELECT helper_pid, helper_start, host_boot_id FROM kernel_mm_anchors WHERE capture_id=?",
+            (capture_id,),
+        ).fetchone()
+    assert row is not None, capture_id
+    pid, start, boot_id = row
+    assert Path("/proc/sys/kernel/random/boot_id").read_text().strip() == boot_id
+    handle = os.pidfd_open(pid)
+    try:
+        assert int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]) == start
+        signal.pidfd_send_signal(handle, signal.SIGKILL)
+    finally:
+        os.close(handle)
+
+
+def partial_fork(endpoint, root, ref, backend=None, restart_broker=None, lose_anchor=False):
     import threading
-    names=["partial-keep","partial-retry"]
-    key="partial-batch"
+    prefix = "lost" if lose_anchor else "partial"
+    names = [prefix + "-keep", prefix + "-retry"]
+    key = prefix + "-batch"
     req=dict(kind="fork_batch",operation_id=key,request_digest=digest(key.encode()),expected=ref,parameters=fork_parameters(names, backend))
     killed=threading.Event()
     def interrupt_unpublished():
@@ -162,6 +180,28 @@ def partial_fork(endpoint, root, ref, backend=None):
     good,failed=batch["fork"]["children"]
     assert good["phase"]=="COMPLETED" and failed["phase"]=="ABORTED",batch
     retry=dict(request_digest=req["request_digest"],expected=ref,expected_revision=batch["revision"])
+    if restart_broker:
+        restart_broker()
+    if lose_anchor:
+        capture_id = batch["fork"]["capture_id"]
+        terminate_pinned_anchor(root / "catalog/catalog.sqlite", capture_id)
+        def refused():
+            try:
+                http(endpoint, f"{EXT}/operations/{key}/retry", retry)
+            except RuntimeError as err:
+                if "E_CAPTURE_LOST" in str(err):
+                    return True
+                raise
+            raise AssertionError("retry accepted after losing the pinned capture")
+        until(refused)
+        after = http(endpoint, f"{EXT}/operations/{key}")
+        assert after["fork"]["capture_id"] == capture_id and after["fork"]["children"] == batch["fork"]["children"], after
+        log = root / "state/managed" / (good["incarnation_id"] + ".log")
+        ticks = lambda: sum(line.startswith("PARKED_BLOCK_TICK ") for line in log.read_text(errors="replace").splitlines())
+        before = ticks()
+        until(lambda: ticks() > before + 2)
+        print("Losing the pinned kernel anchor refused retry on the original cut; the published sibling continued.", flush=True)
+        return
     http(endpoint,f"{EXT}/operations/{key}/retry",retry)
     recovered=settled(endpoint,key)
     assert recovered["fork"]["outcome"]=="applied" and recovered["fork"]["capture_id"]==original["fork"]["capture_id"],recovered
@@ -219,8 +259,16 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
             stack.callback(stop)
             return proc
 
-        broker = spawn([worker_binary or bundle / "smolvm-resourced", "serve", "--socket", worker, "--state-dir", root / "catalog",
-                        "--socket-gid", str(grp.getgrnam("kvm").gr_gid)], "worker.log")
+        broker_command = [worker_binary or bundle / "smolvm-resourced", "serve", "--socket", worker,
+                          "--state-dir", root / "catalog", "--socket-gid", str(grp.getgrnam("kvm").gr_gid)]
+        broker = spawn(broker_command, "worker.log")
+        def restart_broker():
+            nonlocal broker
+            broker.kill()
+            broker.wait()
+            broker = spawn(broker_command, "worker.log")
+            until(lambda: worker_ready(worker))
+
         until(lambda: worker_ready(worker))
         serve_command = [binary, "--state-dir", root / "state", "serve", "start", "--listen", f"unix://{endpoint}",
                          "--worker-resource-socket", worker, "--guest-rollout-port", "37226", "--shutdown-grace", "0"]
@@ -480,8 +528,14 @@ def verify(bundle, root, guest, system_image, fork, product_volumes, statepoint,
             if fork_faults or statepoint:
                 grand_ref=http(endpoint,f"{EXT}/machines/grandchild/execution")
                 if fork_faults:
-                    partial_fork(endpoint,root,grand_ref,memory_fork_backend)
-                    if statepoint:fence_machine("partial-keep")
+                    kernel_faults = memory_fork_backend in ("auto", "kernel_cow")
+                    partial_fork(endpoint,root,grand_ref,memory_fork_backend,restart_broker if kernel_faults else None)
+                    if statepoint or kernel_faults:
+                        fence_machine("partial-keep")
+                    if kernel_faults:
+                        fence_machine("partial-retry")
+                        partial_fork(endpoint,root,grand_ref,memory_fork_backend,lose_anchor=True)
+                        fence_machine("lost-keep")
                 if statepoint:durable_points(endpoint,grand_ref,"grandchild",logfile)
             return
         if lifecycle:
