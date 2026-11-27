@@ -1,6 +1,6 @@
 //! Discover the installed Worker ABI before admitting an anonymous RAM launch.
 use crate::ipc::{Fault, Result};
-use smolvm_runtime_protocol::kernel_cow::PROFILE;
+use smolvm_runtime_protocol::kernel_cow::boot_capability;
 
 pub(crate) struct Import {
     pub capture_id: String,
@@ -24,14 +24,7 @@ pub(crate) fn require_worker(bundle: &str) -> Result<()> {
 }
 
 pub(crate) fn capability(bundle: &str) -> serde_json::Value {
-    let available = worker_available(bundle);
-    serde_json::json!({
-        "supported":available,
-        "status":if available { "supported" } else { "unavailable" },
-        "reason_code":if available { "" } else { "WORKER_KERNEL_COW_UNAVAILABLE" },
-        "contract_version":available.then_some(1),
-        "verified_profile":available.then_some(PROFILE),
-    })
+    serde_json::json!(boot_capability(Some(worker_available(bundle))))
 }
 
 #[cfg(not(target_arch = "x86_64"))]
