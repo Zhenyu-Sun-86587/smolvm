@@ -6,7 +6,7 @@ use crate::ipc::{valid_id, Fault, Request, Result};
 use crate::managed::{key, machine_id, Machine, Restore};
 use crate::native_control::{Endpoint, Inventory};
 use crate::statepoint_capture::{self, Export, Purpose};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use smolvm_runtime_protocol::kernel_cow::PROFILE;
@@ -122,15 +122,39 @@ fn standby_scope(c: &Catalog, incarnation: &str) -> Result<(u32, String, String)
          [incarnation], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).optional()?.ok_or_else(|| conflict("source requires managed standby"))
 }
+
+fn active_credential_relay_hold(
+    db: &Connection,
+    source: &Execution,
+    original_hold: Option<&str>,
+) -> Result<Option<String>> {
+    if source.phase != "registered" {
+        return Ok(None);
+    }
+    Ok(db.query_row(
+        "SELECT id FROM lifecycle_protections WHERE instance_id=?1 AND incarnation_id=?2 AND epoch=?3
+         AND kind='hold' AND state='active' AND reason='credential_proxy'
+         AND id GLOB 'access-*' AND (?4 IS NULL OR id=?4) ORDER BY id LIMIT 1",
+        params![source.instance_id, source.incarnation_id, source.execution_epoch, original_hold],
+        |row| row.get(0),
+    ).optional()?)
+}
+
+fn credential_relay_fork_eligible(kind: &str, inventory: &Inventory) -> bool {
+    matches!(kind, "independent_fork" | "fork_batch")
+        && inventory.source_disposition == "RUNNING"
+        && inventory.credential_relay_fork == Some(true)
+}
+
 pub(crate) fn restore(c: &Catalog, child: &str) -> Result<Option<Restore>> {
     Ok(c.db.query_row("SELECT b.operation_id,b.capture_id,b.anchor,b.helper_digest,b.pivot_json IS NOT NULL FROM managed_fork_children ch JOIN managed_fork_batches b ON b.operation_id=ch.batch_id WHERE ch.operation_id=? AND b.source_released=1",[child],
         |r|Ok(Restore{batch_id:r.get(0)?,capture_id:r.get(1)?,anchor:r.get(2)?,helper_digest:r.get(3)?,source_pivot:r.get(4)?,durable:None})).optional()?)
 }
 pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
-    let Some((stage,capture,original,released,error,admission,requested,selected))=c.db.query_row(
-        "SELECT stage,capture_id,original,source_released,error,admission_mode,memory_fork_backend,selected_memory_fork_backend
+    let Some((stage,capture,original,released,error,admission,requested,selected,relay_hold))=c.db.query_row(
+        "SELECT stage,capture_id,original,source_released,error,admission_mode,memory_fork_backend,selected_memory_fork_backend,credential_relay_hold
          FROM managed_fork_batches WHERE operation_id=?",[id],
-        |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?))).optional()? else {return Ok(None)};
+        |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?))).optional()? else {return Ok(None)};
     let mut stmt = c.db.prepare(
         "SELECT ch.name,ch.instance_id,ch.operation_id,
              CASE WHEN (ch.cancelled=1 OR ch.admission_error IS NOT NULL) AND o.operation_id IS NULL THEN 'ABORTED' ELSE COALESCE(o.phase,'RESERVED') END,
@@ -174,6 +198,9 @@ pub(crate) fn receipt(c: &Catalog, id: &str) -> Result<Option<Value>> {
         "failed_count":failed, "outcome":outcome, "error":error});
     if selected == "kernel_cow" {
         receipt["kernel_cow_abi_digest"] = json!(crate::managed_kernel_cow::ABI_DIGEST);
+    }
+    if relay_hold.is_some() {
+        receipt["source_relay_retention_applied"] = json!(released && stage != "aborted");
     }
     Ok(Some(receipt))
 }
@@ -352,8 +379,13 @@ pub(crate) fn submit(
         if selected == "kernel_cow" {
             admission::require_kernel_anchor_room(tx, capacity.memory_mib)?;
         }
-        tx.execute("INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,session,token,anchor,network_gate,original,stage,pivot_json,restore_capture_id,volume_restore_policy,admission_mode,memory_fork_backend,selected_memory_fork_backend) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![id,incarnation,namespace,capture,template_bytes,names,session,token,anchor,network,inv.source_disposition,initial,pivot,target,mode,admission,requested.as_str(),selected])?;
+        let relay_hold = if credential_relay_fork_eligible(kind, &inv) {
+            active_credential_relay_hold(tx, &source, None)?
+        } else {
+            None
+        };
+        tx.execute("INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,session,token,anchor,network_gate,original,stage,pivot_json,restore_capture_id,volume_restore_policy,admission_mode,memory_fork_backend,selected_memory_fork_backend,credential_relay_hold) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![id,incarnation,namespace,capture,template_bytes,names,session,token,anchor,network,inv.source_disposition,initial,pivot,target,mode,admission,requested.as_str(),selected,relay_hold])?;
         let mut admitted = 0;
         let mut last_refusal = None;
         for (i,name) in input.children.iter().enumerate(){
@@ -492,6 +524,7 @@ struct Job {
     network: bool,
     pivot: Option<String>,
     kernel_cow: bool,
+    credential_relay_hold: Option<String>,
 }
 impl Job {
     fn scope(&self) -> String {
@@ -512,6 +545,13 @@ impl Job {
         c.db.execute(
             "UPDATE managed_fork_batches SET stage=?,error=NULL WHERE operation_id=? AND stage=?",
             params![next, self.id, self.stage],
+        )?;
+        Ok(())
+    }
+    fn fail_capture(&self, c: &Catalog, reason: &str) -> Result<()> {
+        c.db.execute(
+            "UPDATE managed_fork_batches SET stage='failure_return',error=? WHERE operation_id=? AND stage=?",
+            params![reason, self.id, self.stage],
         )?;
         Ok(())
     }
@@ -649,7 +689,10 @@ impl Job {
 
 #[cfg(test)]
 mod backend_tests {
-    use super::{retry, Catalog, Control, MemoryForkBackend, Request};
+    use super::{
+        active_credential_relay_hold, credential_relay_fork_eligible, retry, source_exited, Catalog,
+        Control, Execution, Inventory, MemoryForkBackend, Request,
+    };
     use serde_json::json;
 
     #[test]
@@ -669,6 +712,85 @@ mod backend_tests {
         assert_eq!(auto.select(true, false, true).unwrap(), "kernel_cow");
         assert!(auto.select(true, false, false).is_err());
         assert_eq!(default.select(false, false, true).unwrap(), "kernel_cow");
+    }
+
+    #[test]
+    fn credential_relay_fork_requires_a_running_source_and_its_original_active_hold() {
+        let mut inventory: Inventory = serde_json::from_value(json!({
+            "protocol":"CaptureControl/1", "devices":[], "source_disposition":"RUNNING",
+            "last_session":1, "guest_gate":"idle", "measured_helper":true,
+        })).unwrap();
+        assert!(!credential_relay_fork_eligible("independent_fork", &inventory));
+        inventory.credential_relay_fork = Some(true);
+        for operation in ["independent_fork", "fork_batch"] {
+            assert!(credential_relay_fork_eligible(operation, &inventory));
+        }
+        for operation in ["vm_snapshot", "hibernate", "vm_rollback"] {
+            assert!(!credential_relay_fork_eligible(operation, &inventory));
+        }
+        inventory.source_disposition = "STANDBY".into();
+        assert!(!credential_relay_fork_eligible("independent_fork", &inventory));
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(&dir.path().join("catalog.sqlite"), "boot", "session").unwrap();
+        let bundle = format!("sha256:{}", "3".repeat(64));
+        let digest = format!("sha256:{}", "1".repeat(64));
+        catalog.register_bundle(&bundle, &digest).unwrap();
+        catalog.db.execute_batch(
+            "INSERT INTO lifecycle_policies(instance_id,bundle_digest,revision,policy_json)
+               SELECT 'source-vm',bundle_digest,1,'{}' FROM runtime_bundles;
+             INSERT INTO lifecycle_protections(instance_id,id,kind,principal,incarnation_id,epoch,revision,state,reason) VALUES
+               ('source-vm','access-0-ssh','hold','grant','source-inc',2,1,'active','ssh'),
+               ('source-vm','access-1-suspect','hold','grant','source-inc',2,1,'suspect','credential_proxy'),
+               ('source-vm','access-2-epoch','hold','grant','source-inc',1,1,'active','credential_proxy'),
+               ('source-vm','access-3-other','hold','grant','other-inc',2,1,'active','credential_proxy'),
+               ('source-vm','access-4-lease','lease','grant','source-inc',2,1,'active','credential_proxy'),
+               ('source-vm','access-5-current','hold','grant','source-inc',2,1,'active','credential_proxy'),
+               ('source-vm','access-6-current','hold','other-grant','source-inc',2,1,'active','credential_proxy');"
+        ).unwrap();
+        let mut source = Execution {
+            incarnation_id: "source-inc".into(), instance_id: "source-vm".into(),
+            route_id: "deep".into(), execution_epoch: 2, bundle_digest: bundle,
+            host_boot_id: "boot".into(), pid: 123, pid_start_time: 1, uid: 1001,
+            phase: "registered".into(), last_operation_id: "launch".into(),
+        };
+        let hold = active_credential_relay_hold(&catalog.db, &source, None).unwrap().unwrap();
+        assert_eq!(hold, "access-5-current");
+        assert_eq!(active_credential_relay_hold(&catalog.db, &source, Some(&hold)).unwrap(), Some(hold.clone()));
+        catalog.db.execute("UPDATE lifecycle_protections SET state='released' WHERE id=?", [&hold]).unwrap();
+        assert!(active_credential_relay_hold(&catalog.db, &source, Some(&hold)).unwrap().is_none());
+        assert_eq!(active_credential_relay_hold(&catalog.db, &source, None).unwrap().unwrap(), "access-6-current");
+        source.phase = "unknown".into();
+        assert!(active_credential_relay_hold(&catalog.db, &source, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_relay_preserving_fork_cannot_succeed_if_the_original_execution_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::open(&dir.path().join("catalog.sqlite"), "boot", "session").unwrap();
+        let bundle = format!("sha256:{}", "3".repeat(64));
+        let digest = format!("sha256:{}", "1".repeat(64));
+        catalog.register_bundle(&bundle, &digest).unwrap();
+        catalog.db.execute_batch(
+            "INSERT INTO operations
+               SELECT 'batch','independent_fork',executable_sha256,'deep','source-vm',bundle_digest,
+                      1,'source-inc','NEW','NONE',2 FROM runtime_bundles;
+             INSERT INTO executions(incarnation_id,route_id,instance_id,execution_epoch,bundle_digest,host_boot_id,
+                                    pid,pid_start_time,uid,phase,last_operation_id)
+               SELECT 'source-inc','deep','source-vm',1,bundle_digest,'boot',123,1,1001,'exited','batch'
+                      FROM runtime_bundles;
+             INSERT INTO managed_fork_batches(operation_id,source_incarnation,serve_instance,capture_id,template,children,
+               session,token,anchor,network_gate,original,stage,checkpoint,credential_relay_hold)
+               VALUES('batch','source-inc','serve','cut','{}','[]',1,'hold','gate',0,'RUNNING','waking',X'01','access-held');"
+        ).unwrap();
+        let tx = catalog.db.transaction().unwrap();
+        source_exited(&tx, "source-inc").unwrap();
+        tx.commit().unwrap();
+        let op = catalog.operation("batch").unwrap();
+        assert_eq!(op.phase, "ABORTED");
+        let receipt = op.fork.unwrap();
+        assert_eq!(receipt["source_relay_retention_applied"], false);
+        assert_eq!(receipt["error"], "original execution exited before its credential relay returned");
     }
 
     #[test]
@@ -761,7 +883,7 @@ impl Actor {
             // VMM may already have accepted it even before the first catalog write.
             let mut q=c.db.prepare("SELECT operation_id,source_incarnation,capture_id,session,token,anchor,stage,original,network_gate,
                 json_remove(pivot_json,'$.admitted_grant_id','$.reconciled_writer'),(SELECT kind FROM operations o WHERE o.operation_id=b.operation_id),
-                selected_memory_fork_backend='kernel_cow'
+                selected_memory_fork_backend='kernel_cow', credential_relay_hold
                 FROM managed_fork_batches b WHERE stage IN ('failure_return','cancel_preflight','children','cancel_gate','arming','parking','standby','holding','pivoting','source_return','waking','kernel_confirming','kernel_abandon')
                 OR (stage='exporting' AND EXISTS (SELECT 1 FROM operations o WHERE o.operation_id=b.operation_id AND o.kind IN ('independent_fork','fork_batch'))) ORDER BY rowid")?;
             let result = q
@@ -779,6 +901,7 @@ impl Actor {
                         pivot: r.get(9)?,
                         kind: r.get(10)?,
                         kernel_cow: r.get(11)?,
+                        credential_relay_hold: r.get(12)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -802,6 +925,14 @@ impl Actor {
         if j.stage=="cancel_preflight" {return finish_abort(c,&j.id,None)}
         let ep = Endpoint::load(&c.db, &j.inc, boot)?;
         let scope = j.scope();
+        if matches!(j.stage.as_str(), "standby" | "holding") {
+            if let Some(hold) = &j.credential_relay_hold {
+                let source = c.execution(&j.inc)?;
+                if active_credential_relay_hold(&c.db, &source, Some(hold))?.is_none() {
+                    return j.fail_capture(c, "credential relay hold ended before the source cut");
+                }
+            }
+        }
         match j.stage.as_str() {
             "cancel_gate" => {
                 let inv=ep.inventory()?;
@@ -848,7 +979,17 @@ impl Actor {
             }
             "standby" => {
                 let started = Instant::now();
-                let status = ep.command(&format!("STANDBY_ENTER {scope} managed"))?;
+                let verb = if j.credential_relay_hold.is_some() {
+                    "STANDBY_FORK_ENTER"
+                } else {
+                    "STANDBY_ENTER"
+                };
+                let status = match ep.command(&format!("{verb} {scope} managed")) {
+                    Err(fault) if j.credential_relay_hold.is_some() && fault.code == "E_NATIVE_REFUSED" => {
+                        return j.fail_capture(c, &fault.message);
+                    }
+                    result => result?,
+                };
                 if serde_json::from_str::<Value>(&status).map_err(invalid)?["source_disposition"]
                     == "STANDBY"
                 {
@@ -864,6 +1005,10 @@ impl Actor {
                 }
                 if matches!(inv.source_disposition.as_str(), "STANDBY" | "WAKING") && j.original == "RUNNING" {
                     ep.command(&format!("STANDBY_WAKE {scope}"))?;
+                    return Ok(());
+                }
+                if inv.source_disposition == "GUEST_HELD" && j.credential_relay_hold.is_some() {
+                    j.gate(&ep, "ABORT", "")?;
                     return Ok(());
                 }
                 if inv.source_disposition==j.original {
@@ -883,17 +1028,20 @@ impl Actor {
                     format!("CAPTURE_KERNEL_PREPARE {scope}")
                 };
                 let status = match ep.command(&command) {
-                    Err(fault) if fault.code=="E_NATIVE_REFUSED" && (fault.message.starts_with("ENOTSUP") || fault.message.starts_with("EIO held capture:")) => {
-                        c.db.execute("UPDATE managed_fork_batches SET stage='failure_return',error=? WHERE operation_id=? AND stage='holding'",params![fault.message,j.id])?;
-                        return Ok(())
+                    Err(fault) if fault.code == "E_NATIVE_REFUSED" && (j.credential_relay_hold.is_some()
+                        || fault.message.starts_with("ENOTSUP") || fault.message.starts_with("EIO held capture:")) => {
+                        return j.fail_capture(c, &fault.message);
                     }
                     result=>result?
                 };
                 let status = serde_json::from_str::<Value>(&status).map_err(invalid)?;
                 if status["phase"] == "failed" {
                     let reason = status["error"].as_str().unwrap_or("native source failed to reach the capture boundary");
-                    c.db.execute("UPDATE managed_fork_batches SET stage='failure_return',error=? WHERE operation_id=? AND stage='holding'",params![reason,j.id])?;
+                    j.fail_capture(c, reason)?;
                 } else if status["source_disposition"] == "HELD" {
+                    if j.credential_relay_hold.is_some() && status["credential_relay_fork"] != true {
+                        return j.fail_capture(c, "VMM did not confirm source credential relay retention");
+                    }
                     j.capture_timing("held_prepare", started);
                     j.advance(
                         c,
@@ -957,19 +1105,24 @@ impl Actor {
 /// A source pivot is one step in a managed operation. The fenced source exit
 /// may release the parent, but only its actor can publish the terminal result.
 pub(crate) fn source_exited(tx:&rusqlite::Transaction<'_>,inc:&str)->Result<()> {
-    let mut q=tx.prepare("SELECT b.operation_id,o.kind,b.checkpoint IS NOT NULL AND b.stage!='kernel_abandon',p.phase FROM managed_fork_batches b JOIN operations o USING(operation_id)
+    let mut q=tx.prepare("SELECT b.operation_id,o.kind,b.checkpoint IS NOT NULL AND b.stage!='kernel_abandon',p.phase,b.credential_relay_hold IS NOT NULL FROM managed_fork_batches b JOIN operations o USING(operation_id)
         LEFT JOIN statepoints p USING(capture_id) WHERE b.source_incarnation=? AND b.source_released=0 AND o.phase='NEW'")?;
-    let jobs=q.query_map([inc],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,Option<String>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let jobs=q.query_map([inc],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,bool>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     drop(q);
-    for (id,kind,volatile,phase) in jobs {
+    for (id,kind,volatile,phase,preserve_relay) in jobs {
         if phase.as_deref()==Some("stop_committed") {continue}
         let next=match kind.as_str() {
-            "independent_fork"|"fork_batch" if volatile=>"children",
+            "independent_fork"|"fork_batch" if volatile && !preserve_relay=>"children",
             "vm_snapshot" if matches!(phase.as_deref(),Some("exporting"|"durable"))=>"checkpoint_export",
             _=>"aborted"
         };
-        tx.execute("UPDATE managed_fork_batches SET stage=?,source_released=1,error=? WHERE operation_id=?",params![next,
-            if next=="aborted" {Some("source exited before the managed capture was committed")}else{None},id])?;
+        let error = if next == "aborted" {
+            Some(if preserve_relay { "original execution exited before its credential relay returned" }
+                else { "source exited before the managed capture was committed" })
+        } else {
+            None
+        };
+        tx.execute("UPDATE managed_fork_batches SET stage=?,source_released=1,error=? WHERE operation_id=?",params![next,error,id])?;
         if next=="aborted" {
             drop_capture_pins(tx, &id)?;
             tx.execute("UPDATE operations SET phase='ABORTED',decision='ABORT',revision=revision+1 WHERE operation_id=?",[&id])?;
