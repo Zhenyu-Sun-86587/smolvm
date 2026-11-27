@@ -207,6 +207,15 @@ fn serve(mut socket: Socket, export: Export) -> io::Result<()> {
     }
 }
 
+fn receive_init(boot: &Socket) -> io::Result<(Init, OwnedFd)> {
+    let packet = ipc::receive_packet(boot).map_err(|fault| io::Error::other(fault.message))?;
+    let [donor]: [OwnedFd; 1] = packet
+        .descriptors
+        .try_into()
+        .map_err(|_| invalid("kernel CoW anchor needs exactly one donor pidfd"))?;
+    Ok((serde_json::from_slice(&packet.body)?, donor))
+}
+
 pub(super) fn run() -> io::Result<()> {
     // SAFETY: inherited standard input is the launch socket. Close any fds
     // other than this connection and standard output/error before loading.
@@ -221,14 +230,7 @@ pub(super) fn run() -> io::Result<()> {
         return Err(io::Error::from(io::ErrorKind::PermissionDenied));
     }
     boot.set_read_timeout(Some(Duration::from_secs(15)))?;
-    let packet = ipc::receive_packet_with_limit(&boot, 1)
-        .map_err(|fault| io::Error::other(fault.message))?;
-    let init: Init = serde_json::from_slice(&packet.body)?;
-    let donor = packet
-        .descriptors
-        .into_iter()
-        .next()
-        .ok_or_else(|| invalid("missing donor pidfd"))?;
+    let (init, donor) = receive_init(&boot)?;
     if !in_scope(std::process::id() as i32, &init.helper_id)? {
         return Err(invalid("kernel CoW anchor is outside its Worker scope"));
     }
@@ -298,6 +300,28 @@ mod tests {
     use std::process::Command;
 
     const SANDBOX_TEST: &str = "SMOLVM_TEST_ONLY_ANCHOR_SECCOMP";
+
+    #[test]
+    fn bootstrap_receives_json_and_one_donor() {
+        let (sender, receiver) = Socket::pair(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+        let init = Init {
+            directory: PathBuf::from("/run/anchor"),
+            capture_id: "capture-test".into(),
+            helper_id: "helper-test".into(),
+            bundle_digest: "bundle-test".into(),
+            executable_digest: "executable-test".into(),
+            regions: vec![],
+        };
+        let body = serde_json::to_vec(&init).unwrap();
+        let fd = OwnedFd::from(File::open("/dev/null").unwrap());
+        ipc::send_packet(&sender, &body, std::slice::from_ref(&fd)).unwrap();
+        let (decoded, _) = receive_init(&receiver).unwrap();
+        assert_eq!(decoded.capture_id, init.capture_id);
+        for fds in [vec![], vec![fd.try_clone().unwrap(), fd]] {
+            ipc::send_packet(&sender, &body, &fds).unwrap();
+            assert!(receive_init(&receiver).is_err());
+        }
+    }
 
     #[test]
     fn restricts_mprotect_after_import_even_with_maywrite() {
