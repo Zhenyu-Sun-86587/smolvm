@@ -184,8 +184,8 @@ fn lockdown() -> io::Result<()> {
     Ok(())
 }
 
-fn serve(mut socket: Socket, export: Export) -> io::Result<()> {
-    if ipc::peer(&socket)?.uid != 0 {
+fn serve(socket: &mut Socket, export: Export) -> io::Result<()> {
+    if ipc::peer(socket)?.uid != 0 {
         return Err(io::Error::from(io::ErrorKind::PermissionDenied));
     }
     socket.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -205,6 +205,15 @@ fn serve(mut socket: Socket, export: Export) -> io::Result<()> {
         }
         _ => Err(invalid("unknown kernel CoW anchor request")),
     }
+}
+
+fn handle_connection(mut socket: Socket, export: Export) {
+    let _ = serve(&mut socket, export);
+    // OwnedFd's debug drop checks F_GETFD. The locked-down helper only
+    // needs close(2) here, including when a client disconnects early.
+    let fd = socket.into_raw_fd();
+    // SAFETY: ownership was transferred above and Linux releases the fd on EINTR.
+    unsafe { libc::close(fd) };
 }
 
 fn receive_init(boot: &Socket) -> io::Result<(Init, OwnedFd)> {
@@ -284,9 +293,7 @@ pub(super) fn run() -> io::Result<()> {
     lockdown()?;
     loop {
         match listener.accept() {
-            Ok((socket, _)) => {
-                let _ = serve(socket, export);
-            }
+            Ok((socket, _)) => handle_connection(socket, export),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
             Err(error) => return Err(error),
         }
@@ -300,6 +307,47 @@ mod tests {
     use std::process::Command;
 
     const SANDBOX_TEST: &str = "SMOLVM_TEST_ONLY_ANCHOR_SECCOMP";
+
+    #[test]
+    fn serves_repeated_connections_after_lockdown() {
+        const CHILD: &str = "SMOLVM_TEST_ONLY_ANCHOR_CONNECTIONS";
+        if std::env::var_os(CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "kernel_mm_anchor_process::tests::serves_repeated_connections_after_lockdown",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "locked-down connection handler: {status}");
+            return;
+        }
+        unsafe extern "C" fn unused_export(_: libc::c_int) -> i32 {
+            -libc::EINVAL
+        }
+        let pair = || {
+            let (mut client, server) = Socket::pair(Domain::UNIX, Type::STREAM, None).unwrap();
+            client.write_all(b"Q").unwrap();
+            (client, server)
+        };
+        let (mut first, server1) = pair();
+        let (mut second, server2) = pair();
+        // Only the Worker UID receives a reply. Unprivileged test runs also
+        // exercise two rejected connections closing under the same filter.
+        let root_peer = unsafe { libc::geteuid() } == 0;
+        lockdown().unwrap();
+        handle_connection(server1, unused_export);
+        handle_connection(server2, unused_export);
+        let mut reply = [0];
+        let ok = !root_peer
+            || (first.read_exact(&mut reply).is_ok()
+                && reply == *b"+"
+                && second.read_exact(&mut reply).is_ok()
+                && reply == *b"+");
+        // Skip test framework output and allocator teardown under the filter.
+        unsafe { libc::_exit(if ok { 0 } else { 1 }) }
+    }
 
     #[test]
     fn bootstrap_receives_json_and_one_donor() {
