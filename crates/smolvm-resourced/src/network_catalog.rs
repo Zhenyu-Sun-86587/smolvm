@@ -277,7 +277,7 @@ impl Catalog {
                 guest_ipv4: fixed.map(|(guest, _, _)| guest),
                 preferred_private_ipv4: None,
                 transfer_id: None,
-                rebind_revision: prior.map(|before| before.revision),
+                rebind_revision: prior.as_ref().map(|before| before.revision),
                 dns_name: Some(dns_name.into()),
             },
             overlay,
