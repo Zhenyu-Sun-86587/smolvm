@@ -454,7 +454,7 @@ pub fn boot() -> Result<()> {
         if kernel && boot.plan.restore.is_none() {
             k.enable_managed_kernel_cow(ctx).map_err(failed)?;
         }
-        let (sets, files) = client.managed_disks(&boot.plan).map_err(failed)?;
+        let disks = client.managed_disks(&boot.plan).map_err(failed)?;
         let network = boot
             .network
             .as_ref()
@@ -464,8 +464,7 @@ pub fn boot() -> Result<()> {
         k.managed_boot(
             ctx,
             &boot.plan,
-            &sets,
-            &files,
+            &disks,
             &boot.helper,
             &boot.control,
             &boot.worker,

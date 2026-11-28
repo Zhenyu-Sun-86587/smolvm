@@ -324,7 +324,7 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
                 migrate_capture_journal(&tx)?;
             }
-            1..=34 => {
+            1..=35 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -453,7 +453,9 @@ impl Catalog {
         tx.execute_batch(include_str!("schema_network_memberships.sql"))?;
         tx.execute_batch(include_str!("schema_network_transfers.sql"))?;
         tx.execute_batch(include_str!("schema_network_overlay.sql"))?;
-        tx.pragma_update(None, "user_version", 34)?;
+        tx.execute_batch(include_str!("schema_saved_files.sql"))?;
+        tx.execute_batch(include_str!("schema_bucket_bases.sql"))?;
+        tx.pragma_update(None, "user_version", 35)?;
         tx.commit()?;
         Ok(Self { db })
     }
@@ -575,6 +577,7 @@ impl Catalog {
              )
              SELECT EXISTS (SELECT 1 FROM executions WHERE phase='unknown')
                 OR EXISTS (SELECT 1 FROM operations o WHERE o.phase='NEW'
+                           AND o.kind!='disk_closure_import'
                            AND NOT EXISTS (SELECT 1 FROM replayable_operations p WHERE p.operation_id=o.operation_id))
                 OR EXISTS (SELECT 1 FROM writer_reservations r LEFT JOIN writer_grants g USING(operation_id)
                     WHERE g.grant_id IS NULL OR g.state!='attached')
@@ -1223,6 +1226,7 @@ impl Catalog {
                 | "statepoint_rescue"
                 | "backup"
                 | "backup_import"
+                | crate::disk_closure_import::KIND
                 | "fork_capture"
                 | "kernel_anchor_export"
                 | "managed_execution"

@@ -72,6 +72,7 @@ pub mod retry;
 pub mod secrets;
 pub mod sni;
 pub mod tcp_forward;
+pub mod saved_files;
 pub mod system_files_v2;
 pub mod workload_target;
 
@@ -621,6 +622,8 @@ pub enum ManagedDisk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Sync scoped whole virtio ext4 disks and report the Guest mount topology.
+    CaptureSavedFileMounts,
     /// Filesystem operations on the execution-scoped System Agent only.
     SystemFilesV2 {
         /// Connection-owned v2 file request.
@@ -1578,6 +1581,7 @@ impl AgentRequest {
     /// decision rather than an accidental leak in some future request type.
     pub fn log_summary(&self) -> String {
         match self {
+            AgentRequest::CaptureSavedFileMounts => "CaptureSavedFileMounts".into(),
             AgentRequest::SystemFilesV2 { .. } => "SystemFilesV2".into(),
             AgentRequest::ContainerSession { .. } => "ContainerSession".into(),
             AgentRequest::OnlineMemory {

@@ -198,12 +198,13 @@ impl StatePoints {
                 .any(|device| device.is_network()),
         )?;
         let directory = self.directory.clone();
+        let mounts = crate::saved_files::mounts(&catalog.db, &operation.operation_id)?;
         let bundle = operation.bundle_digest;
         let commit_id = operation.operation_id;
         let job = thread::Builder::new()
             .name("statepoint-export".into())
             .spawn(move || {
-                statepoint_store::write_native(&directory, point, bundle, commit_id, capture, opened)
+                statepoint_store::write_native(&directory, point, bundle, commit_id, capture, opened, mounts)
             })
             .map_err(host_io)?;
         self.exports.insert(export.capture_id, job);
@@ -272,9 +273,10 @@ impl StatePoints {
         }
         let directory = self.directory.clone();
         let point = record.point.clone();
+        let mounts = crate::saved_files::mounts(&catalog.db, &operation.operation_id)?;
         let job = thread::Builder::new().name("statepoint-export".into()).spawn(move || {
             statepoint_store::write(&directory, point, operation.bundle_digest, operation.operation_id,
-                &checkpoint, &mut ram, opened)
+                &checkpoint, &mut ram, opened, mounts)
         }).map_err(host_io)?;
         self.exports.insert(export.capture_id, job);
         Ok(record)

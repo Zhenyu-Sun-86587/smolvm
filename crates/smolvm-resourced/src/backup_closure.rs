@@ -16,7 +16,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path};
 
 const MAX_MANIFEST: usize = 16 << 20;
-const MAX_CLOSURE: usize = 1024;
+pub(crate) const MAX_CLOSURE: usize = 1024;
 const SCHEMA: &str = "NativeBackupClosure/1";
 const TRANSFER_SCHEMA: &str = "NativeBackupTransfer/1";
 
@@ -65,8 +65,8 @@ pub(crate) struct Manifest {
     pub generations: Vec<String>,
     pub blocks: BTreeMap<String, BlockSpec>,
     #[serde(default)]
-    block_digests: BTreeMap<String, String>,
-    members: BTreeMap<String, u64>,
+    pub block_digests: BTreeMap<String, String>,
+    pub members: BTreeMap<String, u64>,
 }
 
 // The original closure is an opaque string so it keeps the exact digest and
@@ -104,7 +104,7 @@ fn bundle<'a>(catalog: &Catalog, request: &'a Request) -> Result<&'a str> {
     Ok(id)
 }
 
-fn open_member(root: &File, path: &str) -> io::Result<File> {
+pub(crate) fn open_member(root: &File, path: &str) -> io::Result<File> {
     let parts: Vec<_> = Path::new(path).components().collect();
     if parts.is_empty()
         || parts.len() > 8
@@ -459,7 +459,7 @@ pub(crate) fn release(catalog: &mut Catalog, request: &Request) -> Result<Value>
     Ok(json!({"backup_id":selection.backup_id,"phase":"released"}))
 }
 
-fn load(
+pub(crate) fn load(
     archive: &File,
     expected: &str,
     bundle: &str,

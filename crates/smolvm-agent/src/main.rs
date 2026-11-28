@@ -23,6 +23,7 @@ mod live_resources;
 #[cfg(target_os = "linux")]
 mod oci_supervisor;
 mod shutdown;
+mod saved_files;
 mod shutdown_freeze;
 mod system_files;
 
@@ -2641,6 +2642,10 @@ fn handle_connection(
                     let _permit = WORK_SLOTS.acquire();
                     handle_file_write(&path, &data, mode, uid, gid, Some(&WorkloadTarget::Vm))
                 }
+                AgentRequest::CaptureSavedFileMounts => {
+                    let _permit = WORK_SLOTS.acquire();
+                    saved_files::capture()
+                }
                 AgentRequest::SystemFilesV2 { request } => {
                     system_files::v2::handle(stream, request, &mut system_upload_v2)?;
                     continue;
@@ -3375,7 +3380,8 @@ fn handle_request(
 
         // Streaming uploads go through `handle_connection`'s
         // per-connection session state so they can't land here.
-        AgentRequest::SystemFilesV2 { .. }
+        AgentRequest::CaptureSavedFileMounts
+        | AgentRequest::SystemFilesV2 { .. }
         | AgentRequest::FileWriteBegin { .. }
         | AgentRequest::DirectoryWriteBegin { .. }
         | AgentRequest::FileWriteChunk { .. } => AgentResponse::error(

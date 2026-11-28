@@ -525,6 +525,7 @@ impl Worker {
                 layers,
             });
         }
+        let ranges = crate::bucket_bases::launch(&self.catalog, &self.objects, &op.bundle_digest, &layouts, self.admin_uid)?;
         let heads = plan.heads();
         let mut packet = if heads.is_empty() {
             Reply {
@@ -562,7 +563,18 @@ impl Worker {
                 }
             }
         }
-        packet.result = json!({"devices":layouts,"grant":packet.result.get("grant"),"incarnation_id":execution.incarnation_id,"execution_epoch":execution.execution_epoch});
+        if packet.descriptors.len() + ranges.len() > ipc::MAX_FDS {
+            return Err(Fault::new("E_RESOURCE_LIMIT", "managed block capability descriptors exceed Worker limits"));
+        }
+        let mut bucket_ranges = std::collections::BTreeMap::new();
+        for (resource, (bytes, descriptor)) in ranges {
+            bucket_ranges.insert(resource.clone(), bytes);
+            packet.table.push(ipc::FdEntry {
+                index: packet.descriptors.len(), resource_id: resource, role: "bucket_range".into(),
+            });
+            packet.descriptors.push(descriptor);
+        }
+        packet.result = json!({"bucket_ranges":bucket_ranges,"devices":layouts,"grant":packet.result.get("grant"),"incarnation_id":execution.incarnation_id,"execution_epoch":execution.execution_epoch});
         Ok(packet)
     }
     fn reconnect_native_endpoints(&mut self) -> Result<()> {
@@ -604,6 +616,7 @@ impl Worker {
             "RegisterGenerationBatch"
                 | "ReconcileExecutionExports"
                 | "ImportImmutableBlock"
+                | "ImportImmutableClosure"
                 | "ReconcileWriterSet"
                 | "CommitWriterPivot"
                 | "FinalizeWriterPivot"
@@ -617,6 +630,32 @@ impl Worker {
             ));
         }
         let result = match request.method.as_str() {
+            "ImportImmutableClosure" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new("E_PERMISSION_DENIED", "disk closure import requires the Worker administrator"));
+                }
+                crate::disk_closure_import::import(&mut self.catalog, &self.objects, request, descriptors)
+            }
+            "RegisterBucketBase" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new("E_PERMISSION_DENIED", "Bucket bases require the Worker administrator"));
+                }
+                crate::bucket_bases::register(&self.catalog, &self.objects, request, self.admin_uid)
+            }
+            "PrepareSavedFiles" | "ReadSavedFiles" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new("E_PERMISSION_DENIED", "saved files require the Worker administrator"));
+                }
+                if request.method == "PrepareSavedFiles" {
+                    crate::saved_files::prepare(&self.catalog, &self.objects, self.statepoints.directory(), request)
+                } else {
+                    let (result, file) = crate::saved_files::read(&self.catalog, request)?;
+                    let id = result["capture_id"].as_str().ok_or_else(|| Fault::invalid("missing saved capture ID"))?;
+                    return Ok(Reply { result: result.clone(), table: vec![ipc::FdEntry {
+                        index: 0, resource_id: id.into(), role: "saved_files".into(),
+                    }], descriptors: vec![file.into()], delivered: None });
+                }
+            }
             "PrepareBackupClosure" | "ReadBackupMember" => {
                 if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
                     return Err(Fault::new("E_PERMISSION_DENIED", "native backups require the Worker administrator"));
@@ -1083,6 +1122,12 @@ impl Worker {
             }
             "QueryWorkerBudget" => crate::admission::status(&self.catalog.db),
             "ReleaseBackupClosure" => crate::backup_closure::release(&mut self.catalog, request),
+            "ReleaseImmutableClosure" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new("E_PERMISSION_DENIED", "disk closure release requires the Worker administrator"));
+                }
+                crate::disk_closure_import::release(&mut self.catalog, &self.objects, request)
+            }
             "ReleaseStatePoint" => self.statepoints.release_root(&mut self.catalog, request),
             "QueryProductVolume" => crate::product_volumes::query(&self.catalog, request),
             "ApplyProductVolume" => {

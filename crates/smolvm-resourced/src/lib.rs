@@ -15,6 +15,8 @@ mod backing_identity;
 #[cfg(target_os = "linux")]
 mod blocks;
 #[cfg(target_os = "linux")]
+mod bucket_bases;
+#[cfg(target_os = "linux")]
 mod catalog;
 #[cfg(target_os = "linux")]
 pub mod client;
@@ -49,6 +51,8 @@ mod managed_statepoint;
 mod backup_closure;
 #[cfg(target_os = "linux")]
 mod backup_import;
+#[cfg(target_os = "linux")]
+mod disk_closure_import;
 #[cfg(target_os = "linux")]
 pub mod native_client;
 #[cfg(target_os = "linux")]
@@ -86,6 +90,8 @@ mod pivots;
 mod product_volumes;
 #[cfg(target_os = "linux")]
 mod resource_resize;
+#[cfg(target_os = "linux")]
+mod saved_files;
 #[cfg(target_os = "linux")]
 mod statepoint_capture;
 #[cfg(target_os = "linux")]

@@ -1,5 +1,5 @@
 //! Worker-owned live changes to the current managed execution.
-mod observations;
+pub(crate) mod observations;
 pub(crate) mod pressure_hint;
 
 use self::observations::{Balloon, Cpus, Ram, MIB};

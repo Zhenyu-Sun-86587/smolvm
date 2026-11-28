@@ -24,7 +24,7 @@ fn guest(detail: impl ToString) -> Fault {
     Fault::new("E_GUEST_MANAGEMENT_UNAVAILABLE", detail.to_string())
 }
 
-pub(super) fn agent(endpoint: &Endpoint, request: &AgentRequest) -> Result<AgentResponse> {
+pub(crate) fn agent(endpoint: &Endpoint, request: &AgentRequest) -> Result<AgentResponse> {
     let mut stream = UnixStream::from(endpoint.connect_guest_agent().map_err(guest)?);
     let seconds = if matches!(request, AgentRequest::Ping | AgentRequest::VmExec { .. }) {
         2
@@ -43,7 +43,8 @@ pub(super) fn agent(endpoint: &Endpoint, request: &AgentRequest) -> Result<Agent
     let mut size = [0; 4];
     stream.read_exact(&mut size).map_err(guest)?;
     let size = u32::from_be_bytes(size) as usize;
-    if size == 0 || size > 65536 {
+    let max = if matches!(request, AgentRequest::CaptureSavedFileMounts) { 128 << 10 } else { 64 << 10 };
+    if size == 0 || size > max {
         return Err(guest("unexpected Guest resource reply size"));
     }
     let mut bytes = vec![0u8; size];
