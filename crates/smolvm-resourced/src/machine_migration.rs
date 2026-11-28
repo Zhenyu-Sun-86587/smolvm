@@ -630,6 +630,9 @@ fn hold_source(catalog: &mut Catalog, objects: &File, boot: &str, input: &Input)
     if record.phase != "durable" {
         return Err(pending("source StatePoint bytes are being exported"));
     }
+    if !crate::bucket_online::require_capture_commit(catalog, &op, &record)? {
+        return Err(pending("the complete held Bucket writer set is awaiting its remote commit"));
+    }
     let endpoint =
         crate::native_control::Endpoint::load(&catalog.db, &execution.incarnation_id, boot)?;
     let reply = endpoint.command(&format!(
@@ -1614,12 +1617,15 @@ fn hold_stopped_source(
         device.head_id = None;
         device.reattach = false;
     }
-    let generation_ids = devices
+    let generation_ids: Vec<_> = devices
         .iter()
         .map(|device| device.disk.generation_id.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    if !crate::bucket_online::require_commit(catalog, &operation, &generation_ids)? {
+        return Err(pending("the complete stopped Bucket writer set is awaiting its remote commit"));
+    }
     let details = HeldDetails {
         generation_ids,
         capture_operation_id: op.clone(),
