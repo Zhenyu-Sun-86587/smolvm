@@ -205,10 +205,44 @@ impl QuarantinedPort {
         }
     }
 
-    pub(crate) fn adopt_published(&mut self, router: PrivateRouter) {
+    pub(crate) fn adopt_recovered(&mut self, router: PrivateRouter, published: bool) {
         self.router_link.router = router;
         self.router_link.attached = true;
-        self.router_link.routed.set(true);
+        self.router_link.routed.set(published);
+    }
+
+    pub(crate) fn quarantine_recovered_migration(&self, evidence: &KernelProof) -> io::Result<()> {
+        let port = self.namespace();
+        let router = self.router_link.router.namespace();
+        let name = self.router_link.name.as_str();
+        let tap = link(port, TAP_PORT_NAME)?;
+        let uplink = link(port, "up0")?;
+        let peer = link(router, name)?;
+        if NamespaceIdentity::read(port)? != evidence.port
+            || NamespaceIdentity::read(router)? != evidence.router
+            || tap["kind"] != "tun" || uplink["kind"] != "veth" || peer["kind"] != "veth"
+            || uplink["ifindex"].as_i64().is_none() || peer["ifindex"].as_i64().is_none()
+            || uplink["ifindex"] != peer["peer_index"] || peer["ifindex"] != uplink["peer_index"]
+            || uplink["peer_namespace"].as_i64().is_none() || peer["peer_namespace"].as_i64().is_none()
+        {
+            return Err(io::Error::other("migration TAP differs from its original router link"));
+        }
+        let private = self.router_link.address.to_string();
+        let host = format!("{private}/32");
+        let host_routes = || -> io::Result<Vec<Value>> {
+            Ok(entries(&routes(router)?)?.iter().filter(|row|row["dst"] == private || row["dst"] == host)
+                .cloned().collect())
+        };
+        match host_routes()?.as_slice() {
+            [] => self.router_link.routed.set(false),
+            [entry] if entry["dev"] == name && entry["scope"] == "link" => self.router_link.routed.set(true),
+            _ => return Err(io::Error::other("migration address belongs to another router link")),
+        }
+        self.close_identity()?;
+        if link(port, TAP_PORT_NAME)?["up"] != false || !host_routes()?.is_empty() {
+            return Err(io::Error::other("recovered migration TAP retains forwarding authority"));
+        }
+        Ok(())
     }
 
     pub(crate) fn record_kernel_proof(&self, directory: &Path) -> io::Result<KernelProof> {
@@ -223,6 +257,16 @@ impl QuarantinedPort {
     }
 
     pub(crate) fn kernel_proof(&self) -> io::Result<KernelProof> {
+        self.kernel_proof_with_policy(true)
+    }
+
+    pub(crate) fn migration_kernel_proof(&self) -> io::Result<KernelProof> {
+        // Overlay withdrawal legitimately changes its own authorization
+        // table. The transfer proves that shared state independently.
+        self.kernel_proof_with_policy(false)
+    }
+
+    fn kernel_proof_with_policy(&self, include_overlay: bool) -> io::Result<KernelProof> {
         let port_ns = self.namespace();
         let router_ns = self.router_link.router.namespace();
         let name = self.router_link.name.as_str();
@@ -307,8 +351,8 @@ impl QuarantinedPort {
             router_loopback,
             route_rules(router_ns)?,
             route_rules(port_ns)?,
-            firewall(port_ns)?,
-            firewall(router_ns)?,
+            firewall(port_ns, true)?,
+            firewall(router_ns, include_overlay)?,
             sysctl,
         ]);
         let bytes = serde_json::to_vec(&value).map_err(io::Error::other)?;
@@ -375,7 +419,7 @@ fn routes(namespace: BorrowedFd<'_>) -> io::Result<Value> {
     Ok(raw)
 }
 
-fn firewall(namespace: BorrowedFd<'_>) -> io::Result<Value> {
+fn firewall(namespace: BorrowedFd<'_>, include_overlay: bool) -> io::Result<Value> {
     let mut raw = probe_json(namespace, "nft", &["-j", "list", "ruleset"])?;
     let rows = raw["nftables"]
         .as_array_mut()
@@ -385,7 +429,8 @@ fn firewall(namespace: BorrowedFd<'_>) -> io::Result<Value> {
     rows.retain(|row| {
         row.get("metainfo").is_none() && !row.as_object().is_some_and(|row| {
             row.iter().any(|(kind, entry)| {
-                (kind == "table" && entry["name"] == "sm_membership") || entry["table"] == "sm_membership"
+                let table = if kind == "table" { &entry["name"] } else { &entry["table"] };
+                table == "sm_membership" || (!include_overlay && table == "sm_overlay")
             })
         })
     });

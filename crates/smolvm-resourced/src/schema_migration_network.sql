@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS machine_migration_source_taps (
     lease_id TEXT NOT NULL REFERENCES network_tap_leases(lease_id),
     lease_revision INTEGER NOT NULL CHECK (lease_revision > 0),
     transfer_json TEXT NOT NULL CHECK (json_valid(transfer_json)),
+    kernel_scope_json TEXT NOT NULL CHECK (json_valid(kernel_scope_json)),
     phase TEXT NOT NULL CHECK (phase IN ('closing','closed','reopening','reopened'))
 ) STRICT;
 

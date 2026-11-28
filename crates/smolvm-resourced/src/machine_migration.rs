@@ -1503,7 +1503,9 @@ fn queue_cold(
     let mut machine = details.machine;
     machine.name = name.into();
     if environment.is_some() && machine.boot_profile != "system-debian-v1" {
-        return Err(unsupported("cold migration Boot environment requires the managed System profile"));
+        return Err(unsupported(
+            "cold migration Boot environment requires the managed System profile",
+        ));
     }
     if machine.disks.len() != details.devices.len() {
         return Err(fenced("target disk set differs from the held source"));
@@ -1641,7 +1643,6 @@ fn close_source_tap(
         ).optional()?;
         if lease.lease_id != original.lease_id
             || !lease.matches(execution)
-            || lease.revision != transfer.attachment_revision
             || lease.state != "attached"
             || !network_transfer::source_descriptor(&lease.attachment, transfer)
             || catalog.network_kernel_proof(&lease)?.is_none()
@@ -1649,14 +1650,16 @@ fn close_source_tap(
             return Err(fenced("source TAP no longer has the exact published lease"));
         }
         match prior {
-            None if lease.gate == "open" => {
+            None if lease.gate == "open" && lease.revision == transfer.attachment_revision => {
+                let scope = network.migration_source_proof(&lease)?;
                 catalog.db.execute(
-                    "INSERT INTO machine_migration_source_taps VALUES(?,?,?,?,'closing')",
+                    "INSERT INTO machine_migration_source_taps VALUES(?,?,?,?,?,'closing')",
                     params![
                         transfer.migration_id,
                         lease.lease_id,
                         lease.revision,
-                        transfer_json
+                        transfer_json,
+                        encode(scope)?,
                     ],
                 )?;
             }
@@ -1686,11 +1689,11 @@ fn reopen_source_tap(
     network: &NetworkRuntime,
     execution: &Execution,
 ) -> Result<Option<Attachment>> {
-    let row: Option<(String,i64,String,String)> = catalog.db.query_row(
-        "SELECT lease_id,lease_revision,transfer_json,phase FROM machine_migration_source_taps WHERE migration_id=?",
-        [&input.ticket().id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    let row: Option<(String,i64,String,String,String)> = catalog.db.query_row(
+        "SELECT lease_id,lease_revision,transfer_json,phase,kernel_scope_json FROM machine_migration_source_taps WHERE migration_id=?",
+        [&input.ticket().id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
     ).optional()?;
-    let Some((id, revision, scope, phase)) = row else {
+    let Some((id, revision, scope, phase, kernel_scope)) = row else {
         let (_, plan) = source_plan(catalog, input)?;
         expected_source_attachment(catalog, input, execution, &plan)?;
         return Ok(source_attachment(catalog, execution, &plan, false)?.map(|(a, _)| a));
@@ -1738,7 +1741,9 @@ fn reopen_source_tap(
             "UPDATE machine_migration_source_taps SET phase='reopening' WHERE migration_id=?",
             [&input.ticket().id],
         )?;
-        network.reopen_migration_source(catalog, &lease)?;
+        let kernel_scope = serde_json::from_str(&kernel_scope)
+            .map_err(|_| fenced("invalid persisted migration TAP kernel scope"))?;
+        network.reopen_migration_source(&lease, &kernel_scope)?;
         let tx = catalog.db.unchecked_transaction()?;
         if tx.execute(
             "UPDATE network_tap_leases SET revision=revision+1 WHERE lease_id=? AND revision=? AND state='attached'",
