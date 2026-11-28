@@ -517,6 +517,9 @@ pub(crate) fn pending(c: &Catalog, serve: &str, bundle: &str) -> Result<Vec<Plan
         WHERE m.serve_instance=? AND o.bundle_digest=? AND o.phase='NEW'
           AND NOT EXISTS (SELECT 1 FROM machine_migrations mm WHERE mm.native_operation_id=o.operation_id
             AND (mm.state IN ('aborting','aborted') OR (o.kind='launch' AND mm.decision_json IS NULL)))
+          AND NOT (o.kind='launch' AND EXISTS (
+            SELECT 1 FROM network_transfer_guards g LEFT JOIN network_transfers t USING(operation_id)
+            WHERE g.operation_id=o.operation_id AND coalesce(t.phase,'')<>'committed'))
           AND ((SELECT NOT recovering FROM worker_state) OR EXISTS (
               SELECT 1 FROM executions e WHERE e.incarnation_id=m.incarnation_id
                 AND e.last_operation_id=o.operation_id AND e.instance_id=o.instance_id

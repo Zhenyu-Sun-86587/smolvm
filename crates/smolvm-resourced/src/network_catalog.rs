@@ -252,6 +252,16 @@ impl Catalog {
         overlay: &crate::network::overlay::Overlay,
     ) -> Result<NetworkReservation> {
         let prior = lookup(&self.db, attachment_id)?;
+        let mut dns_name = dns_name;
+        if let Some(before) = &prior {
+            let migrated: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM network_transfer_guards WHERE attachment_id=?)",
+                [attachment_id], |row| row.get(0),
+            )?;
+            if migrated {
+                dns_name = before.dns_name.as_deref().unwrap_or(dns_name);
+            }
+        }
         let fixed = network.fixed_route();
         self.reserve_network_with_overlay(
             request,
@@ -267,7 +277,7 @@ impl Catalog {
                 guest_ipv4: fixed.map(|(guest, _, _)| guest),
                 preferred_private_ipv4: None,
                 transfer_id: None,
-                rebind_revision: prior.map(|before| before.revision),
+                rebind_revision: prior.as_ref().map(|before| before.revision),
                 dns_name: Some(dns_name.into()),
             },
             overlay,
@@ -387,10 +397,17 @@ impl Catalog {
         let allocation = overlay.allocation().filter(|pool| pool.network_id == data.network_id);
         let operation = self.matching_operation(request)?;
         verify_epoch(request, &operation)?;
-        if data.preferred_private_ipv4.is_some() != data.transfer_id.is_some()
-            || data.transfer_id.as_ref().is_some_and(|id| !valid_id(id) || operation.kind != "restore_target")
-        {
+        if data.preferred_private_ipv4.is_some() != data.transfer_id.is_some() {
             return Err(Fault::invalid("stable address reservation requires a designated transfer target"));
+        }
+        if let Some(id) = &data.transfer_id {
+            if !valid_id(id)
+                || (operation.kind != "restore_target"
+                    && (operation.kind != "launch"
+                        || !crate::machine_migration::cold_target(&self.db, &operation.operation_id, id)?))
+            {
+                return Err(Fault::invalid("stable address reservation requires a designated transfer target"));
+            }
         }
         if !valid_id(&data.attachment_id)
             || !valid_id(&data.network_id)
@@ -434,6 +451,9 @@ impl Catalog {
                 ));
             }
             if let Some(transfer) = &data.transfer_id {
+                if prior.state == "released" && prior.operation_id != operation.operation_id {
+                    return self.reclaim_aborted_transfer(request, prior, transfer, data.dns_name.as_deref());
+                }
                 if !crate::network_transfer::guard_matches(&self.db, &operation.operation_id, &data.attachment_id, transfer)? {
                     return Err(Fault::new("E_IDEMPOTENCY_CONFLICT", "attachment already has another transfer intent"));
                 }
@@ -541,6 +561,50 @@ impl Catalog {
             .ok_or_else(|| Fault::new("E_CATALOG", "network reservation was not stored"))?;
         tx.commit()?;
         Ok(reservation)
+    }
+
+    fn reclaim_aborted_transfer(
+        &mut self,
+        request: &Request,
+        prior: NetworkReservation,
+        migration: &str,
+        dns_name: Option<&str>,
+    ) -> Result<NetworkReservation> {
+        self.ready()?;
+        let operation = self.active_operation(request)?;
+        let old = self.operation(&prior.operation_id)?;
+        let prior_aborted: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM machine_migrations m
+             JOIN network_transfer_guards g USING(migration_id)
+             WHERE m.native_operation_id=?1 AND m.side='target' AND m.state='aborted'
+               AND g.operation_id=?1 AND g.attachment_id=?2 AND m.decision_json IS NULL)",
+            params![old.operation_id,prior.attachment_id], |row|row.get(0),
+        )?;
+        if !prior_aborted || old.phase != "ABORTED" || !operation.launches_execution()
+            || old.route_id != operation.route_id || old.bundle_digest != operation.bundle_digest
+            || old.instance_id != operation.instance_id || prior.dns_name.as_deref() != dns_name
+        {
+            return Err(Fault::new("E_FENCE_UNPROVEN", "previous transfer reservation has no confirmed abort"));
+        }
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE network_attachments SET operation_id=?1,state='reserved',revision=revision+1
+             WHERE attachment_id=?2 AND state='released' AND revision=?3
+               AND NOT EXISTS(SELECT 1 FROM network_tap_leases WHERE attachment_id=?2 AND state<>'retired')
+               AND NOT EXISTS(SELECT 1 FROM network_attachments current
+                 WHERE current.network_id=?4 AND current.private_ipv4=?5 AND current.state<>'released')",
+            params![operation.operation_id, prior.attachment_id, prior.revision,
+                prior.network_id, u32::from(prior.private_ipv4)],
+        )?;
+        if changed != 1 {
+            return Err(Fault::new("E_NETWORK_ATTACHMENT_CONFLICT", "stable address is unavailable after the prior aborted transfer"));
+        }
+        tx.execute(
+            "INSERT INTO network_transfer_guards(operation_id,attachment_id,migration_id) VALUES(?,?,?)",
+            params![operation.operation_id, prior.attachment_id, migration],
+        )?;
+        tx.commit()?;
+        self.scoped_network_reservation(request, &prior.attachment_id)
     }
 
     fn rebind_network(
@@ -743,7 +807,7 @@ mod tests {
         use crate::network::{topology::KernelProof, NamespaceIdentity};
         use crate::network_lease_catalog::AttachmentDescriptor;
 
-        for case in ["committed", "active", "unknown gate", "legacy schema"] {
+        for case in ["committed", "migration held", "migration complete", "active", "unknown gate", "legacy schema"] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("catalog.sqlite");
             let mut catalog = Catalog::open(&path, "boot", "original").unwrap();
@@ -796,6 +860,19 @@ mod tests {
             if case == "unknown gate" {
                 catalog.db.execute("UPDATE initial_network_activations SET phase='unknown'", []).unwrap();
             }
+            if let Some(state) = case.strip_prefix("migration ") {
+                catalog.db.execute(
+                    "INSERT INTO machine_migrations
+                     (migration_id,ticket_digest,ticket_json,side,instance_id,native_operation_id,state)
+                     VALUES('move',?,'{}','source','vm','migration-source',?)",
+                    params![launch.request_digest,state],
+                ).unwrap();
+                catalog.db.execute(
+                    "INSERT INTO machine_migration_source_taps
+                     VALUES('move','lease',?,json_object('attachment_revision',?),?,'closed')",
+                    params![attached.revision,attached.revision,serde_json::to_string(&proof).unwrap()],
+                ).unwrap();
+            }
             if case == "legacy schema" {
                 catalog.db.execute_batch(
                     "DROP TABLE kernel_cow_imports; DROP TABLE kernel_mm_anchors; DROP TABLE kernel_statepoint_checkpoints;
@@ -814,12 +891,23 @@ mod tests {
             let execution = catalog.reconcile_execution("execution").unwrap();
             let unknown = catalog.tap_lease("attachment").unwrap();
             assert_eq!((unknown.state.as_str(), unknown.gate.as_str()), ("unknown", "unknown"));
-            if case == "committed" {
+            if matches!(case, "committed" | "migration held") {
+                let migration = case == "migration held";
+                assert_eq!(catalog.has_migration_source_gate(&unknown).unwrap(), migration);
                 assert_eq!(catalog.recoverable_network_proof(&unknown, &execution).unwrap(), proof);
                 assert!(catalog.router_pin_in_use(proof.router).unwrap());
                 catalog.adopt_published_tap(&unknown).unwrap();
                 let recovered = catalog.tap_lease("attachment").unwrap();
-                assert_eq!((recovered.state.as_str(), recovered.gate.as_str()), ("attached", "open"));
+                assert_eq!((recovered.state.as_str(), recovered.gate.as_str()),
+                    ("attached", if migration { "closed" } else { "open" }));
+                if migration {
+                    let revisions: (i64, i64) = catalog.db.query_row(
+                        "SELECT lease_revision,json_extract(transfer_json,'$.attachment_revision')
+                         FROM machine_migration_source_taps WHERE migration_id='move'",
+                        [], |row| Ok((row.get(0)?,row.get(1)?)),
+                    ).unwrap();
+                    assert_eq!(revisions, (recovered.revision, attached.revision));
+                }
                 assert_eq!(recovered.attachment_digest().unwrap(), attached.attachment_digest().unwrap());
                 assert!(recovered.revision > attached.revision);
                 assert_eq!(catalog.complete_recovery("replacement").unwrap()["state"], "ready");

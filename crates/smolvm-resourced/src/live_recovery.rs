@@ -64,6 +64,7 @@ impl Worker {
     fn recover_network(&mut self, execution: &Execution, attachment: &str) -> Result<()> {
         let lease = self.catalog.tap_lease(attachment)?;
         let evidence = self.catalog.recoverable_network_proof(&lease, execution)?;
+        let held_migration = self.catalog.has_migration_source_gate(&lease)?;
         self.verify_live_execution(execution)?;
         let endpoint = Endpoint::load(&self.catalog.db, &execution.incarnation_id, &self.boot)?;
         let inventory = endpoint.inventory()?;
@@ -82,6 +83,7 @@ impl Worker {
                 "idle" | "released" | "aborted" | "expired_thawed" | "failed_thawed"
             ),
             "STANDBY" => inventory.guest_gate == "parked",
+            "HELD" if held_migration => inventory.guest_gate == "parked",
             _ => false,
         };
         if !original_guest || !settled {
@@ -93,10 +95,9 @@ impl Worker {
             grants::fence_unproven("live VMM has no verified process handle")
         })?;
         let (router, port) =
-            self.network
-                .recover_port(&self.catalog, execution, &lease, &evidence, pidfd.as_fd())?;
+            self.network.recover_port(&self.catalog, execution, &lease, &evidence, pidfd.as_fd(), held_migration)?;
         self.verify_live_execution(execution)?;
-        self.network.adopt_recovered_port(&mut self.catalog, &lease, router, port)
+        self.network.adopt_recovered_port(&mut self.catalog, &lease, router, port, held_migration)
     }
 
     fn recover_writer(&mut self, execution: &Execution, grant: &WriterGrant) -> Result<()> {

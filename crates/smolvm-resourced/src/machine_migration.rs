@@ -1,13 +1,19 @@
 //! Exact-attempt Worker authority for a cross-Worker transfer.
 
+use crate::activation_runtime::ActivationRuntime;
+use crate::boot_environment;
 use crate::catalog::{Catalog, Execution, Operation};
-use crate::ipc::{Expected, Fault, FdEntry, PROTOCOL, Request, Result, valid_digest, valid_id};
+use crate::ipc::{valid_digest, valid_id, Expected, Fault, FdEntry, Request, Result, PROTOCOL};
 use crate::managed::{self, Device, Machine};
 use crate::migration_product_volumes as products;
+use crate::network_lease_catalog::TapLease;
+use crate::network_memberships::{self, Membership};
+use crate::network_runtime::NetworkRuntime;
+use crate::network_transfer::{self, OwnerDecision, SourceFence, Transfer};
 use crate::statepoint_catalog::Record;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -74,7 +80,54 @@ struct Step {
     fence: Option<Value>,
     abort: Option<Value>,
     decision: Option<Decision>,
-    network: Option<Value>,
+    network: Option<MigrationNetwork>,
+    boot_environment: Option<boot_environment::Attempt>,
+}
+
+#[derive(Deserialize)]
+struct MigrationNetwork {
+    source_attachment: Attachment,
+    membership: Membership,
+    overlay_fence: Option<SourceFence>,
+    target_abort: Option<network_transfer::Receipt>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Attachment {
+    lease: TapLease,
+    request_digest: String,
+    network_id: String,
+    dns_name: Option<String>,
+    policy_revision: i64,
+}
+
+#[derive(Default, Serialize)]
+struct ResumedNetwork {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reopened_attachment: Option<Attachment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovered_tap: Option<RecoveredTap>,
+}
+
+#[derive(Serialize)]
+struct RecoveredTap {
+    original_revision: i64,
+    closed_revision: i64,
+    broker_session_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReadyNetwork {
+    transfer: Transfer,
+    operation_id: String,
+    request_digest: String,
+}
+
+#[derive(Serialize)]
+struct HistoricalNetwork {
+    published_revision: i64,
+    retired_revision: i64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -229,15 +282,43 @@ impl Input {
                 "migration requires the exact original Bundle and reader",
             ));
         }
-        if self
-            .request
-            .network
-            .as_ref()
-            .is_some_and(|network| !network.is_null())
+        if self.request.boot_environment.is_some()
+            && (ticket.mode != "cold"
+                || !matches!(
+                    self.request.step.as_str(),
+                    "preflight_target" | "prepare_target" | "activate_target"
+                ))
         {
-            return Err(unsupported(
-                "managed cross-Worker network activation is unavailable for this transfer",
+            return Err(Fault::invalid(
+                "boot environment is only valid for a new cold target",
             ));
+        }
+        if let Some(network) = &self.request.network {
+            let lease = &network.source_attachment.lease;
+            let expected = &ticket.source.execution;
+            let incarnation = expected
+                .incarnation_id
+                .as_deref()
+                .unwrap_or(&ticket.source.binding_incarnation_id);
+            if lease.route_id != "deep"
+                || lease.bundle_digest != ticket.source.bundle_digest
+                || lease.instance_id != expected.instance_id
+                || lease.execution_epoch != Some(expected.execution_epoch)
+                || lease.incarnation_id.as_deref() != Some(incarnation)
+                || lease.revision < 1
+                || lease.state != "attached"
+                || lease.gate != "open"
+                || !valid_id(&lease.lease_id)
+                || !valid_id(&lease.operation_id)
+                || !valid_digest(&network.source_attachment.request_digest)
+                || !network.membership.valid()
+                || network.membership.policy_revision
+                    != network.source_attachment.policy_revision.max(1)
+            {
+                return Err(fenced(
+                    "network intent differs from the exact source execution or policy",
+                ));
+            }
         }
         Ok(())
     }
@@ -363,6 +444,41 @@ fn reserve(catalog: &Catalog, input: &Input) -> Result<()> {
         params![input.ticket().id,input.ticket_digest,encode(input.ticket())?,
             if input.target() {"target"} else {"source"},input.endpoint().execution.instance_id,input.op()])?;
     state(catalog, input)?;
+    let intent = network_intent(input)?;
+    catalog.db.execute(
+        "INSERT OR IGNORE INTO machine_migration_network_intents VALUES(?,?)",
+        params![input.ticket().id, intent],
+    )?;
+    verify_network_intent(catalog, input)
+}
+
+fn network_intent(input: &Input) -> Result<String> {
+    encode(
+        input
+            .request
+            .network
+            .as_ref()
+            .map(|net| (&net.source_attachment, &net.membership)),
+    )
+}
+
+fn verify_network_intent(catalog: &Catalog, input: &Input) -> Result<()> {
+    let prior: Option<String> = catalog
+        .db
+        .query_row(
+            "SELECT intent_json FROM machine_migration_network_intents WHERE migration_id=?",
+            [&input.ticket().id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(prior) = prior {
+        if prior != network_intent(input)? {
+            return Err(Fault::new(
+                "E_IDEMPOTENCY_CONFLICT",
+                "migration network scope changed",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -553,7 +669,7 @@ fn source_plan(catalog: &Catalog, input: &Input) -> Result<(Execution, managed::
             if execution.instance_id != ep.execution.instance_id
                 || execution.route_id != "deep"
                 || execution.bundle_digest != ep.bundle_digest
-                || execution.execution_epoch > epoch
+                || execution.execution_epoch != epoch
                 || execution.phase != "exited"
             {
                 return Err(fenced(
@@ -568,20 +684,221 @@ fn source_plan(catalog: &Catalog, input: &Input) -> Result<(Execution, managed::
     let plan = managed::plan(catalog, &op)?
         .filter(|_| op.phase == "COMPLETED")
         .ok_or_else(|| unsupported("source has no complete managed disk provenance"))?;
-    if plan.machine.name != ep.runtime_name || plan.machine.network.is_some() {
-        return Err(unsupported(
-            "source network topology has no reversible cross-Worker fence",
+    if plan.machine.name != ep.runtime_name {
+        return Err(fenced(
+            "source managed launch differs from the migration ticket",
         ));
     }
     Ok((execution, plan))
+}
+
+fn source_attachment(
+    catalog: &Catalog,
+    execution: &Execution,
+    plan: &managed::Plan,
+    stopped: bool,
+) -> Result<Option<(Attachment, Option<HistoricalNetwork>)>> {
+    let Some(spec) = plan.machine.network.as_ref() else {
+        return Ok(None);
+    };
+    let id = plan.network_attachment_id().unwrap();
+    let (lease, history) = if stopped {
+        let row = catalog
+            .db
+            .query_row(
+                "SELECT t.lease_id,t.operation_id,t.route_id,t.bundle_digest,t.instance_id,
+                    t.incarnation_id,t.execution_epoch,t.host_boot_id,t.broker_session_id,
+                    t.revision,k.published_revision,t.descriptor_json
+             FROM network_tap_leases t JOIN network_kernel_receipts k USING(lease_id)
+             WHERE t.attachment_id=?1 AND t.incarnation_id=?2 AND t.execution_epoch=?3
+               AND t.operation_id=?4 AND t.instance_id=?5 AND t.state='retired'
+               AND t.revision>k.published_revision
+               AND NOT EXISTS(SELECT 1 FROM network_tap_leases active
+                 WHERE active.attachment_id=t.attachment_id AND active.state<>'retired')",
+                params![
+                    id,
+                    execution.incarnation_id,
+                    execution.execution_epoch,
+                    execution.last_operation_id,
+                    execution.instance_id
+                ],
+                |r| {
+                    Ok((
+                        TapLease {
+                            lease_id: r.get(0)?,
+                            operation_id: r.get(1)?,
+                            route_id: r.get(2)?,
+                            bundle_digest: r.get(3)?,
+                            instance_id: r.get(4)?,
+                            incarnation_id: r.get(5)?,
+                            execution_epoch: r.get(6)?,
+                            host_boot_id: r.get(7)?,
+                            broker_session_id: r.get(8)?,
+                            revision: r.get::<_, i64>(9)? - 1,
+                            state: "attached".into(),
+                            gate: "open".into(),
+                            attachment: serde_json::from_str(&r.get::<_, String>(11)?)
+                                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        },
+                        HistoricalNetwork {
+                            published_revision: r.get(10)?,
+                            retired_revision: r.get(9)?,
+                        },
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| fenced("stopped source has no exact retired published TAP"))?;
+        (row.0, Some(row.1))
+    } else {
+        let leases = catalog.tap_leases_for_execution(execution)?;
+        let [lease] = leases.as_slice() else {
+            return Err(fenced("migration requires exactly one managed source TAP"));
+        };
+        if lease.gate != "open"
+            || lease.state != "attached"
+            || catalog.network_kernel_proof(lease)?.is_none()
+        {
+            return Err(fenced("source TAP has no exact kernel publication proof"));
+        }
+        (lease.clone(), None)
+    };
+    let (network_id, dns_name) = catalog.tap_network_metadata(&lease)?;
+    if id != lease.attachment.attachment_id
+        || !lease.matches(execution)
+        || network_id != spec.network_id
+        || lease.attachment.route_domain_id != spec.route_domain_id
+        || lease.attachment.device_id != "net0"
+        || lease.attachment.mode
+            != if spec.fixed_route().is_some() {
+                "fixed_internal"
+            } else {
+                "native"
+            }
+    {
+        return Err(fenced("source attachment differs from the managed launch"));
+    }
+    let policy_revision =
+        network_memberships::lookup(&catalog.db, &lease.instance_id)?.policy_revision;
+    let request_digest = catalog.operation(&lease.operation_id)?.request_digest;
+    Ok(Some((
+        Attachment {
+            lease,
+            request_digest,
+            network_id,
+            dns_name,
+            policy_revision,
+        },
+        history,
+    )))
+}
+
+fn expected_source_attachment(
+    catalog: &Catalog,
+    input: &Input,
+    execution: &Execution,
+    plan: &managed::Plan,
+) -> Result<()> {
+    let observed = source_attachment(
+        catalog,
+        execution,
+        plan,
+        input.endpoint().execution.incarnation_id.is_none(),
+    )?;
+    match (observed, input.request.network.as_ref()) {
+        (None, None) => Ok(()),
+        (Some((attachment, _)), Some(network)) => {
+            // Older lookup clients omit or use zero for the default policy.
+            let mut submitted = network.source_attachment.clone();
+            submitted.policy_revision = submitted.policy_revision.max(1);
+            if attachment != submitted
+                || network_memberships::lookup(&catalog.db, &execution.instance_id)?
+                    != network.membership
+            {
+                return Err(fenced(
+                    "source TAP or network policy changed during migration",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(fenced(
+            "migration intent differs from the source network topology",
+        )),
+    }
+}
+
+fn validate_network_domain(
+    network: &NetworkRuntime,
+    input: &Input,
+    spec: &managed::Network,
+) -> Result<()> {
+    let intent = input
+        .request
+        .network
+        .as_ref()
+        .ok_or_else(|| fenced("source network intent is missing"))?;
+    let a = &intent.source_attachment.lease.attachment;
+    let target = &input.ticket().target.worker_id;
+    let source = &input.ticket().source.worker_id;
+    let (local, peer) = if input.target() {
+        (target, source)
+    } else {
+        (source, target)
+    };
+    let valid_mode = match spec.fixed_route() {
+        Some((guest, gateway, prefix)) => {
+            a.mode == "fixed_internal"
+                && a.guest_ipv4 == guest
+                && a.gateway_ipv4 == gateway
+                && a.guest_prefix == prefix
+        }
+        None => {
+            a.mode == "native"
+                && a.guest_ipv4 == a.private_ipv4
+                && a.guest_prefix == 32
+                && network.overlay().has_peer(&a.route_domain_id, local, peer)
+                && network.overlay().allocation().is_some_and(|pool| {
+                    pool.network_id == spec.network_id && pool.cidr == spec.cidr
+                })
+        }
+    };
+    if !valid_mode
+        || intent.source_attachment.network_id != spec.network_id
+        || a.route_domain_id != spec.route_domain_id
+        || a.device_id != "net0"
+    {
+        return Err(Fault::new(
+            "E_OVERLAY_UNAVAILABLE",
+            "migration requires the same managed route domain, mode and guest route",
+        ));
+    }
+    Ok(())
+}
+
+fn source_network_expected(input: &Input) -> Expected {
+    let mut expected = input.ticket().source.execution.clone();
+    if expected.incarnation_id.is_none() {
+        expected.incarnation_id = Some(input.ticket().source.binding_incarnation_id.clone());
+    }
+    expected
 }
 
 fn source_point(catalog: &Catalog, input: &Input) -> Result<Record> {
     catalog.require_statepoint(&managed::key(&input.op(), "point", 0))
 }
 
-fn hold_source(catalog: &mut Catalog, objects: &File, boot: &str, input: &Input) -> Result<Value> {
+fn hold_source(
+    catalog: &mut Catalog,
+    objects: &File,
+    boot: &str,
+    input: &Input,
+    network: &NetworkRuntime,
+) -> Result<Value> {
     let (execution, plan) = source_plan(catalog, input)?;
+    expected_source_attachment(catalog, input, &execution, &plan)?;
+    if let Some(spec) = &plan.machine.network {
+        validate_network_domain(network, input, spec)?;
+    }
     if input.endpoint().execution.incarnation_id.is_none() {
         return hold_stopped_source(catalog, objects, input, plan);
     }
@@ -684,6 +1001,18 @@ fn hold_source(catalog: &mut Catalog, objects: &File, boot: &str, input: &Input)
             "captured writable device set differs from managed launch",
         ));
     }
+    if record
+        .point
+        .devices
+        .iter()
+        .filter(|device| device.is_network())
+        .count()
+        != usize::from(plan.machine.network.is_some())
+    {
+        return Err(fenced(
+            "captured network inventory differs from the managed launch",
+        ));
+    }
     let product_volumes = product_volumes(catalog, input, &devices)?;
     products::check_held(catalog, &input.ticket().id, &product_volumes)?;
     let parked_at: Option<i64> = catalog.db.query_row(
@@ -725,6 +1054,15 @@ fn inspect(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Value> {
     } else {
         None
     };
+    let (attachment, history) = source_attachment(
+        catalog,
+        &execution,
+        &plan,
+        input.endpoint().execution.incarnation_id.is_none(),
+    )?
+    .map_or((None, None), |(attachment, history)| {
+        (Some(attachment), history)
+    });
     let product_volumes = product_volumes(catalog, input, &plan.devices)?;
     let storage = plan
         .devices
@@ -736,11 +1074,18 @@ fn inspect(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Value> {
         input,
         json!({"details":{"profile":profile,
         "vcpus":plan.machine.cpus,"memory_mib":plan.machine.memory_mib,"storage_bytes":storage,
-        "product_volumes":product_volumes}}),
+        "product_volumes":product_volumes,"reversible_network":attachment.is_some(),
+        "source_attachment":attachment, "historical_network":history,
+        "network_topology":plan.machine.network}}),
     )
 }
 
-fn preflight(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Value> {
+fn preflight(
+    catalog: &mut Catalog,
+    input: &Input,
+    boot: &str,
+    network: &NetworkRuntime,
+) -> Result<Value> {
     let endpoint = input.endpoint();
     let (epoch, incarnation, active) =
         crate::catalog::binding(&catalog.db, "deep", &endpoint.execution.instance_id)?;
@@ -752,6 +1097,18 @@ fn preflight(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Value> 
     }
     if let Some(source) = input.request.hold.as_ref() {
         input.check(Some(source), "inspect_source", &input.ticket().source)?;
+        let source_spec: Option<managed::Network> =
+            serde_json::from_value(source["details"]["network_topology"].clone())
+                .map_err(|_| fenced("source network topology receipt is malformed"))?;
+        match (source_spec.as_ref(), input.request.network.as_ref()) {
+            (Some(spec), Some(_)) => validate_network_domain(network, input, spec)?,
+            (None, None) => (),
+            _ => {
+                return Err(fenced(
+                    "target preflight is missing the exact source network intent",
+                ))
+            }
+        }
         let capacity = crate::admission::status(&catalog.db)?;
         for dimension in ["vcpus", "memory_mib", "storage_bytes"] {
             let required = source["details"][dimension]
@@ -785,7 +1142,10 @@ fn preflight(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Value> 
             "held target preflight requires CPU, clock and geometry from the exact source",
         ));
     }
-    make_receipt(input, json!({}))
+    make_receipt(
+        input,
+        json!({"details":{"boot_environment_migration":true}}),
+    )
 }
 
 fn import_spec(input: &Input) -> Result<Value> {
@@ -810,6 +1170,151 @@ fn import_spec(input: &Input) -> Result<Value> {
     Ok(spec)
 }
 
+fn requested_transfer(input: &Input) -> Option<Transfer> {
+    input.request.network.as_ref().map(|network| {
+        make_transfer(
+            input.ticket(),
+            &network.source_attachment,
+            network.membership.policy_revision,
+        )
+    })
+}
+
+fn make_transfer(ticket: &Ticket, source: &Attachment, policy_revision: i64) -> Transfer {
+    let lease = &source.lease;
+    let a = &lease.attachment;
+    Transfer {
+        machine_id: ticket.machine_id.clone(),
+        source_worker_id: ticket.source.worker_id.clone(),
+        target_worker_id: ticket.target.worker_id.clone(),
+        expected_owner_epoch: ticket.source.owner_epoch,
+        target_execution_epoch: ticket.target.execution.execution_epoch,
+        attachment_id: a.attachment_id.clone(),
+        attachment_revision: lease.revision,
+        target_attachment_id: managed::key(&ticket.target.execution.instance_id, "net", 0),
+        // The stable reservation is a new lease: quarantined, offered, attached.
+        target_attachment_revision: 3,
+        policy_revision,
+        migration_id: ticket.id.clone(),
+        network_mode: a.mode.clone(),
+        private_ipv4: a.private_ipv4,
+        guest_ipv4: a.guest_ipv4,
+        guest_gateway_ipv4: a.gateway_ipv4,
+        guest_prefix: a.guest_prefix,
+        guest_mac: a.mac,
+        route_domain_id: a.route_domain_id.clone(),
+    }
+}
+
+pub(crate) fn live_network_transfer(
+    catalog: &Catalog,
+    operation: &str,
+    lease: &TapLease,
+) -> Result<Option<Transfer>> {
+    let data: Option<(String, String)> = catalog.db.query_row(
+        "SELECT m.ticket_json,n.intent_json FROM machine_migrations m
+         JOIN machine_migration_network_intents n USING(migration_id)
+         JOIN network_transfer_guards g ON g.migration_id=m.migration_id AND g.operation_id=m.native_operation_id
+         WHERE m.side='target' AND m.native_operation_id=?1 AND g.attachment_id=?2",
+        params![operation,lease.attachment.attachment_id], |r| Ok((r.get(0)?,r.get(1)?)),
+    ).optional()?;
+    let Some((ticket, scope)) = data else {
+        return Ok(None);
+    };
+    let ticket: Ticket =
+        serde_json::from_str(&ticket).map_err(|_| fenced("invalid migration ticket"))?;
+    let (source, membership): (Attachment, Membership) = serde_json::from_str(&scope)
+        .map_err(|_| fenced("invalid sealed migration network intent"))?;
+    let transfer = make_transfer(&ticket, &source, membership.policy_revision);
+    if ticket.mode != "live"
+        || lease.lease_id == source.lease.lease_id
+        || lease.revision != transfer.target_attachment_revision
+        || lease.instance_id != ticket.target.execution.instance_id
+        || lease.incarnation_id != ticket.target.execution.incarnation_id
+        || lease.execution_epoch != Some(ticket.target.execution.execution_epoch)
+    {
+        return Err(fenced(
+            "migration target TAP is outside its execution or transfer revision",
+        ));
+    }
+    Ok(Some(transfer))
+}
+
+fn reserve_target_tap(
+    catalog: &mut Catalog,
+    network: &mut NetworkRuntime,
+    input: &Input,
+    native: &Request,
+    spec: &managed::Network,
+    transfer: &Transfer,
+) -> Result<TapLease> {
+    validate_network_domain(network, input, spec)?;
+    catalog.ensure_private_network(&crate::network_catalog::RegisterNetwork {
+        network_id: spec.network_id.clone(),
+        route_domain_id: spec.route_domain_id.clone(),
+        cidr: spec.cidr.clone(),
+    })?;
+    let fixed = spec.fixed_route();
+    let (_, _, expected) = native.scope()?;
+    let dns_name = input
+        .request
+        .network
+        .as_ref()
+        .unwrap()
+        .source_attachment
+        .dns_name
+        .clone()
+        .unwrap_or_else(|| format!("{}.private", managed::key(&expected.instance_id, "vm", 0)));
+    let data = serde_json::from_value(json!({
+        "attachment_id":transfer.target_attachment_id, "network_id":spec.network_id,
+        "device_id":"net0", "mode":transfer.network_mode, "guest_ipv4":fixed.map(|(guest,_,_)|guest),
+        "preferred_private_ipv4":transfer.private_ipv4, "transfer_id":input.ticket().id,
+        "dns_name":dns_name,
+    })).map_err(|_|Fault::invalid("invalid transfer reservation"))?;
+    catalog.reserve_network_with_overlay(native, &data, network.overlay())?;
+    let lease = match catalog.tap_lease(&transfer.target_attachment_id) {
+        Ok(lease) if lease.operation_id == input.op() && lease.gate == "closed" => {
+            let expected = &input.ticket().target.execution;
+            let ready = match lease.state.as_str() {
+                "quarantined" => lease.incarnation_id.is_none() && lease.execution_epoch.is_none(),
+                "offered" | "attached" => {
+                    lease.incarnation_id == expected.incarnation_id
+                        && lease.execution_epoch == Some(expected.execution_epoch)
+                }
+                _ => false,
+            };
+            if !ready || lease.instance_id != expected.instance_id {
+                return Err(fenced("target TAP no longer owns the held execution lease"));
+            }
+            lease
+        }
+        Ok(_) => {
+            return Err(fenced(
+                "target TAP belongs to a different operation or gate",
+            ))
+        }
+        Err(error) if error.code == "E_NOT_FOUND" => network.prepare(
+            catalog,
+            &native.derived(
+                "PrepareNetworkAttachment",
+                json!({
+                    "attachment_id":transfer.target_attachment_id,
+                    "guest_gateway_ipv4":fixed.map(|(_,gateway,_)|gateway),
+                    "guest_prefix":fixed.map(|(_,_,prefix)|prefix),
+                }),
+            ),
+        )?,
+        Err(error) => return Err(error),
+    };
+    if !network_transfer::target_descriptor(transfer, &lease.attachment) {
+        return Err(fenced(
+            "target TAP cannot preserve the original IP, MAC and gateway",
+        ));
+    }
+    Ok(lease)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prepare_target(
     catalog: &mut Catalog,
     objects: &File,
@@ -818,6 +1323,9 @@ fn prepare_target(
     input: &Input,
     wire: &Request,
     descriptors: Vec<OwnedFd>,
+    network: &mut NetworkRuntime,
+    activations: &ActivationRuntime,
+    verify_process: impl Fn(&Catalog, &Execution) -> Result<()>,
 ) -> Result<Value> {
     input.check(
         input.request.hold.as_ref(),
@@ -827,13 +1335,21 @@ fn prepare_target(
     let hold = input.request.hold.as_ref().unwrap();
     let details: HeldDetails = serde_json::from_value(hold["details"].clone())
         .map_err(|error| Fault::invalid(error.to_string()))?;
-    if details.generation_ids.is_empty()
-        || details.machine.network.is_some()
-        || details.devices.is_empty()
-    {
+    if details.generation_ids.is_empty() || details.devices.is_empty() {
         return Err(fenced("source hold has no eligible immutable disk closure"));
     }
     let live = input.ticket().mode == "live";
+    let transfer = requested_transfer(input);
+    let network_spec = details.machine.network.clone();
+    match (network_spec.as_ref(), transfer.as_ref()) {
+        (Some(spec), Some(_)) => validate_network_domain(network, input, spec)?,
+        (None, None) => (),
+        _ => {
+            return Err(fenced(
+                "target intent differs from the held source network topology",
+            ))
+        }
+    }
     if live && details.profile.as_deref() != Some(cpu_clock_profile(boot)?.as_str()) {
         return Err(unsupported("held migration CPU or clock profile changed"));
     }
@@ -934,6 +1450,9 @@ fn prepare_target(
                 network_id: None,
             },
         )?;
+        if let Some((transfer, spec)) = transfer.as_ref().zip(network_spec.as_ref()) {
+            reserve_target_tap(catalog, network, input, &native, spec, transfer)?;
+        }
         let activation = catalog.activation(&op).map_err(|error| {
             if error.code == "E_NOT_FOUND" {
                 pending("restored target has not reached its held activation gate")
@@ -950,15 +1469,56 @@ fn prepare_target(
             ));
         }
     } else {
-        queue_cold(catalog, &native, details, &endpoint.runtime_name)?;
+        queue_cold(
+            catalog,
+            &native,
+            details,
+            &endpoint.runtime_name,
+            input.request.boot_environment.as_ref(),
+        )?;
+        if let Some((transfer, spec)) = transfer.as_ref().zip(network_spec.as_ref()) {
+            reserve_target_tap(catalog, network, input, &native, spec, transfer)?;
+        }
     }
+    let prepared_network = if let Some(transfer) = &transfer {
+        let membership = &input.request.network.as_ref().unwrap().membership;
+        Some(if live {
+            let execution =
+                catalog.execution(endpoint.execution.incarnation_id.as_deref().unwrap())?;
+            verify_process(catalog, &execution)?;
+            let request = input.native(endpoint.execution.clone(), json!({})).derived(
+                "PrepareTransfer",
+                json!({"transfer":transfer, "membership":membership}),
+            );
+            let result = network_transfer::handle(
+                catalog,
+                &execution,
+                &request,
+                network,
+                activations,
+                || verify_process(catalog, &execution),
+            )?;
+            verify_process(catalog, &execution)?;
+            result
+        } else {
+            network_transfer::prepare_cold(catalog, network, &op, transfer, membership)?
+        })
+    } else {
+        None
+    };
+    let ready_network = transfer.map(|transfer| ReadyNetwork {
+        transfer,
+        operation_id: op.clone(),
+        request_digest: input.ticket_digest.clone(),
+    });
     let product_volumes = products::observations(catalog, &native, &input.ticket().id)?;
     remember(
         catalog,
         input,
         "prepared",
         json!({"details":{"native_operation_id":op,
-        "request_digest":input.ticket_digest, "held_live":live,"product_volumes":product_volumes},
+        "request_digest":input.ticket_digest, "held_live":live,"product_volumes":product_volumes,
+        "network":ready_network, "network_prepared":prepared_network},
         "capture_id":hold["capture_id"], "manifest_digest":hold["manifest_digest"]}),
     )
 }
@@ -968,12 +1528,26 @@ fn queue_cold(
     native: &Request,
     details: HeldDetails,
     name: &str,
+    environment: Option<&boot_environment::Attempt>,
 ) -> Result<Operation> {
     let (id, _) = native.operation()?;
+    match catalog.operation(id) {
+        Ok(_) if boot_environment::attempt(&catalog.db, id)?.as_ref() != environment => {
+            return Err(conflict("cold migration boot environment changed"));
+        }
+        Ok(_) => (),
+        Err(error) if error.code == "E_NOT_FOUND" => (),
+        Err(error) => return Err(error),
+    }
     let (_, _, expected) = native.scope()?;
     let namespace = managed::serve_id(&expected.instance_id, name)?;
     let mut machine = details.machine;
     machine.name = name.into();
+    if environment.is_some() && machine.boot_profile != "system-debian-v1" {
+        return Err(unsupported(
+            "cold migration Boot environment requires the managed System profile",
+        ));
+    }
     if machine.disks.len() != details.devices.len() {
         return Err(fenced("target disk set differs from the held source"));
     }
@@ -1015,6 +1589,9 @@ fn queue_cold(
     let spec = encode(&machine)?;
     let encoded = encode(&devices)?;
     catalog.begin_with(native, "launch", |tx| {
+        if let Some(environment) = environment {
+            boot_environment::record(tx, id, environment)?;
+        }
         crate::admission::reserve(tx,id,&expected.instance_id,capacity)?;
         for device in &devices {
             let exists: bool = tx.query_row(
@@ -1033,7 +1610,267 @@ fn queue_cold(
     })
 }
 
-fn source_fence(catalog: &mut Catalog, objects: &File, input: &Input, boot: &str) -> Result<Value> {
+fn check_ready_network(input: &Input, transfer: Option<&Transfer>) -> Result<()> {
+    let ready = input
+        .request
+        .ready
+        .as_ref()
+        .ok_or_else(|| fenced("target readiness is missing"))?;
+    match transfer {
+        None if ready["details"]["network"].is_null() => Ok(()),
+        Some(transfer) => {
+            let network: ReadyNetwork = serde_json::from_value(ready["details"]["network"].clone())
+                .map_err(|_| fenced("stable target network readiness is missing"))?;
+            let prepared: network_transfer::Receipt =
+                serde_json::from_value(ready["details"]["network_prepared"].clone())
+                    .map_err(|_| fenced("target TAP preparation is missing"))?;
+            if network.transfer != *transfer
+                || network.operation_id != native_id(&input.ticket().id, "target")
+                || network.request_digest != input.ticket_digest
+                || prepared.transfer != *transfer
+                || prepared.state != "prepared"
+                || prepared.published
+                || prepared.activation_revision < 1
+            {
+                return Err(fenced(
+                    "target TAP preparation does not match the exact transfer",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(fenced("target readiness has another network topology")),
+    }
+}
+
+fn close_source_tap(
+    catalog: &Catalog,
+    input: &Input,
+    network: &NetworkRuntime,
+    execution: &Execution,
+    transfer: &Transfer,
+) -> Result<Option<SourceFence>> {
+    if transfer.network_mode == "native"
+        && (!network.overlay().has_peer(
+            &transfer.route_domain_id,
+            &transfer.source_worker_id,
+            &transfer.target_worker_id,
+        ) || !network.overlay().permits_source_fence(transfer, execution))
+    {
+        return Err(fenced(
+            "source overlay ownership belongs to another Worker or execution",
+        ));
+    }
+    if network_memberships::lookup(&catalog.db, &execution.instance_id)?
+        != input.request.network.as_ref().unwrap().membership
+    {
+        return Err(fenced("source network membership changed"));
+    }
+    if execution.phase == "exited" {
+        let (_, plan) = source_plan(catalog, input)?;
+        expected_source_attachment(catalog, input, execution, &plan)?;
+    } else {
+        let lease = catalog.tap_lease(&transfer.attachment_id)?;
+        let original = &input
+            .request
+            .network
+            .as_ref()
+            .unwrap()
+            .source_attachment
+            .lease;
+        let transfer_json = encode(transfer)?;
+        let prior: Option<(String, i64, String, String)> = catalog.db.query_row(
+            "SELECT lease_id,lease_revision,transfer_json,phase FROM machine_migration_source_taps WHERE migration_id=?",
+            [&input.ticket().id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).optional()?;
+        if lease.lease_id != original.lease_id
+            || !lease.matches(execution)
+            || lease.state != "attached"
+            || !network_transfer::source_descriptor(&lease.attachment, transfer)
+            || catalog.network_kernel_proof(&lease)?.is_none()
+        {
+            return Err(fenced("source TAP no longer has the exact published lease"));
+        }
+        match prior {
+            None if lease.gate == "open" && lease.revision == transfer.attachment_revision => {
+                let scope = network.migration_source_proof(&lease)?;
+                catalog.db.execute(
+                    "INSERT INTO machine_migration_source_taps VALUES(?,?,?,?,?,'closing')",
+                    params![
+                        transfer.migration_id,
+                        lease.lease_id,
+                        lease.revision,
+                        transfer_json,
+                        encode(scope)?,
+                    ],
+                )?;
+            }
+            Some((id, rev, scope, phase))
+                if id == lease.lease_id
+                    && rev == lease.revision
+                    && scope == transfer_json
+                    && matches!(phase.as_str(), "closing" | "closed") =>
+            {
+                ()
+            }
+            _ => return Err(fenced("source TAP fence intent changed")),
+        }
+        network.close_migration_source(&lease)?;
+        catalog.db.execute(
+            "UPDATE machine_migration_source_taps SET phase='closed' WHERE migration_id=?",
+            [&transfer.migration_id],
+        )?;
+    }
+    Ok((transfer.network_mode == "native")
+        .then(|| network_transfer::source_receipt(execution, transfer)))
+}
+
+fn reopen_source_tap(
+    catalog: &Catalog,
+    input: &Input,
+    network: &NetworkRuntime,
+    execution: &Execution,
+) -> Result<ResumedNetwork> {
+    let row: Option<(String,i64,String,String,String)> = catalog.db.query_row(
+        "SELECT lease_id,lease_revision,transfer_json,phase,kernel_scope_json FROM machine_migration_source_taps WHERE migration_id=?",
+        [&input.ticket().id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    ).optional()?;
+    let Some((id, revision, scope, phase, kernel_scope)) = row else {
+        let (_, plan) = source_plan(catalog, input)?;
+        expected_source_attachment(catalog, input, execution, &plan)?;
+        return Ok(ResumedNetwork {
+            reopened_attachment: source_attachment(catalog, execution, &plan, false)?
+                .map(|(a, _)| a),
+            recovered_tap: None,
+        });
+    };
+    let transfer =
+        requested_transfer(input).ok_or_else(|| fenced("source network scope is missing"))?;
+    let mut reopened = input
+        .request
+        .network
+        .as_ref()
+        .unwrap()
+        .source_attachment
+        .clone();
+    let target_abort = input
+        .request
+        .network
+        .as_ref()
+        .and_then(|net| net.target_abort.as_ref())
+        .ok_or_else(|| fenced("source TAP reopen requires the exact target network abort"))?;
+    let abort_details = &input.request.abort.as_ref().unwrap()["details"]["network_aborted"];
+    if target_abort.transfer != transfer
+        || target_abort.state != "aborted"
+        || target_abort.published
+        || *abort_details != json!(target_abort)
+        || scope != encode(&transfer)?
+    {
+        return Err(fenced(
+            "target network abort differs from the source TAP fence",
+        ));
+    }
+    let lease = catalog.tap_lease(&transfer.attachment_id)?;
+    let reopened_revision = revision
+        .checked_add(1)
+        .ok_or_else(|| fenced("source TAP reopen revision is exhausted"))?;
+    let revision_now = if phase == "reopened" {
+        reopened_revision
+    } else {
+        revision
+    };
+    if lease.lease_id != id
+        || lease.lease_id != reopened.lease.lease_id
+        || lease.broker_session_id != reopened.lease.broker_session_id
+        || revision < transfer.attachment_revision
+        || lease.revision != revision_now
+        || !lease.matches(execution)
+        || lease.state != "attached"
+        || !network_transfer::source_descriptor(&lease.attachment, &transfer)
+        || network_memberships::lookup(&catalog.db, &execution.instance_id)?
+            != input.request.network.as_ref().unwrap().membership
+    {
+        return Err(fenced("source TAP reopen would change the original lease"));
+    }
+    let recovered_tap = if revision > transfer.attachment_revision {
+        let broker_session_id = catalog
+            .db
+            .query_row(
+                "SELECT w.broker_session_id FROM network_kernel_receipts k
+             JOIN network_tap_leases l USING(lease_id)
+             JOIN worker_state w ON w.singleton=1 AND w.host_boot_id=l.host_boot_id
+             WHERE l.lease_id=?1 AND l.broker_session_id=?2
+               AND k.adopted_session_id=w.broker_session_id
+               AND w.broker_session_id<>l.broker_session_id",
+                params![id, reopened.lease.broker_session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                fenced("source TAP revision advanced without the exact broker recovery proof")
+            })?;
+        Some(RecoveredTap {
+            original_revision: transfer.attachment_revision,
+            closed_revision: revision,
+            broker_session_id,
+        })
+    } else {
+        None
+    };
+    if phase != "reopened" {
+        catalog.db.execute(
+            "UPDATE machine_migration_source_taps SET phase='reopening' WHERE migration_id=?",
+            [&input.ticket().id],
+        )?;
+        let kernel_scope = serde_json::from_str(&kernel_scope)
+            .map_err(|_| fenced("invalid persisted migration TAP kernel scope"))?;
+        network.reopen_migration_source(&lease, &kernel_scope)?;
+        let tx = catalog.db.unchecked_transaction()?;
+        if tx.execute(
+            "UPDATE network_tap_leases SET revision=revision+1 WHERE lease_id=? AND revision=? AND state='attached'",
+            params![id,revision],
+        )? != 1 {
+            return Err(fenced("source TAP revision changed during the exact reopen"));
+        }
+        tx.execute(
+            "UPDATE private_packet_wake_rules SET source_lease_revision=?1+1
+             WHERE source_lease=?2 AND source_lease_revision=?1 AND source_attachment=?3
+               AND source_incarnation=?4 AND source_epoch=?5",
+            params![
+                revision,
+                id,
+                transfer.attachment_id,
+                execution.incarnation_id,
+                execution.execution_epoch
+            ],
+        )?;
+        tx.execute(
+            "UPDATE machine_migration_source_taps SET phase='reopened' WHERE migration_id=?",
+            [&input.ticket().id],
+        )?;
+        tx.commit()?;
+    }
+    reopened.lease = catalog.tap_lease(&transfer.attachment_id)?;
+    if reopened.lease.gate != "open"
+        || reopened.lease.lease_id != id
+        || reopened.lease.revision != reopened_revision
+    {
+        return Err(fenced(
+            "reopened source TAP has no exact publication receipt",
+        ));
+    }
+    Ok(ResumedNetwork {
+        reopened_attachment: Some(reopened),
+        recovered_tap,
+    })
+}
+
+fn source_fence(
+    catalog: &mut Catalog,
+    objects: &File,
+    input: &Input,
+    boot: &str,
+    network: &NetworkRuntime,
+) -> Result<Value> {
     let ready = input.check(
         input.request.ready.as_ref(),
         "prepare_target",
@@ -1046,6 +1883,8 @@ fn source_fence(catalog: &mut Catalog, objects: &File, input: &Input, boot: &str
             "target readiness does not match the captured manifest",
         ));
     }
+    let transfer = requested_transfer(input);
+    check_ready_network(input, transfer.as_ref())?;
     if input.endpoint().execution.incarnation_id.is_none() {
         let (epoch, incarnation, active) =
             crate::catalog::binding(&catalog.db, "deep", &input.endpoint().execution.instance_id)?;
@@ -1055,12 +1894,34 @@ fn source_fence(catalog: &mut Catalog, objects: &File, input: &Input, boot: &str
         {
             return Err(fenced("stopped writer slot or migration operation changed"));
         }
+        let (execution, _) = source_plan(catalog, input)?;
+        let details: HeldDetails = serde_json::from_value(hold["details"].clone())
+            .map_err(|_| fenced("stopped source hold receipt is malformed"))?;
+        for device in details
+            .devices
+            .iter()
+            .filter(|device| !device.disk.read_only)
+        {
+            let head: String = catalog.db.query_row(
+                "SELECT head_resource_id FROM volume_heads WHERE volume_id=?",
+                [&device.volume_id],
+                |r| r.get(0),
+            )?;
+            let closure = catalog.block_closure(&head)?;
+            crate::blocks::fence_head_for_seal(objects, &closure[0], false)?;
+        }
+        let overlay_fence = match transfer.as_ref() {
+            Some(transfer) => close_source_tap(catalog, input, network, &execution, transfer)?,
+            None => None,
+        };
         return remember(
             catalog,
             input,
             "fenced",
             json!({
-            "manifest_digest":hold["manifest_digest"],"details":{"ready_proof":ready,"writer_gate":"confirmed_stopped"}}),
+            "manifest_digest":hold["manifest_digest"],"details":{"ready_proof":ready,
+                "writer_gate":"confirmed_stopped","relay_gate":"exited",
+                "tap_gate":transfer.as_ref().map(|_|"retired"),"overlay_fence":overlay_fence}}),
         );
     }
     let record = source_point(catalog, input)?;
@@ -1086,7 +1947,9 @@ fn source_fence(catalog: &mut Catalog, objects: &File, input: &Input, boot: &str
             .point
             .devices
             .iter()
-            .any(|device| device.is_network())
+            .filter(|device| device.is_network())
+            .count()
+            != usize::from(transfer.is_some())
     {
         return Err(fenced(
             "source writer set or measured network inventory changed",
@@ -1105,13 +1968,18 @@ fn source_fence(catalog: &mut Catalog, objects: &File, input: &Input, boot: &str
             "VMM did not corroborate the non-expiring held writer fence",
         ));
     }
+    let overlay_fence = match transfer.as_ref() {
+        Some(transfer) => close_source_tap(catalog, input, network, &execution, transfer)?,
+        None => None,
+    };
     remember(
         catalog,
         input,
         "fenced",
         json!({"capture_id":record.export.capture_id,
         "manifest_digest":record.manifest_digest, "details":{"ready_proof": ready,
-        "writer_gate":"capture_stop_reserved","relay_gate":"parked"}}),
+        "writer_gate":"capture_stop_reserved","relay_gate":"parked",
+        "tap_gate":transfer.as_ref().map(|_|"closed"),"overlay_fence":overlay_fence}}),
     )
 }
 
@@ -1186,6 +2054,255 @@ fn release_import(
     Ok(())
 }
 
+fn validate_boot_intent(catalog: &Catalog, input: &Input) -> Result<()> {
+    if input.ticket().mode == "cold"
+        && boot_environment::attempt(&catalog.db, &input.op())? != input.request.boot_environment
+    {
+        return Err(conflict("cold migration boot environment changed"));
+    }
+    Ok(())
+}
+
+fn abort_receipt(input: &Input) -> Result<()> {
+    input.check(
+        input.request.abort.as_ref(),
+        "abort_target",
+        &input.ticket().target,
+    )?;
+    let details = &input.request.abort.as_ref().unwrap()["details"];
+    if !["writer_closed", "tap_closed", "relay_closed"]
+        .iter()
+        .all(|key| details[*key] == true)
+    {
+        return Err(fenced(
+            "target has not corroborated writer, TAP and relay retirement",
+        ));
+    }
+    Ok(())
+}
+
+fn source_overlay_fence(input: &Input, transfer: &Transfer) -> Result<Option<SourceFence>> {
+    let scope = input.request.network.as_ref().unwrap();
+    let fence = input
+        .request
+        .fence
+        .as_ref()
+        .ok_or_else(|| fenced("missing exact source fence"))?;
+    let details = &fence["details"];
+    let stopped = input.ticket().source.execution.incarnation_id.is_none();
+    let tap_gate = if stopped { "retired" } else { "closed" };
+    let writer_gate = if stopped {
+        "confirmed_stopped"
+    } else {
+        "capture_stop_reserved"
+    };
+    let relay_gate = if stopped { "exited" } else { "parked" };
+    if details["tap_gate"] != tap_gate
+        || details["writer_gate"] != writer_gate
+        || details["relay_gate"] != relay_gate
+        || details["overlay_fence"] != json!(scope.overlay_fence)
+        || (transfer.network_mode == "native") != scope.overlay_fence.is_some()
+        || scope
+            .overlay_fence
+            .as_ref()
+            .is_some_and(|proof| !proof.binds(&source_network_expected(input)))
+    {
+        return Err(fenced(
+            "committed network transfer lacks the exact source TAP, writer and relay gates",
+        ));
+    }
+    Ok(scope.overlay_fence.clone())
+}
+
+pub(crate) fn cold_target(
+    db: &rusqlite::Connection,
+    operation: &str,
+    migration: &str,
+) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM machine_migrations WHERE side='target' AND native_operation_id=?
+         AND migration_id=? AND json_extract(ticket_json,'$.mode')='cold')",
+        params![operation,migration], |r|r.get(0),
+    )?)
+}
+
+pub(crate) fn query_boot_environment(catalog: &Catalog, request: &Request) -> Result<Value> {
+    let operation = catalog.matching_operation(request)?;
+    let (_, _, expected) = request.scope()?;
+    let attempt: boot_environment::Attempt = request.payload()?;
+    let id = &operation.operation_id;
+    let eligible: bool = catalog.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM machine_migrations WHERE side='target' AND native_operation_id=?
+         AND ticket_digest=? AND json_extract(ticket_json,'$.mode')='cold'
+         AND state IN ('prepared','active','complete'))",
+        params![id,operation.request_digest], |r|r.get(0),
+    )?;
+    if !eligible
+        || operation.kind != "launch"
+        || expected.incarnation_id.is_some()
+        || expected.execution_epoch != operation.expected_execution_epoch
+        || boot_environment::attempt(&catalog.db, id)?.as_ref() != Some(&attempt)
+        || operation.phase == "ABORTED"
+    {
+        return Err(fenced(
+            "boot environment requires the original queued cold migration",
+        ));
+    }
+    Ok(json!(operation))
+}
+
+fn seal_aborted_target_heads(catalog: &mut Catalog, objects: &File, input: &Input) -> Result<()> {
+    let native = input.native(input.endpoint().execution.clone(), json!({}));
+    let operation = match catalog.matching_operation(&native) {
+        Ok(operation) => operation,
+        Err(error) if error.code == "E_NOT_FOUND" => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let op = &operation.operation_id;
+    if !operation.launches_execution()
+        || operation.phase != "ABORTED"
+        || operation.expected_incarnation_id.is_some()
+        || operation.expected_execution_epoch.checked_add(1)
+            != Some(input.endpoint().execution.execution_epoch)
+    {
+        return Err(fenced(
+            "target disk cleanup requires the exact aborted launch",
+        ));
+    }
+    let plan = managed::plan(catalog, &operation)?
+        .filter(|plan| plan.launch.execution == input.endpoint().execution)
+        .ok_or_else(|| fenced("aborted target launch lost its exact disk plan"))?;
+    let tx = catalog.db.unchecked_transaction()?;
+    let has_authority: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM machine_migrations WHERE migration_id=?1 AND side='target'
+                        AND native_operation_id=?2 AND state='aborting' AND decision_json IS NULL)
+             AND NOT EXISTS(SELECT 1 FROM executions WHERE last_operation_id=?2 AND phase<>'exited')
+             AND NOT EXISTS(SELECT 1 FROM writer_reservations WHERE operation_id=?2)
+             AND NOT EXISTS(SELECT 1 FROM writer_grants WHERE operation_id=?2 AND state<>'released')",
+        params![input.ticket().id,op], |row|row.get(0),
+    )?;
+    if !has_authority {
+        return Err(fenced(
+            "aborted target retains an execution or writer, or its migration decision changed",
+        ));
+    }
+    let mut locks = Vec::new();
+    let mut sealed = Vec::new();
+    for device in &plan.devices {
+        let Some(head) = device.head_id.as_deref() else {
+            continue;
+        };
+        if device.reattach || device.disk.read_only {
+            return Err(fenced(
+                "aborted migration launch does not own one of its disk heads",
+            ));
+        }
+        let before: Option<(String, String)> = tx
+            .query_row(
+                "SELECT head_resource_id,backing_identity FROM volume_heads WHERE volume_id=?",
+                [&device.volume_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((registered, identity)) = before else {
+            if let Some((owner, spec, _)) = catalog.block_intent(head)? {
+                if owner != *op || !spec.sealed {
+                    return Err(fenced("aborted migration has an unaccounted disk head"));
+                }
+                sealed.push(head);
+            }
+            continue;
+        };
+        let (owner, spec, saved_identity) = catalog
+            .block_intent(head)?
+            .ok_or_else(|| fenced("aborted target head has no managed backing"))?;
+        let expected = plan
+            .head_spec(head)
+            .ok_or_else(|| fenced("aborted target disk head changed"))?;
+        let writer: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM writer_reservations WHERE volume_id=?1 OR head_resource_id=?2)
+                OR EXISTS(SELECT 1 FROM root_refs WHERE owner_kind='block_seal' AND resource_id=?2 AND state='active')",
+            params![device.volume_id,head], |row|row.get(0),
+        )?;
+        if registered != head
+            || owner != *op
+            || spec != expected
+            || !spec.mutable()
+            || saved_identity.as_deref() != Some(&identity)
+            || writer
+        {
+            return Err(fenced(
+                "aborted target head or writer authority differs from its exact launch",
+            ));
+        }
+        let mut object = catalog.block_closure(head)?.remove(0);
+        let (directory, file) = crate::blocks::fence_head_for_seal(objects, &object, true)?;
+        crate::blocks::seal_fenced_head(&directory, &file, &mut object)?;
+        if tx.execute(
+            "DELETE FROM volume_heads WHERE volume_id=?1 AND head_resource_id=?2 AND backing_identity=?3",
+            params![device.volume_id,head,identity],
+        )? != 1 {
+            return Err(fenced("aborted target disk head changed while being discarded"));
+        }
+        crate::blocks::publish_seal_record(&tx, op, &object)?;
+        tx.execute(
+            "UPDATE root_refs SET state='dropped',revision=revision+1
+             WHERE owner_kind='operation' AND owner_id=?1 AND resource_id=?2 AND state='active'",
+            params![op, head],
+        )?;
+        locks.push(file);
+        sealed.push(head);
+    }
+    tx.commit()?;
+    drop(locks);
+    // The target heads are immutable staging garbage after the transaction.
+    // If collection is interrupted, the Worker resumes from 'deleting'.
+    for head in sealed {
+        let resource = catalog.resource(head)?;
+        if resource["state"] == "available" {
+            let revision = resource["revision"]
+                .as_i64()
+                .ok_or_else(|| fenced("aborted target disk has no catalog revision"))?;
+            match catalog.mark_gc(head, revision) {
+                Ok(_) => (),
+                Err(error) if error.code == "E_RESOURCE_PINNED" => (),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn abort_target_tap(catalog: &Catalog, network: &mut NetworkRuntime, input: &Input) -> Result<()> {
+    let Some(transfer) = requested_transfer(input) else {
+        return Ok(());
+    };
+    match catalog.tap_lease(&transfer.target_attachment_id) {
+        Ok(lease) if lease.operation_id == input.op() && lease.state == "quarantined" => {
+            network.retire_port(catalog, &lease)?;
+        }
+        Ok(_) => return Err(fenced("target TAP effects have not been retired")),
+        Err(error) if error.code == "E_NOT_FOUND" => (),
+        Err(error) => return Err(error),
+    }
+    let unresolved: bool = catalog.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM network_attachments WHERE operation_id=? AND state='unknown')",
+        [&input.op()],
+        |r| r.get(0),
+    )?;
+    if unresolved {
+        return Err(fenced(
+            "target network preparation must be reconciled before abort",
+        ));
+    }
+    catalog.db.execute(
+        "UPDATE network_attachments SET state='released',revision=revision+1
+         WHERE operation_id=? AND attachment_id=? AND state='reserved'",
+        params![input.op(), transfer.target_attachment_id],
+    )?;
+    Ok(())
+}
+
 impl crate::worker::Worker {
     pub(crate) fn machine_migration(
         &mut self,
@@ -1222,6 +2339,7 @@ impl crate::worker::Worker {
                 reserve(&self.catalog, &input)?;
             }
         }
+        verify_network_intent(&self.catalog, &input)?;
         if let Some(result) = previous(&self.catalog, &input, step)? {
             let (phase, decision) = state(&self.catalog, &input)?.unwrap();
             if (phase == "aborted" && step != "abort_target")
@@ -1236,6 +2354,7 @@ impl crate::worker::Worker {
                         return Err(fenced("owner decision changed on replay"));
                     }
                     if step == "activate_target" {
+                        validate_boot_intent(&self.catalog, &input)?;
                         let native = input.native(input.endpoint().execution.clone(), json!({}));
                         let execution = self.scoped_execution(&native)?;
                         self.verify_live_execution(&execution)?;
@@ -1255,13 +2374,37 @@ impl crate::worker::Worker {
                         input.request.hold.as_ref(),
                     )?;
                 }
-                "resume_source" => {
+                "prepare_target" => {
                     input.check(
-                        input.request.abort.as_ref(),
-                        "abort_target",
+                        input.request.hold.as_ref(),
+                        "hold_source",
+                        &input.ticket().source,
+                    )?;
+                    validate_boot_intent(&self.catalog, &input)?;
+                    let hold = input.request.hold.as_ref().unwrap();
+                    if result["manifest_digest"] != hold["manifest_digest"]
+                        || result["capture_id"] != hold["capture_id"]
+                    {
+                        return Err(fenced(
+                            "target prepare retry changed the original source hold",
+                        ));
+                    }
+                    if input.ticket().mode == "live" {
+                        let native = input.native(input.endpoint().execution.clone(), json!({}));
+                        self.verify_live_execution(&self.scoped_execution(&native)?)?;
+                    }
+                }
+                "fence_source" => {
+                    let ready = input.check(
+                        input.request.ready.as_ref(),
+                        "prepare_target",
                         &input.ticket().target,
                     )?;
+                    if result["details"]["ready_proof"] != ready {
+                        return Err(fenced("target ready proof changed on source fence replay"));
+                    }
                 }
+                "resume_source" => abort_receipt(&input)?,
                 _ => (),
             }
             return Ok(result);
@@ -1270,22 +2413,40 @@ impl crate::worker::Worker {
             state(&self.catalog, &input)?.unwrap_or_else(|| ("new".into(), None));
         match (step, phase.as_str()) {
             ("inspect_source", "new") => inspect(&mut self.catalog, &input, &self.boot),
-            ("preflight_target", "new") => preflight(&mut self.catalog, &input, &self.boot),
-            ("hold_source", "new" | "reserved") => {
-                hold_source(&mut self.catalog, &self.objects, &self.boot, &input)
+            ("preflight_target", "new") => {
+                preflight(&mut self.catalog, &input, &self.boot, &self.network)
             }
-            ("prepare_target", "new" | "reserved" | "importing" | "imported") => prepare_target(
+            ("hold_source", "new" | "reserved") => hold_source(
                 &mut self.catalog,
                 &self.objects,
-                self.statepoints.directory(),
                 &self.boot,
                 &input,
-                request,
-                descriptors,
+                &self.network,
             ),
-            ("fence_source", "held") => {
-                source_fence(&mut self.catalog, &self.objects, &input, &self.boot)
+            ("prepare_target", "new" | "reserved" | "importing" | "imported") => {
+                let verify = |catalog: &Catalog, execution: &Execution| {
+                    Self::verify_live_execution_at(catalog, &self.boot, &self.executions, execution)
+                };
+                prepare_target(
+                    &mut self.catalog,
+                    &self.objects,
+                    self.statepoints.directory(),
+                    &self.boot,
+                    &input,
+                    request,
+                    descriptors,
+                    &mut self.network,
+                    &self.activation,
+                    verify,
+                )
             }
+            ("fence_source", "held") => source_fence(
+                &mut self.catalog,
+                &self.objects,
+                &input,
+                &self.boot,
+                &self.network,
+            ),
             ("activate_target", "prepared") => {
                 require_local(
                     &self.catalog,
@@ -1293,7 +2454,61 @@ impl crate::worker::Worker {
                     "prepare_target",
                     input.request.ready.as_ref(),
                 )?;
+                validate_boot_intent(&self.catalog, &input)?;
+                let transfer = requested_transfer(&input);
+                let source_fence = transfer
+                    .as_ref()
+                    .map(|transfer| source_overlay_fence(&input, transfer))
+                    .transpose()?
+                    .flatten();
                 record_decision(&self.catalog, &input, decision.as_deref())?;
+                let mut published = None;
+                if let Some(transfer) = transfer.as_ref() {
+                    let owner =
+                        OwnerDecision::migration(transfer, input.ticket().target.owner_epoch);
+                    if input.ticket().mode == "cold" {
+                        if network_transfer::awaiting_owner(&self.catalog, &input.op())?
+                            && transfer.network_mode == "native"
+                        {
+                            network_transfer::authorize_overlay_commit(
+                                self.network.overlay(),
+                                transfer,
+                                source_fence.as_ref(),
+                            )?;
+                        }
+                        network_transfer::authorize_cold(
+                            &self.catalog,
+                            &input.op(),
+                            transfer,
+                            &owner,
+                        )?;
+                    } else {
+                        let native = input.native(input.endpoint().execution.clone(), json!({}))
+                            .derived("CommitTransfer",json!({"transfer":transfer,"owner_decision":owner,"source_fence":source_fence}));
+                        let execution = self.scoped_execution(&native)?;
+                        let verify = || {
+                            Self::verify_live_execution_at(
+                                &self.catalog,
+                                &self.boot,
+                                &self.executions,
+                                &execution,
+                            )
+                        };
+                        verify()?;
+                        let receipt = network_transfer::handle(
+                            &self.catalog,
+                            &execution,
+                            &native,
+                            &mut self.network,
+                            &self.activation,
+                            verify,
+                        )?;
+                        if !receipt.published {
+                            return Err(pending("committed target TAP publication is in progress"));
+                        }
+                        published = Some(receipt);
+                    }
+                }
                 let op = self.catalog.operation(&input.op())?;
                 if op.phase == "ABORTED" {
                     return Err(fenced("committed target launch failed"));
@@ -1304,13 +2519,23 @@ impl crate::worker::Worker {
                 let native = input.native(input.endpoint().execution.clone(), json!({}));
                 let execution = self.scoped_execution(&native)?;
                 self.verify_live_execution(&execution)?;
+                if let Some(transfer) = transfer.as_ref().filter(|_| input.ticket().mode == "cold")
+                {
+                    published = Some(network_transfer::observe_cold(
+                        &self.catalog,
+                        &input.op(),
+                        transfer,
+                        &execution,
+                    )?);
+                }
                 let product_volumes =
                     products::observations(&self.catalog, &native, &input.ticket().id)?;
                 remember(
                     &mut self.catalog,
                     &input,
                     "active",
-                    json!({"details":{"product_volumes":product_volumes}}),
+                    json!({"details":{"product_volumes":product_volumes,"network_published":published,
+                        "boot_environment":op.boot_environment}}),
                 )
             }
             ("abort_target", "reserved" | "importing" | "imported" | "prepared" | "aborting")
@@ -1343,6 +2568,7 @@ impl crate::worker::Worker {
                         } else {
                             input.endpoint().execution.execution_epoch - 1
                         };
+                        abort_target_tap(&self.catalog, &mut self.network, &input)?;
                         let native = input.native(
                             Expected {
                                 instance_id: input.endpoint().execution.instance_id.clone(),
@@ -1360,6 +2586,21 @@ impl crate::worker::Worker {
                     Err(error) if error.code == "E_NOT_FOUND" => (),
                     Err(error) => return Err(error),
                 }
+                abort_target_tap(&self.catalog, &mut self.network, &input)?;
+                let prepared = previous(&self.catalog, &input, "prepare_target")?;
+                let aborted = if prepared
+                    .as_ref()
+                    .is_some_and(|receipt| !receipt["details"]["network_prepared"].is_null())
+                {
+                    Some(network_transfer::abort_migration(
+                        &self.catalog,
+                        &requested_transfer(&input).unwrap(),
+                        &input.op(),
+                    )?)
+                } else {
+                    None
+                };
+                seal_aborted_target_heads(&mut self.catalog, &self.objects, &input)?;
                 products::remove_aborted_target(&self.catalog, &input.ticket().id)?;
                 release_import(
                     &mut self.catalog,
@@ -1367,16 +2608,18 @@ impl crate::worker::Worker {
                     self.statepoints.directory(),
                     &input,
                 )?;
-                remember(&mut self.catalog, &input, "aborted", json!({}))
+                remember(
+                    &mut self.catalog,
+                    &input,
+                    "aborted",
+                    json!({"details":{
+                    "writer_closed":true,"tap_closed":true,"relay_closed":true,"network_aborted":aborted}}),
+                )
             }
             ("resume_source", "reserved" | "held" | "fenced" | "resuming")
                 if decision.is_none() =>
             {
-                input.check(
-                    input.request.abort.as_ref(),
-                    "abort_target",
-                    &input.ticket().target,
-                )?;
+                abort_receipt(&input)?;
                 self.catalog.db.execute(
                     "UPDATE machine_migrations SET state='resuming' WHERE migration_id=?",
                     [&input.ticket().id],
@@ -1407,14 +2650,25 @@ impl crate::worker::Worker {
                     Err(error) if error.code == "E_NOT_FOUND" => (),
                     Err(error) => return Err(error),
                 }
-                if input.endpoint().execution.incarnation_id.is_some() {
+                let reopened = if input.endpoint().execution.incarnation_id.is_some() {
                     let native = input.native(input.endpoint().execution.clone(), json!({}));
                     let execution = self.scoped_execution(&native)?;
                     self.verify_live_execution(&execution)?;
+                    let reopened =
+                        reopen_source_tap(&self.catalog, &input, &self.network, &execution)?;
+                    self.verify_live_execution(&execution)?;
+                    reopened
                 } else {
-                    source_plan(&self.catalog, &input)?;
-                }
-                remember(&mut self.catalog, &input, "resumed", json!({}))
+                    let (execution, plan) = source_plan(&self.catalog, &input)?;
+                    expected_source_attachment(&self.catalog, &input, &execution, &plan)?;
+                    ResumedNetwork::default()
+                };
+                remember(
+                    &mut self.catalog,
+                    &input,
+                    "resumed",
+                    json!({"details":reopened}),
+                )
             }
             ("finalize_source", "fenced") => {
                 require_local(
@@ -1507,6 +2761,26 @@ pub(crate) fn permit_target_process(catalog: &Catalog, operation: &Operation) ->
         return Err(fenced(
             "migration target process does not have launch authority",
         ));
+    }
+    if operation.kind == "launch"
+        && network_transfer::awaiting_owner(catalog, &operation.operation_id)?
+    {
+        return Err(fenced(
+            "migration target TAP does not have the committed owner decision",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn permit_target_abort(catalog: &Catalog, operation: &str) -> Result<()> {
+    let committed: bool = catalog.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM machine_migrations WHERE side='target'
+         AND native_operation_id=? AND decision_json IS NOT NULL)",
+        [operation],
+        |r| r.get(0),
+    )?;
+    if committed {
+        return Err(fenced("a committed target cannot be aborted"));
     }
     Ok(())
 }
@@ -1720,6 +2994,7 @@ mod tests {
                 abort: None,
                 decision: None,
                 network: None,
+                boot_environment: None,
             },
             ticket_digest: digest(b"matching controller ticket"),
             bundle_manifest: Value::Null,
@@ -1747,6 +3022,134 @@ mod tests {
     }
 
     #[test]
+    fn target_abort_fences_all_exact_provisional_heads_and_retries_partial_sealing() {
+        let directory = tempfile::tempdir().unwrap();
+        let objects = directory.path().join("objects");
+        std::fs::create_dir(&objects).unwrap();
+        let objects = File::open(objects).unwrap();
+        let mut catalog =
+            Catalog::open(&directory.path().join("catalog.sqlite"), "boot", "serve").unwrap();
+        let input = input("abort_target");
+        let endpoint = input.endpoint();
+        catalog
+            .register_bundle(&endpoint.bundle_digest, &"c".repeat(64))
+            .unwrap();
+        reserve(&catalog, &input).unwrap();
+
+        let expected = Expected {
+            instance_id: endpoint.execution.instance_id.clone(),
+            incarnation_id: None,
+            execution_epoch: 0,
+        };
+        let base = Request {
+            operation_id: Some("make-base".into()),
+            expected: Some(Expected {
+                instance_id: "base-slot".into(),
+                ..expected.clone()
+            }),
+            ..input.native(expected.clone(), json!({}))
+        };
+        catalog.begin(&base, "catalog").unwrap();
+        let immutable = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        immutable.as_file().set_len(4096).unwrap();
+        crate::blocks::create(
+            &mut catalog,
+            &objects,
+            &base.derived(
+                "ImportImmutableBlock",
+                json!({"resource_id":"base","capacity_bytes":4096,"content_sha256":digest(&[0;4096])}),
+            ),
+            Some(File::open(immutable.path()).unwrap().into()),
+            true,
+        )
+        .unwrap();
+        catalog.finish(&base, false, 1).unwrap();
+
+        let native = input.native(expected, json!({}));
+        let devices = ["root", "data"]
+            .into_iter()
+            .map(|id| Device {
+                disk: managed::Disk {
+                    attachment_id: format!("{id}-attachment"),
+                    device_id: id.into(),
+                    role: id.into(),
+                    generation_id: "base".into(),
+                    volume_id: None,
+                    read_only: false,
+                },
+                volume_id: format!("{id}-volume"),
+                head_id: Some(format!("{id}-head")),
+                capacity_bytes: 4096,
+                reattach: false,
+            })
+            .collect::<Vec<_>>();
+        let machine: Machine = serde_json::from_value(json!({
+            "name":endpoint.runtime_name,"boot_profile":"system-debian-v1","cpus":1,"memory_mib":64,
+            "init":"/sbin/init","disks":devices.iter().map(|device|&device.disk).collect::<Vec<_>>(),
+        })).unwrap();
+        let op = catalog.begin_with(&native, "launch", |tx| {
+            tx.execute("INSERT INTO managed_launches
+                (operation_id,incarnation_id,serve_instance,machine_name,spec_json,devices_json,vcpus,memory_mib)
+                VALUES(?,?,?,?,?,?,1,64)", params![input.op(),endpoint.execution.incarnation_id,
+                    endpoint.local_instance_id,endpoint.runtime_name,encode(&machine)?,encode(&devices)?])?;
+            Ok(())
+        }).unwrap();
+        let plan = managed::plan(&catalog, &op).unwrap().unwrap();
+        for head in plan.heads() {
+            crate::blocks::create(
+                &mut catalog,
+                &objects,
+                &native.derived(
+                    "CreateVolumeHead",
+                    json!(plan.head_spec(&head.head_resource_id).unwrap()),
+                ),
+                None,
+                false,
+            )
+            .unwrap();
+        }
+        catalog.finish(&native, true, op.revision).unwrap();
+        catalog
+            .db
+            .execute(
+                "UPDATE machine_migrations SET state='aborting' WHERE migration_id=?",
+                [&input.ticket().id],
+            )
+            .unwrap();
+
+        let data = catalog.block_closure("data-head").unwrap().remove(0);
+        let lock = crate::blocks::lock_writer(&objects, &data).unwrap();
+        assert_eq!(
+            seal_aborted_target_heads(&mut catalog, &objects, &input)
+                .unwrap_err()
+                .code,
+            "E_FENCE_UNPROVEN"
+        );
+        assert_eq!(
+            catalog
+                .db
+                .query_row("SELECT count(*) FROM volume_heads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(lock);
+        for _ in 0..2 {
+            seal_aborted_target_heads(&mut catalog, &objects, &input).unwrap();
+            assert_eq!(
+                catalog
+                    .db
+                    .query_row("SELECT count(*) FROM volume_heads", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(catalog.resource("root-head").unwrap()["state"], "deleting");
+            assert_eq!(catalog.resource("data-head").unwrap()["state"], "deleting");
+        }
+    }
+
+    #[test]
     fn source_never_reacquires_writer_after_committed_retirement() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("catalog.sqlite");
@@ -1767,15 +3170,13 @@ mod tests {
             .code,
             "E_FENCE_UNPROVEN"
         );
-        assert!(
-            guard_operation(
-                &catalog.db,
-                "deep",
-                &source.ticket().target.execution.instance_id,
-                "new-wake"
-            )
-            .is_ok()
-        );
+        assert!(guard_operation(
+            &catalog.db,
+            "deep",
+            &source.ticket().target.execution.instance_id,
+            "new-wake"
+        )
+        .is_ok());
     }
 
     #[test]

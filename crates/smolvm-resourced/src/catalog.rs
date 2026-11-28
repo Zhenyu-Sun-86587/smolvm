@@ -327,7 +327,7 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
                 migrate_capture_journal(&tx)?;
             }
-            1..=38 => {
+            1..=39 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -462,10 +462,11 @@ impl Catalog {
         tx.execute_batch(include_str!("schema_disk_backup.sql"))?;
         tx.execute_batch(include_str!("schema_machine_migration.sql"))?;
         tx.execute_batch(include_str!("schema_migration_product_volumes.sql"))?;
+        tx.execute_batch(include_str!("schema_migration_network.sql"))?;
         if version < 37 {
             tx.execute_batch(include_str!("schema_boot_environment.sql"))?;
         }
-        tx.pragma_update(None, "user_version", 38)?;
+        tx.pragma_update(None, "user_version", 39)?;
         tx.commit()?;
         Ok(Self { db })
     }
@@ -532,6 +533,8 @@ impl Catalog {
         // journal. Once the original VMM and its published RAM are accounted
         // for, waiting for those operations to finish here would deadlock
         // them on the same recovery barrier when they acquire resources.
+        // An undecided migration also needs its original held source to reach
+        // the owner-gated recovery RPC once its runtime resources are accounted for.
         let outstanding: bool = tx.query_row(
             "WITH accounted_kernel_cuts AS (
                  SELECT a.capture_id,a.operation_id,a.source_incarnation,a.source_epoch,a.source_session,a.host_boot_id,ram.state
@@ -566,6 +569,24 @@ impl Catalog {
                          AND f.operation_id=o.operation_id) OR k.operation_id IS NOT NULL)
              ), replayable_operations AS (
                  SELECT operation_id FROM replayable_forks
+                 UNION ALL
+                 SELECT o.operation_id FROM machine_migrations m
+                 JOIN operations o ON o.operation_id=m.native_operation_id
+                 JOIN managed_fork_batches f ON f.operation_id=o.operation_id AND f.stage='durable_hold'
+                 JOIN statepoints p ON p.operation_id=o.operation_id AND p.capture_id=f.capture_id
+                 JOIN executions e ON e.incarnation_id=f.source_incarnation AND e.incarnation_id=p.source_incarnation_id
+                 JOIN native_endpoints n ON n.incarnation_id=e.incarnation_id
+                 JOIN instance_bindings b ON b.route_id=e.route_id AND b.instance_id=e.instance_id
+                 WHERE m.side='source' AND m.state IN ('held','fenced') AND m.decision_json IS NULL
+                   AND m.instance_id=e.instance_id AND p.phase='durable' AND p.manifest_digest IS NOT NULL
+                   AND o.kind='hibernate' AND o.phase='NEW' AND o.route_id=e.route_id
+                   AND o.bundle_digest=e.bundle_digest AND o.instance_id=e.instance_id
+                   AND o.expected_incarnation_id=e.incarnation_id AND o.expected_execution_epoch=e.execution_epoch
+                   AND b.active_operation_id=o.operation_id AND b.incarnation_id=e.incarnation_id
+                   AND b.execution_epoch=e.execution_epoch AND e.phase='registered'
+                   AND e.host_boot_id=(SELECT host_boot_id FROM worker_state)
+                   AND NOT EXISTS (SELECT 1 FROM machine_migration_source_taps t
+                                   WHERE t.migration_id=m.migration_id AND t.phase<>'closed')
                  UNION ALL
                  SELECT ch.operation_id FROM managed_fork_children ch
                  JOIN replayable_forks f ON f.operation_id=ch.batch_id

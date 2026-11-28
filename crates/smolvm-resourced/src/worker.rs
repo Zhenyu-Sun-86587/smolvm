@@ -189,11 +189,11 @@ pub(crate) struct Worker {
     admin_uid: u32,
     native_signal: std::sync::mpsc::SyncSender<()>,
     permits: HashMap<String, Permit>,
-    executions: HashMap<String, OwnedFd>,
+    pub(crate) executions: HashMap<String, OwnedFd>,
     reserved: HashMap<String, Vec<File>>,
     escrow: Escrow,
-    network: crate::network_runtime::NetworkRuntime,
-    activation: ActivationRuntime,
+    pub(crate) network: crate::network_runtime::NetworkRuntime,
+    pub(crate) activation: ActivationRuntime,
     pub(crate) statepoints: StatePoints,
     forks: crate::managed_fork::Actor,
     lifecycle:crate::lifecycle_controller::Controller,
@@ -1310,7 +1310,10 @@ impl Worker {
                 if request.payload != json!({}) {
                     return Err(Fault::invalid("boot environment probe requires an empty payload"));
                 }
-                Ok(json!({"contract_version":1}))
+                Ok(json!({"contract_version":1,"migration_contract_version":1}))
+            }
+            "QueryMigrationBootEnvironment" => {
+                crate::machine_migration::query_boot_environment(&self.catalog, request)
             }
             "SubmitBootEnvironment" => {
                 #[derive(Deserialize)]
@@ -1962,7 +1965,7 @@ impl Worker {
         Self::verify_live_execution_at(&self.catalog, &self.boot, &self.executions, execution)
     }
 
-    fn verify_live_execution_at(
+    pub(crate) fn verify_live_execution_at(
         catalog: &Catalog,
         boot: &str,
         executions: &HashMap<String, OwnedFd>,
