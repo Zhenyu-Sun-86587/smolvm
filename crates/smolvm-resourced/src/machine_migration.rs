@@ -2954,6 +2954,134 @@ mod tests {
     }
 
     #[test]
+    fn target_abort_fences_all_exact_provisional_heads_and_retries_partial_sealing() {
+        let directory = tempfile::tempdir().unwrap();
+        let objects = directory.path().join("objects");
+        std::fs::create_dir(&objects).unwrap();
+        let objects = File::open(objects).unwrap();
+        let mut catalog =
+            Catalog::open(&directory.path().join("catalog.sqlite"), "boot", "serve").unwrap();
+        let input = input("abort_target");
+        let endpoint = input.endpoint();
+        catalog
+            .register_bundle(&endpoint.bundle_digest, &"c".repeat(64))
+            .unwrap();
+        reserve(&catalog, &input).unwrap();
+
+        let expected = Expected {
+            instance_id: endpoint.execution.instance_id.clone(),
+            incarnation_id: None,
+            execution_epoch: 0,
+        };
+        let base = Request {
+            operation_id: Some("make-base".into()),
+            expected: Some(Expected {
+                instance_id: "base-slot".into(),
+                ..expected.clone()
+            }),
+            ..input.native(expected.clone(), json!({}))
+        };
+        catalog.begin(&base, "catalog").unwrap();
+        let immutable = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        immutable.as_file().set_len(4096).unwrap();
+        crate::blocks::create(
+            &mut catalog,
+            &objects,
+            &base.derived(
+                "ImportImmutableBlock",
+                json!({"resource_id":"base","capacity_bytes":4096,"content_sha256":digest(&[0;4096])}),
+            ),
+            Some(File::open(immutable.path()).unwrap().into()),
+            true,
+        )
+        .unwrap();
+        catalog.finish(&base, false, 1).unwrap();
+
+        let native = input.native(expected, json!({}));
+        let devices = ["root", "data"]
+            .into_iter()
+            .map(|id| Device {
+                disk: managed::Disk {
+                    attachment_id: format!("{id}-attachment"),
+                    device_id: id.into(),
+                    role: id.into(),
+                    generation_id: "base".into(),
+                    volume_id: None,
+                    read_only: false,
+                },
+                volume_id: format!("{id}-volume"),
+                head_id: Some(format!("{id}-head")),
+                capacity_bytes: 4096,
+                reattach: false,
+            })
+            .collect::<Vec<_>>();
+        let machine: Machine = serde_json::from_value(json!({
+            "name":endpoint.runtime_name,"boot_profile":"system-debian-v1","cpus":1,"memory_mib":64,
+            "init":"/sbin/init","disks":devices.iter().map(|device|&device.disk).collect::<Vec<_>>(),
+        })).unwrap();
+        let op = catalog.begin_with(&native, "launch", |tx| {
+            tx.execute("INSERT INTO managed_launches
+                (operation_id,incarnation_id,serve_instance,machine_name,spec_json,devices_json,vcpus,memory_mib)
+                VALUES(?,?,?,?,?,?,1,64)", params![input.op(),endpoint.execution.incarnation_id,
+                    endpoint.local_instance_id,endpoint.runtime_name,encode(&machine)?,encode(&devices)?])?;
+            Ok(())
+        }).unwrap();
+        let plan = managed::plan(&catalog, &op).unwrap().unwrap();
+        for head in plan.heads() {
+            crate::blocks::create(
+                &mut catalog,
+                &objects,
+                &native.derived(
+                    "CreateVolumeHead",
+                    json!(plan.head_spec(&head.head_resource_id).unwrap()),
+                ),
+                None,
+                false,
+            )
+            .unwrap();
+        }
+        catalog.finish(&native, true, op.revision).unwrap();
+        catalog
+            .db
+            .execute(
+                "UPDATE machine_migrations SET state='aborting' WHERE migration_id=?",
+                [&input.ticket().id],
+            )
+            .unwrap();
+
+        let data = catalog.block_closure("data-head").unwrap().remove(0);
+        let lock = crate::blocks::lock_writer(&objects, &data).unwrap();
+        assert_eq!(
+            seal_aborted_target_heads(&mut catalog, &objects, &input)
+                .unwrap_err()
+                .code,
+            "E_FENCE_UNPROVEN"
+        );
+        assert_eq!(
+            catalog
+                .db
+                .query_row("SELECT count(*) FROM volume_heads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(lock);
+        for _ in 0..2 {
+            seal_aborted_target_heads(&mut catalog, &objects, &input).unwrap();
+            assert_eq!(
+                catalog
+                    .db
+                    .query_row("SELECT count(*) FROM volume_heads", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(catalog.resource("root-head").unwrap()["state"], "deleting");
+            assert_eq!(catalog.resource("data-head").unwrap()["state"], "deleting");
+        }
+    }
+
+    #[test]
     fn source_never_reacquires_writer_after_committed_retirement() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("catalog.sqlite");
