@@ -354,7 +354,14 @@ fn download(
     length: Option<u64>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let outcome = (|| {
-        let pinned = tree::open_path(path_from_bytes(path, true)?, true)?;
+        let path = path_from_bytes(path, true)?;
+        // Reject special files before any open, then recheck the pinned inode
+        // so a concurrent replacement cannot turn this into a blocking open.
+        let candidate = path.metadata()?;
+        if !candidate.is_file() {
+            return Err(wrong_type(&candidate));
+        }
+        let pinned = tree::open_path(path, true)?;
         let metadata = pinned.metadata()?;
         if !metadata.is_file() {
             return Err(wrong_type(&metadata));
@@ -373,7 +380,10 @@ fn download(
                 "read exceeds the 4 GiB transfer limit",
             ));
         }
-        let mut file = File::open(tree::fd_path(&pinned))?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(tree::fd_path(&pinned))?;
         file.seek(SeekFrom::Start(offset))?;
         let mut writer = Download::new(stream);
         if io::copy(&mut file.take(size), &mut writer)? != size {

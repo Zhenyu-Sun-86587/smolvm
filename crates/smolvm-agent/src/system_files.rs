@@ -652,6 +652,38 @@ mod tests {
     }
 
     #[test]
+    fn system_transfer_v2_rejects_special_files_before_opening() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let socket_path = directory.path().join("socket");
+        let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let (mut host, agent) = connect();
+        host.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        for (path, expected) in [
+            (fifo.as_path(), "FILE_SPECIAL_TYPE"),
+            (socket_path.as_path(), "FILE_SPECIAL_TYPE"),
+            (directory.path(), "FILE_IS_DIRECTORY"),
+        ] {
+            v2_send(
+                &mut host,
+                FileRequest::Read {
+                    path: byte_path(path),
+                    offset: 0,
+                    length: None,
+                },
+            );
+            assert!(
+                matches!(receive(&mut host), AgentResponse::Error { code: Some(code), .. } if code == expected)
+            );
+        }
+        drop(host);
+        agent.join().unwrap();
+    }
+
+    #[test]
     fn system_transfer_v2_archival_replacement_and_link_semantics() {
         use std::os::unix::fs::symlink;
         let directory = tempfile::tempdir().unwrap();
