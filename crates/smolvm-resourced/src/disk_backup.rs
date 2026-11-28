@@ -191,7 +191,7 @@ pub(crate) fn apply(catalog: &mut Catalog, objects: &File, request: &Request) ->
         [&attempt.input.attempt_id],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)),
     ).optional()?;
-    if let Some((digest, _, receipt)) = &prior {
+    if let Some((digest, selection, receipt)) = &prior {
         if digest != &attempt.digest {
             return Err(Fault::new(
                 "E_IDEMPOTENCY_CONFLICT",
@@ -199,7 +199,12 @@ pub(crate) fn apply(catalog: &mut Catalog, objects: &File, request: &Request) ->
             ));
         }
         if let Some(receipt) = receipt {
-            return decode(receipt);
+            let receipt: Value = decode(receipt)?;
+            if receipt["phase"] == "restored" {
+                let selection: Vec<Selection> = decode(selection.as_deref().unwrap_or("null"))?;
+                retire_previous_heads(catalog, objects, &attempt, &selection);
+            }
+            return Ok(receipt);
         }
     }
     if attempt.input.action == "delete" {
@@ -460,7 +465,71 @@ fn run(
     };
     let result = publish.apply(catalog, attempt, selection);
     drop(locked);
+    if result.is_ok() && attempt.input.action == "restore" {
+        retire_previous_heads(catalog, objects, attempt, selection);
+    }
     result
+}
+
+// A failed restore cannot make any original head read-only. Superseded heads
+// are reclaimed only after the writer CAS and receipt have committed. This
+// cleanup can safely resume after a lost reply or an interrupted inode seal.
+fn retire_previous_heads(
+    catalog: &mut Catalog,
+    objects: &File,
+    attempt: &Attempt<'_>,
+    selection: &[Selection],
+) {
+    for old in selection.iter().filter(|disk| !disk.slot.read_only) {
+        if let Err(error) = retire_previous_head(catalog, objects, attempt, old) {
+            eprintln!(
+                "disk backup {} could not mark superseded head {} for collection: {}",
+                attempt.input.attempt_id, old.top, error.code
+            );
+        }
+    }
+}
+
+fn retire_previous_head(
+    catalog: &mut Catalog,
+    objects: &File,
+    attempt: &Attempt<'_>,
+    old: &Selection,
+) -> Result<()> {
+    let Some((_, spec, _)) = catalog.block_intent(&old.top)? else {
+        return Ok(());
+    };
+    if !spec.mutable() {
+        return Ok(());
+    }
+    let fenced: bool = catalog.db.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM volume_heads WHERE head_resource_id=?1)
+        AND NOT EXISTS(SELECT 1 FROM writer_reservations WHERE head_resource_id=?1)",
+        [&old.top],
+        |r| r.get(0),
+    )?;
+    if !fenced {
+        return Err(Fault::new(
+            "E_FENCE_UNPROVEN",
+            "superseded disk still has writer authority",
+        ));
+    }
+    let mut object = catalog.block_closure(&old.top)?.remove(0);
+    if object.backing_identity != old.backing_identity {
+        return Err(Fault::new(
+            "E_BLOCK_BACKING_CHANGED",
+            "superseded disk backing identity changed",
+        ));
+    }
+    let (directory, handle) = blocks::fence_head_for_seal(objects, &object, true)?;
+    blocks::seal_fenced_head(&directory, &handle, &mut object)?;
+    let op = attempt.native.operation()?.0;
+    let tx = catalog.db.transaction()?;
+    blocks::publish_seal_record(&tx, op, &object)?;
+    tx.execute("UPDATE root_refs SET state='dropped',revision=revision+1 WHERE owner_kind='operation' AND owner_id=?
+        AND resource_id=? AND state='active'", params![op, old.top])?;
+    tx.commit()?;
+    Ok(())
 }
 
 struct Publish {
