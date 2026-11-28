@@ -1,4 +1,4 @@
-CREATE TABLE boot_environment_attempts (
+CREATE TABLE IF NOT EXISTS boot_environment_attempts (
     operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
     catalog_revision INTEGER NOT NULL CHECK(catalog_revision >= 0),
     machine_revision INTEGER NOT NULL CHECK(machine_revision > 0),
