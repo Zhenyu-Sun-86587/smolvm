@@ -2591,16 +2591,24 @@ fn handle_connection(
             let response = match request {
                 AgentRequest::Ping => AgentResponse::Pong {
                     version: PROTOCOL_VERSION,
-                    capabilities: vec![
-                        "system-service-v1".to_owned(),
-                        smolvm_protocol::SYSTEM_FILE_WRITE_CAPABILITY.to_owned(),
-                        smolvm_protocol::SYSTEM_FILE_TRANSFER_CAPABILITY.to_owned(),
-                        smolvm_protocol::system_files_v2::CAPABILITY.to_owned(),
-                        smolvm_protocol::SYSTEM_EXEC_STREAM_CAPABILITY.to_owned(),
-                        smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_owned(),
-                        smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY.to_owned(),
-                        smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY.to_owned(),
-                    ],
+                    capabilities: {
+                        let mut capabilities = vec![
+                            "system-service-v1".to_owned(),
+                            smolvm_protocol::SYSTEM_FILE_WRITE_CAPABILITY.to_owned(),
+                            smolvm_protocol::SYSTEM_FILE_TRANSFER_CAPABILITY.to_owned(),
+                            smolvm_protocol::system_files_v2::CAPABILITY.to_owned(),
+                            smolvm_protocol::SYSTEM_EXEC_STREAM_CAPABILITY.to_owned(),
+                            smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_owned(),
+                            smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY.to_owned(),
+                            smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY.to_owned(),
+                        ];
+                        if system_files::v2::desktop_drop_supported() {
+                            capabilities.push(
+                                smolvm_protocol::system_files_v2::DESKTOP_DROP_CAPABILITY.to_owned(),
+                            );
+                        }
+                        capabilities
+                    },
                 },
                 request @ (AgentRequest::VmExec {
                     background: false,
