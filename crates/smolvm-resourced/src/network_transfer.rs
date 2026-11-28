@@ -172,15 +172,18 @@ pub(crate) fn guard_matches(
     )?)
 }
 
-pub(crate) fn permit_activation(catalog: &Catalog, operation: &str) -> Result<()> {
-    let fenced_operation: bool = catalog.db.query_row(
+pub(crate) fn awaiting_owner(catalog: &Catalog, operation: &str) -> Result<bool> {
+    Ok(catalog.db.query_row(
         "SELECT EXISTS(SELECT 1 FROM network_transfer_guards g
                        LEFT JOIN network_transfers t USING(operation_id)
                        WHERE g.operation_id=? AND coalesce(t.phase,'')<>'committed')",
         [operation],
         |row| row.get(0),
-    )?;
-    if fenced_operation {
+    )?)
+}
+
+pub(crate) fn permit_activation(catalog: &Catalog, operation: &str) -> Result<()> {
+    if awaiting_owner(catalog, operation)? {
         return Err(fenced());
     }
     Ok(())

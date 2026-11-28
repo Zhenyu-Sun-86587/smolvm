@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) const ADDRESS: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 const IO_POLL: Duration = Duration::from_millis(250);
@@ -18,16 +18,26 @@ const MAX_STREAMS: usize = 64;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Apply {
+    pub catalog_revision: i64,
+    pub machine_revision: i64,
     pub hosts: Vec<String>,
     pub http_port: u16,
     pub https_port: u16,
     pub token: String,
+    pub lease_seconds: u64,
 }
 
 impl Apply {
     pub(crate) fn validate(&self) -> Result<[u8; 32]> {
+        if self.catalog_revision < 1 || self.machine_revision < 1 {
+            return Err(Fault::invalid("invalid host-bound delivery revision"));
+        }
         if self.hosts.is_empty() {
-            return if self.http_port == 0 && self.https_port == 0 && self.token.is_empty() {
+            return if self.http_port == 0
+                && self.https_port == 0
+                && self.token.is_empty()
+                && self.lease_seconds == 0
+            {
                 Ok([0; 32])
             } else {
                 Err(Fault::invalid(
@@ -42,6 +52,7 @@ impl Apply {
                     && !host.ends_with(".private")
                     && host.parse::<std::net::IpAddr>().is_err()
             })
+            || !(1..=900).contains(&self.lease_seconds)
             || self.http_port < 1024
             || self.https_port < 1024
             || self.http_port == self.https_port
@@ -59,13 +70,25 @@ impl Apply {
 }
 
 struct Route {
+    catalog_revision: i64,
+    machine_revision: i64,
     hosts: Vec<String>,
     http_port: u16,
     https_port: u16,
     token: [u8; 32],
     revoked: AtomicBool,
+    expires: RwLock<Instant>,
 }
 
+impl Route {
+    fn active(&self) -> bool {
+        !self.revoked.load(Ordering::Relaxed)
+            && self
+                .expires
+                .read()
+                .is_ok_and(|expires| *expires > Instant::now())
+    }
+}
 #[derive(Clone, Default)]
 pub(crate) struct Routes(Arc<RwLock<HashMap<Ipv4Addr, Arc<Route>>>>);
 
@@ -80,7 +103,12 @@ impl Routes {
     }
 
     fn route(&self, source: Ipv4Addr) -> Option<Arc<Route>> {
-        self.0.read().ok()?.get(&source).cloned()
+        self.0
+            .read()
+            .ok()?
+            .get(&source)
+            .filter(|route| route.active())
+            .cloned()
     }
 
     pub(crate) fn set(&self, source: Ipv4Addr, apply: Apply) -> Result<()> {
@@ -89,30 +117,48 @@ impl Routes {
             .0
             .write()
             .map_err(|_| Fault::new("E_HOST_IO", "host-bound routing unavailable"))?;
+        let expires = Instant::now() + Duration::from_secs(apply.lease_seconds);
         if let Some(prior) = routes.get(&source) {
-            if prior.hosts == apply.hosts
+            if prior.catalog_revision > apply.catalog_revision
+                || prior.machine_revision > apply.machine_revision
+            {
+                return Err(Fault::new(
+                    "E_STALE_REVISION",
+                    "host-bound relay policy changed",
+                ));
+            }
+
+            if prior.catalog_revision == apply.catalog_revision
+                && prior.machine_revision == apply.machine_revision
+                && prior.hosts == apply.hosts
                 && prior.http_port == apply.http_port
                 && prior.https_port == apply.https_port
                 && prior.token == token
             {
+                *prior
+                    .expires
+                    .write()
+                    .map_err(|_| Fault::new("E_HOST_IO", "host-bound lease unavailable"))? =
+                    expires;
                 return Ok(());
             }
         }
         if let Some(prior) = routes.remove(&source) {
             prior.revoked.store(true, Ordering::Relaxed);
         }
-        if !apply.hosts.is_empty() {
-            routes.insert(
-                source,
-                Arc::new(Route {
-                    hosts: apply.hosts,
-                    http_port: apply.http_port,
-                    https_port: apply.https_port,
-                    token,
-                    revoked: AtomicBool::new(false),
-                }),
-            );
-        }
+        routes.insert(
+            source,
+            Arc::new(Route {
+                catalog_revision: apply.catalog_revision,
+                machine_revision: apply.machine_revision,
+                hosts: apply.hosts,
+                http_port: apply.http_port,
+                https_port: apply.https_port,
+                token,
+                revoked: AtomicBool::new(false),
+                expires: RwLock::new(expires),
+            }),
+        );
         Ok(())
     }
 
@@ -214,7 +260,7 @@ impl Drop for StreamGuard {
 }
 
 fn bridge(guest: TcpStream, route: Arc<Route>, tls: bool, stop: Arc<AtomicBool>) -> io::Result<()> {
-    if route.revoked.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+    if !route.active() || stop.load(Ordering::Relaxed) {
         return Ok(());
     }
     let port = if tls {
@@ -247,10 +293,7 @@ fn transfer(
     done: &AtomicBool,
 ) {
     let mut buffer = [0; 16 * 1024];
-    while !route.revoked.load(Ordering::Relaxed)
-        && !stop.load(Ordering::Relaxed)
-        && !done.load(Ordering::Relaxed)
-    {
+    while route.active() && !stop.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed) {
         match src.read(&mut buffer) {
             Ok(0) => {
                 let _ = dst.shutdown(Shutdown::Write);
@@ -273,4 +316,42 @@ fn transfer(
     }
     done.store(true, Ordering::Relaxed);
     let _ = dst.shutdown(Shutdown::Both);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routes_are_exact_source_scoped_and_expire() {
+        let routes = Routes::default();
+        let source = Ipv4Addr::new(10, 0, 0, 2);
+        let neighbor = Ipv4Addr::new(10, 0, 0, 3);
+        let setup = || Apply {
+            catalog_revision: 1,
+            machine_revision: 1,
+            hosts: vec!["approved.example".into()],
+            http_port: 14001,
+            https_port: 14002,
+            token: "42".repeat(32),
+            lease_seconds: 900,
+        };
+        routes.set(source, setup()).unwrap();
+        assert!(routes.covers(source, "approved.example"));
+        assert!(!routes.covers(source, "alt.approved.example"));
+        assert!(!routes.covers(neighbor, "approved.example"));
+
+        let mut stale = setup();
+        stale.catalog_revision = 0;
+        assert!(routes.set(source, stale).is_err());
+        let flow = routes.route(source).unwrap();
+        *flow.expires.write().unwrap() = Instant::now();
+        assert!(!flow.active());
+        assert!(!routes.covers(source, "approved.example"));
+        routes.set(source, setup()).unwrap();
+        assert!(flow.active());
+        routes.remove(source);
+        assert!(!flow.active());
+        assert!(!routes.covers(source, "approved.example"));
+    }
 }

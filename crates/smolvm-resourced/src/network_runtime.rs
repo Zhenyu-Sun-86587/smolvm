@@ -24,7 +24,7 @@ pub(crate) struct NetworkRuntime {
     membership_filters: HashMap<String, MembershipFilter>,
 }
 
-#[derive(Default, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 struct MembershipFilter {
     internal: Vec<(Ipv4Addr, Ipv4Addr)>,
     peered: Vec<(Ipv4Addr, Ipv4Addr)>,
@@ -176,7 +176,7 @@ impl NetworkRuntime {
             return Err(unknown_attachment());
         }
         if !self.routers.contains_key(&lease.attachment.route_domain_id) {
-            router.apply_membership_filter(&[], &[]).map_err(host_error)?;
+            router.apply_membership_filter(&[], &[], false).map_err(host_error)?;
         }
         catalog.adopt_published_tap(lease)?;
         port.adopt_published(router.clone());
@@ -204,7 +204,7 @@ impl NetworkRuntime {
             }
             let filter = MembershipFilter { internal, peered };
             if self.membership_filters.get(domain) != Some(&filter) {
-                router.apply_membership_filter(&filter.internal, &filter.peered).map_err(host_error)?;
+                router.apply_membership_filter(&filter.internal, &filter.peered, true).map_err(host_error)?;
                 self.membership_filters.insert(domain.clone(), filter);
             }
         }
@@ -222,8 +222,8 @@ impl NetworkRuntime {
             // A failed update cannot retain the old grants after the new
             // revision becomes durable. Close the router transit gates first.
             let block = self.routers.iter().try_for_each(|(domain, router)| {
-                router.apply_membership_filter(&[], &[]).map_err(host_error)?;
-                self.membership_filters.insert(domain.clone(), MembershipFilter::default());
+                router.apply_membership_filter(&[], &[], false).map_err(host_error)?;
+                self.membership_filters.remove(domain);
                 Ok::<_, Fault>(())
             });
             if let Err(error) = block.and_then(|()| catalog.save_network_membership(instance, desired)) {

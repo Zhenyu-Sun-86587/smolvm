@@ -137,7 +137,7 @@ impl PrivateRouter {
             chain ingress { type filter hook prerouting priority filter; policy accept; ct state established counter; }\n\
             chain local { type filter hook output priority filter; policy accept; ct state established counter; }\n\
         }\n")?;
-        router.apply_membership_filter(&[], &[])?;
+        router.apply_membership_filter(&[], &[], false)?;
         Ok(router)
     }
 
@@ -149,6 +149,7 @@ impl PrivateRouter {
         &self,
         internal: &[(Ipv4Addr, Ipv4Addr)],
         peered: &[(Ipv4Addr, Ipv4Addr)],
+        reset_denied_tcp: bool,
     ) -> io::Result<()> {
         use std::fmt::Write as _;
         // Recreate the table atomically in this router's namespace. No
@@ -189,6 +190,9 @@ impl PrivateRouter {
             r#"iifname "p*" oifname "sp*""#,
             r#"iifname "sp*" oifname "p*""#,
         ] {
+            if reset_denied_tcp {
+                writeln!(script, "add rule ip sm_membership transit {interfaces} meta l4proto tcp reject with tcp reset").unwrap();
+            }
             writeln!(script, "add rule ip sm_membership transit {interfaces} drop").unwrap();
         }
         nft(self.namespace(), &script)
