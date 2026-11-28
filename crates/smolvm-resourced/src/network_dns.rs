@@ -172,6 +172,8 @@ fn lookup(
               AND w.broker_session_id=coalesce(proof.adopted_session_id,tap.broker_session_id)
          WHERE dns.network_id=?1 AND dns.name=?2 AND address.state='reserved' AND e.phase='registered'
            AND tap.state='attached' AND w.recovering=0 AND o.phase='COMPLETED'
+           AND NOT EXISTS(SELECT 1 FROM machine_migration_source_taps f
+             WHERE f.lease_id IN (tap.lease_id,source_tap.lease_id) AND f.phase<>'reopened')
            AND (EXISTS(SELECT 1 FROM initial_network_activations i WHERE i.lease_id=tap.lease_id AND i.phase='open')
              OR EXISTS(SELECT 1 FROM target_activations a WHERE a.operation_id=tap.operation_id AND a.phase='released'
                 AND a.decision='commit' AND a.incarnation_id=tap.incarnation_id AND a.execution_epoch=tap.execution_epoch
