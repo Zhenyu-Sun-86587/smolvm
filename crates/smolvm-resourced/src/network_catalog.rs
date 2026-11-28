@@ -807,7 +807,7 @@ mod tests {
         use crate::network::{topology::KernelProof, NamespaceIdentity};
         use crate::network_lease_catalog::AttachmentDescriptor;
 
-        for case in ["committed", "active", "unknown gate", "legacy schema"] {
+        for case in ["committed", "migration held", "migration complete", "active", "unknown gate", "legacy schema"] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("catalog.sqlite");
             let mut catalog = Catalog::open(&path, "boot", "original").unwrap();
@@ -860,6 +860,19 @@ mod tests {
             if case == "unknown gate" {
                 catalog.db.execute("UPDATE initial_network_activations SET phase='unknown'", []).unwrap();
             }
+            if let Some(state) = case.strip_prefix("migration ") {
+                catalog.db.execute(
+                    "INSERT INTO machine_migrations
+                     (migration_id,ticket_digest,ticket_json,side,instance_id,native_operation_id,state)
+                     VALUES('move',?,'{}','source','vm','migration-source',?)",
+                    params![launch.request_digest,state],
+                ).unwrap();
+                catalog.db.execute(
+                    "INSERT INTO machine_migration_source_taps
+                     VALUES('move','lease',?,json_object('attachment_revision',?),?,'closed')",
+                    params![attached.revision,attached.revision,serde_json::to_string(&proof).unwrap()],
+                ).unwrap();
+            }
             if case == "legacy schema" {
                 catalog.db.execute_batch(
                     "DROP TABLE kernel_cow_imports; DROP TABLE kernel_mm_anchors; DROP TABLE kernel_statepoint_checkpoints;
@@ -878,12 +891,23 @@ mod tests {
             let execution = catalog.reconcile_execution("execution").unwrap();
             let unknown = catalog.tap_lease("attachment").unwrap();
             assert_eq!((unknown.state.as_str(), unknown.gate.as_str()), ("unknown", "unknown"));
-            if case == "committed" {
+            if matches!(case, "committed" | "migration held") {
+                let migration = case == "migration held";
+                assert_eq!(catalog.has_migration_source_gate(&unknown).unwrap(), migration);
                 assert_eq!(catalog.recoverable_network_proof(&unknown, &execution).unwrap(), proof);
                 assert!(catalog.router_pin_in_use(proof.router).unwrap());
                 catalog.adopt_published_tap(&unknown).unwrap();
                 let recovered = catalog.tap_lease("attachment").unwrap();
-                assert_eq!((recovered.state.as_str(), recovered.gate.as_str()), ("attached", "open"));
+                assert_eq!((recovered.state.as_str(), recovered.gate.as_str()),
+                    ("attached", if migration { "closed" } else { "open" }));
+                if migration {
+                    let revisions: (i64, i64) = catalog.db.query_row(
+                        "SELECT lease_revision,json_extract(transfer_json,'$.attachment_revision')
+                         FROM machine_migration_source_taps WHERE migration_id='move'",
+                        [], |row| Ok((row.get(0)?,row.get(1)?)),
+                    ).unwrap();
+                    assert_eq!(revisions, (recovered.revision, attached.revision));
+                }
                 assert_eq!(recovered.attachment_digest().unwrap(), attached.attachment_digest().unwrap());
                 assert!(recovered.revision > attached.revision);
                 assert_eq!(catalog.complete_recovery("replacement").unwrap()["state"], "ready");
