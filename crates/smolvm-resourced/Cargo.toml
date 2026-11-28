@@ -6,6 +6,8 @@ license = "Apache-2.0"
 description = "Worker-scoped resource catalog for the Linux runtime"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+base64 = { workspace = true }
+tar = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"
 hex = "0.4"

@@ -995,6 +995,9 @@ impl Actor {
                 }
             }
             "arming" => {
+                if matches!(j.kind.as_str(), "vm_snapshot" | "hibernate" | "vm_rollback") {
+                    crate::saved_files::record_mounts(c, &ep, &j.id)?;
+                }
                 let state = j.gate(&ep, "PREPARE", "2500 15000")?;
                 if matches!(state.as_str(),"failed_thawed"|"expired_thawed"|"aborted") {
                     return finish_abort(c,&j.id,Some(&state));

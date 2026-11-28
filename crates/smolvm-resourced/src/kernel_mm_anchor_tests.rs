@@ -447,6 +447,7 @@ fn durable_checkpoint_replays_original_ram_and_clears_volatile_export_pin() {
         &replay_checkpoint,
         &mut ram,
         BTreeMap::new(),
+        None,
     )
     .unwrap();
     let pending = c.require_statepoint("cut").unwrap();

@@ -4611,6 +4611,7 @@ dependencies = [
 name = "smolvm-resourced"
 version = "1.37.2"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "getrandom 0.3.4",
  "hex",
@@ -4625,6 +4626,7 @@ dependencies = [
  "smolvm-network",
  "smolvm-protocol",
  "smolvm-runtime-protocol",
+ "smolvm-tar",
  "socket2",
  "tempfile",
  "tokio",

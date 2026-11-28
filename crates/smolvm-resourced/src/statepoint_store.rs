@@ -229,6 +229,7 @@ pub(crate) fn write_native(
     commit_id: String,
     capture: Capture,
     disks: BTreeMap<String, File>,
+    mountinfo: Option<Vec<u8>>,
 ) -> io::Result<Manifest> {
     write(
         directory,
@@ -238,6 +239,7 @@ pub(crate) fn write_native(
         &capture.checkpoint,
         &mut RamReader::new(&capture),
         disks,
+        mountinfo,
     )
 }
 
@@ -249,6 +251,7 @@ pub(crate) fn write(
     checkpoint: &[u8],
     ram: &mut impl Read,
     disks: BTreeMap<String, File>,
+    mountinfo: Option<Vec<u8>>,
 ) -> io::Result<Manifest> {
     point.validate_checkpoint(checkpoint)?;
     let staging = tempfile::Builder::new()
@@ -295,6 +298,9 @@ pub(crate) fn write(
         .open(staging.path().join(MANIFEST))?;
     header.write_all(&serde_json::to_vec(&manifest)?)?;
     header.sync_all()?;
+    if let Some(raw) = mountinfo {
+        crate::saved_files::write_mounts(staging.path(), &manifest, raw)?;
+    }
     File::open(staging.path())?.sync_all()?;
     store::publish(
         staging.path(),
