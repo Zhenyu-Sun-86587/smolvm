@@ -121,7 +121,7 @@ fn upgrades_both_version_30_capture_journals_without_losing_their_rows() {
             assert_eq!(journal.1.as_deref(), relay.then_some("access-old"));
             assert_eq!(journal.2, i64::from(cow));
             assert_eq!(current.db.query_row("SELECT count(*) FROM verified_block_backings", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
-            assert_eq!(current.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 33);
+            assert_eq!(current.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 34);
         }
     }
 }

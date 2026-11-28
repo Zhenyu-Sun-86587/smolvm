@@ -91,13 +91,13 @@ pub(crate) struct NetworkReservation {
     pub(crate) dns_name: Option<String>,
 }
 
-struct Prefix {
-    gateway: u32,
-    first: u32,
-    last: u32,
+pub(crate) struct Prefix {
+    pub(crate) gateway: u32,
+    pub(crate) first: u32,
+    pub(crate) last: u32,
 }
 
-fn parse_prefix(cidr: &str) -> Result<Prefix> {
+pub(crate) fn parse_prefix(cidr: &str) -> Result<Prefix> {
     let invalid = || {
         Fault::invalid("private network needs a canonical RFC1918 IPv4 CIDR with space for a gateway and guest")
     };
@@ -165,8 +165,10 @@ fn lookup(db: &Connection, id: &str) -> Result<Option<NetworkReservation>> {
 
 fn unallocated_ipv4(db: &Connection, network: &str, first: u32, last: u32) -> Result<u32> {
     let mut statement = db.prepare(
-        "SELECT private_ipv4 FROM network_attachments
-        WHERE network_id=? AND state<>'released' ORDER BY private_ipv4",
+        "SELECT private_ipv4 FROM network_attachments WHERE network_id=?1 AND state<>'released'
+         UNION SELECT f.private_ipv4 FROM network_overlay_source_fences f
+         JOIN private_networks n USING(route_domain_id) WHERE n.network_id=?1
+         ORDER BY private_ipv4",
     )?;
     let mut candidate = first;
     for address in statement.query_map([network], |row| row.get::<_, u32>(0))? {
@@ -247,10 +249,11 @@ impl Catalog {
         attachment_id: &str,
         dns_name: &str,
         network: &crate::managed::Network,
+        overlay: &crate::network::overlay::Overlay,
     ) -> Result<NetworkReservation> {
         let prior = lookup(&self.db, attachment_id)?;
         let fixed = network.fixed_route();
-        self.reserve_network(
+        self.reserve_network_with_overlay(
             request,
             &ReserveNetwork {
                 attachment_id: attachment_id.into(),
@@ -267,6 +270,7 @@ impl Catalog {
                 rebind_revision: prior.map(|before| before.revision),
                 dns_name: Some(dns_name.into()),
             },
+            overlay,
         )
     }
 
@@ -329,6 +333,10 @@ impl Catalog {
 
     pub(crate) fn register_private_network(&self, data: &RegisterNetwork) -> Result<()> {
         self.ready()?;
+        self.ensure_private_network(data)
+    }
+
+    pub(crate) fn ensure_private_network(&self, data: &RegisterNetwork) -> Result<()> {
         if !valid_id(&data.network_id) || !valid_id(&data.route_domain_id) {
             return Err(Fault::invalid("invalid network or route domain ID"));
         }
@@ -361,11 +369,22 @@ impl Catalog {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve_network(
         &mut self,
         request: &Request,
         data: &ReserveNetwork,
     ) -> Result<NetworkReservation> {
+        self.reserve_network_with_overlay(request, data, &Default::default())
+    }
+
+    pub(crate) fn reserve_network_with_overlay(
+        &mut self,
+        request: &Request,
+        data: &ReserveNetwork,
+        overlay: &crate::network::overlay::Overlay,
+    ) -> Result<NetworkReservation> {
+        let allocation = overlay.allocation().filter(|pool| pool.network_id == data.network_id);
         let operation = self.matching_operation(request)?;
         verify_epoch(request, &operation)?;
         if data.preferred_private_ipv4.is_some() != data.transfer_id.is_some()
@@ -387,6 +406,19 @@ impl Catalog {
             return Err(Fault::invalid("invalid network attachment profile"));
         }
         if let Some(prior) = lookup(&self.db, &data.attachment_id)? {
+            if let Some(pool) = allocation {
+                let address = u32::from(prior.private_ipv4);
+                if !(pool.first..=pool.last).contains(&address) {
+                    let transferred: bool = self.db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM network_transfer_guards WHERE attachment_id=?)",
+                        [&prior.attachment_id], |row| row.get(0),
+                    )?;
+                    if !transferred {
+                        return Err(Fault::new("E_NETWORK_ATTACHMENT_CONFLICT",
+                            "existing private address is outside the configured Worker overlay allocation"));
+                    }
+                }
+            }
             if prior.network_id != data.network_id
                 || prior.device_id != data.device_id
                 || prior.mode != data.mode.as_str()
@@ -428,14 +460,18 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (first, last) = tx
+        let (first, last, domain, cidr) = tx
             .query_row(
-                "SELECT first_ipv4,last_ipv4 FROM private_networks WHERE network_id=?",
+                "SELECT first_ipv4,last_ipv4,route_domain_id,cidr FROM private_networks WHERE network_id=?",
                 [&data.network_id],
-                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
             )
             .optional()?
             .ok_or_else(|| Fault::new("E_NOT_FOUND", "private network is not registered"))?;
+        if allocation.is_some_and(|pool| pool.route_domain_id != domain || pool.cidr != cidr) {
+            return Err(Fault::new("E_OVERLAY_UNAVAILABLE", "private network differs from its configured overlay domain"));
+        }
         let owned: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM network_attachments
              WHERE route_id=? AND instance_id=? AND device_id=? AND state<>'released')",
@@ -459,7 +495,14 @@ impl Catalog {
             }
             address
         } else {
-            unallocated_ipv4(&tx, &data.network_id, first, last)?
+            let (mut first, last) = allocation.map_or((first, last), |pool| (pool.first, pool.last));
+            loop {
+                let candidate = unallocated_ipv4(&tx, &data.network_id, first, last)?;
+                if allocation.is_none() || !overlay.remote_address_reserved(Ipv4Addr::from(candidate)) {
+                    break candidate;
+                }
+                first = candidate + 1;
+            }
         };
         let guest = data.guest_ipv4.map(u32::from).unwrap_or(private);
         tx.execute(
