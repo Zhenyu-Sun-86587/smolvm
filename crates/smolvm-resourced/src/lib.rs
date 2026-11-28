@@ -39,6 +39,8 @@ mod kernel_mm_anchor_process;
 #[cfg(target_os = "linux")]
 pub mod managed;
 #[cfg(target_os = "linux")]
+pub mod boot_environment;
+#[cfg(target_os = "linux")]
 mod managed_fork;
 #[cfg(target_os = "linux")]
 mod managed_kernel_cow;

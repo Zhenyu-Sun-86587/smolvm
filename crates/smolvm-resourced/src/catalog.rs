@@ -56,6 +56,8 @@ pub struct Operation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<crate::native_operations::Progress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_environment: Option<crate::boot_environment::Proof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<Expected>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statepoint: Option<Value>,
@@ -79,6 +81,7 @@ fn operation_row(row: &Row<'_>) -> rusqlite::Result<Operation> {
         expected_execution_epoch: row.get(6)?,
         expected_incarnation_id: row.get(7)?,
         native: None,
+        boot_environment: None,
         execution: None,
         statepoint: None,
         fork: None,
@@ -324,7 +327,7 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
                 migrate_capture_journal(&tx)?;
             }
-            1..=35 => {
+            1..=36 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -455,7 +458,10 @@ impl Catalog {
         tx.execute_batch(include_str!("schema_network_overlay.sql"))?;
         tx.execute_batch(include_str!("schema_saved_files.sql"))?;
         tx.execute_batch(include_str!("schema_bucket_bases.sql"))?;
-        tx.pragma_update(None, "user_version", 35)?;
+        if version < 36 {
+            tx.execute_batch(include_str!("schema_boot_environment.sql"))?;
+        }
+        tx.pragma_update(None, "user_version", 36)?;
         tx.commit()?;
         Ok(Self { db })
     }
@@ -630,6 +636,9 @@ impl Catalog {
             operation.execution = self.db.query_row(
                 "SELECT e.instance_id,e.incarnation_id,e.execution_epoch FROM managed_launches m JOIN executions e USING(incarnation_id) WHERE m.operation_id=? AND e.last_operation_id=m.operation_id",
                 [id], |row| Ok(Expected {instance_id:row.get(0)?, incarnation_id:row.get(1)?, execution_epoch:row.get(2)?})).optional()?;
+        }
+        if operation.kind == "launch" && operation.execution.is_some() {
+            operation.boot_environment = crate::boot_environment::receipt(&self.db, &operation)?;
         }
         if matches!(operation.kind.as_str(), "independent_fork" | "fork_batch") {
             operation.fork = crate::managed_fork::receipt(self, &operation.operation_id)?;
@@ -825,6 +834,7 @@ impl Catalog {
             }
         }
         if !abort && operation.kind == "launch" {
+            crate::boot_environment::require_applied(&tx, id)?;
             let unpublished: bool = tx.query_row(
                 "SELECT (
                     EXISTS(SELECT 1 FROM managed_launches WHERE operation_id=?1 AND json_extract(spec_json,'$.network') IS NOT NULL)

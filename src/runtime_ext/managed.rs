@@ -1,4 +1,5 @@
 //! Dispatch persisted Worker launch intents independently of HTTP clients.
+use super::boot_environment;
 use crate::agent::KrunFunctions;
 use crate::{deep_state, process, systemd_scope, Error, Result};
 use smolvm_resourced::managed::Plan;
@@ -32,6 +33,8 @@ struct Boot {
     scope: String,
     #[serde(default)]
     network: Option<WorkerNetworkScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment: Option<smolvm_resourced::boot_environment::Delivery>,
 }
 static DISPATCH: Once = Once::new();
 pub(super) fn dispatch(socket: PathBuf) {
@@ -39,6 +42,7 @@ pub(super) fn dispatch(socket: PathBuf) {
         thread::Builder::new().name("managed-launches".into()).spawn(move||{
             let running=Arc::new(Mutex::new(HashSet::new()));
             loop {
+                boot_environment::reap();
                 if let Ok(serve)=deep_state::require_instance() {
                     if let Ok(client)=super::launch::verified_client(&socket) {
                         if let Ok(plans)=client.managed_pending(&serve) {
@@ -180,6 +184,14 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
             }
             Err(error) => return Err(failed(error)),
         }
+        if let Some(attempt) = &plan.boot_environment {
+            if attempt.expired() {
+                return abort_launch(client, plan, &prior);
+            }
+            if !boot_environment::received(plan) {
+                return Ok(());
+            }
+        }
         if plan.restore.as_ref().is_some_and(|restore| restore.durable.is_some())
             && !client.prepare_state_restore(launch, &prior).map_err(failed)?
         {
@@ -252,13 +264,20 @@ fn drive(client: &Client<'_>, plan: &Plan) -> Result<()> {
                 gid,
                 scope,
                 network,
+                environment: if plan.boot_environment.is_some() {
+                    Some(boot_environment::take(plan).ok_or_else(|| failed("boot environment attempt is unavailable"))?)
+                } else {
+                    None
+                },
             };
             let mut channel = proc
                 .stdin
                 .take()
                 .ok_or_else(|| failed("lost launch channel"))?;
-            channel.write_all(&serde_json::to_vec(&boot).map_err(failed)?)?;
-            Ok(())
+            let mut body = serde_json::to_vec(&boot).map_err(failed)?;
+            let result = channel.write_all(&body);
+            body.fill(0);
+            Ok(result?)
         })();
         if let Err(e) = setup {
             drop(proc.stdin.take());
@@ -305,10 +324,13 @@ fn confirm(
                     &launch.operation_id,
                 )
                 .map_err(failed)?;
-                client
-                    .finish_launch(launch, &launch.execution, false, op.revision)
-                    .map_err(failed)?;
-                return Ok(());
+                match client.finish_launch(launch, &launch.execution, false, op.revision) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if plan.boot_environment.is_some()
+                        && error.code == "E_FENCE_UNPROVEN"
+                        && error.message == "System boot environment is not confirmed" => (),
+                    Err(error) => return Err(failed(error)),
+                }
             }
         }
         let exited = child
@@ -374,11 +396,19 @@ fn repair_empty_scope(plan: &Plan) {
 /// Internal VMM entry point. The parent sends the permit after systemd adopts this PID.
 pub fn boot() -> Result<()> {
     let mut msg = Vec::new();
-    std::io::stdin().take(131073).read_to_end(&mut msg)?;
-    if msg.len() > 131072 {
+    const MAX_BOOT: usize = smolvm_resourced::boot_environment::MAX_WIRE_BYTES + 131072;
+    std::io::stdin().take(MAX_BOOT as u64 + 1).read_to_end(&mut msg)?;
+    if msg.len() > MAX_BOOT {
         return Err(failed("oversize boot manifest"));
     }
-    let boot: Boot = serde_json::from_slice(&msg).map_err(failed)?;
+    let parsed = serde_json::from_slice(&msg).map_err(|_| failed("invalid boot manifest"));
+    msg.fill(0);
+    let mut boot: Boot = parsed?;
+    let delivery = match (boot.plan.boot_environment.as_ref(), boot.environment.take()) {
+        (Some(attempt), Some(delivery)) if attempt.revision == delivery.revision && !attempt.expired() => Some(delivery),
+        (None, None) => None,
+        _ => return Err(failed("boot environment does not match the launch attempt")),
+    };
     if boot.uid == 0 || boot.gid == 0 {
         return Err(failed("per-VM identity required"));
     }
@@ -501,6 +531,12 @@ pub fn boot() -> Result<()> {
     if let Err(e) = configured {
         unsafe { (k.free_ctx)(ctx) };
         return Err(e);
+    }
+    if let Some((attempt, delivery)) = boot.plan.boot_environment.as_ref().zip(delivery) {
+        if let Err(error) = boot_environment::start(&client, &boot.plan.launch, attempt, delivery, &boot.control) {
+            unsafe { (k.free_ctx)(ctx) };
+            return Err(error.into());
+        }
     }
     let rc = unsafe { (k.start_enter)(ctx) };
     if rc != 0 {

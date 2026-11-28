@@ -87,6 +87,8 @@ pub struct Plan {
     pub grant_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore: Option<Restore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_environment: Option<crate::boot_environment::Attempt>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -402,6 +404,7 @@ pub(crate) fn plan(c: &Catalog, op: &Operation) -> Result<Option<Plan>> {
             devices: serde_json::from_str(&devices)
                 .map_err(|e| Fault::new("E_CATALOG", e.to_string()))?,
             grant_id: key(&op.operation_id, "grant", 0),
+            boot_environment: crate::boot_environment::attempt(&c.db, &op.operation_id)?,
             restore: match crate::managed_state_restore::plan(c, op)? {
                 Some(restore) => Some(restore),
                 None => crate::managed_fork::restore(c, &op.operation_id)?,
@@ -411,6 +414,10 @@ pub(crate) fn plan(c: &Catalog, op: &Operation) -> Result<Option<Plan>> {
     .transpose()
 }
 pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<Operation> {
+    submit_with_environment(c, r, machine, None)
+}
+
+pub(crate) fn submit_with_environment(c: &mut Catalog, r: &Request, machine: Machine, environment: Option<crate::boot_environment::Attempt>) -> Result<Operation> {
     let (id, _) = r.operation()?;
     let (route, bundle, expected) = r.scope()?;
     if route != "deep" || expected.incarnation_id.is_some() || expected.execution_epoch == i64::MAX
@@ -421,6 +428,9 @@ pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<O
         ));
     }
     let serve = serve_id(&expected.instance_id, &machine.name)?;
+    if environment.is_some() && machine.boot_profile != "system-debian-v1" {
+        return Err(Fault::invalid("boot environment requires the managed System profile"));
+    }
     let existing = match c.operation(id) {
         Ok(existing) => Some(existing),
         Err(e) if e.code == "E_NOT_FOUND" => None,
@@ -433,7 +443,7 @@ pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<O
                 "operation already belongs to another handler",
             )
         })?;
-        if original.machine != machine {
+        if original.machine != machine || original.boot_environment != environment {
             return Err(Fault::new(
                 "E_IDEMPOTENCY_CONFLICT",
                 "managed launch profile changed",
@@ -477,6 +487,9 @@ pub(crate) fn submit(c: &mut Catalog, r: &Request, machine: Machine) -> Result<O
     let incarnation = key(id, "vmm", 0);
     c.begin_with(r,"launch",|tx|{
         crate::admission::reserve(tx,id,&expected.instance_id,capacity)?;
+        if let Some(environment) = environment.as_ref() {
+            crate::boot_environment::record(tx, id, environment)?;
+        }
         tx.execute("INSERT INTO managed_launches(operation_id,incarnation_id,serve_instance,machine_name,spec_json,devices_json,vcpus,memory_mib)
             VALUES(?,?,?,?,?,?,?,?)",params![
             id,incarnation,serve,machine.name,spec,encoded,machine.cpus,machine.memory_mib])?;

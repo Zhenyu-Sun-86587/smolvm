@@ -124,6 +124,9 @@ impl KrunFunctions {
         if system {
             env.push(c"KRUN_INIT_PID1=1".as_ptr());
         }
+        if plan.boot_environment.is_some() {
+            env.push(c"SMOLVM_BOOT_ENVIRONMENT=1".as_ptr());
+        }
         if let Some(attached) = network {
             env.push(string(&format!(
                 "KRUN_STATIC_IPV4={}/{},{},{}",
@@ -227,6 +230,14 @@ impl KrunFunctions {
                 check(
                     "System Guest Agent",
                     (self.add_vsock_port2)(ctx, 6000, guest_socket.as_ptr(), true),
+                )?;
+            }
+            if plan.boot_environment.is_some() {
+                let path = crate::runtime_ext::boot_environment::socket(control);
+                let socket = CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+                check(
+                    "System boot environment channel",
+                    (self.add_vsock_port2)(ctx, smolvm_resourced::boot_environment::GUEST_PORT, socket.as_ptr(), true),
                 )?;
             }
             if let Some(path) = guest_relay.as_ref() {
