@@ -143,6 +143,9 @@ impl Job {
                 tx.commit()?;
             }
             "durable_hold" if record.phase=="durable" || record.phase=="stop_committed" => {
+                if crate::machine_migration::source_operation(c, &op.operation_id)? {
+                    return Ok(None);
+                }
                 if let Some(target)=&self.target {
                     let preflight=request(&op,json!({"capture_id":target,"volume_restore_policy":self.mode}));
                     if points.prepare_restore(c,objects,&preflight)?["phase"]!="prepared" {return Ok(None)}

@@ -73,7 +73,8 @@ pub(crate) fn source(
         (record.export.purpose, record.phase.as_str()),
         (Purpose::Checkpoint, "durable")
             | (Purpose::Hibernate | Purpose::RollbackRescue, "hibernated")
-    ) {
+    ) && !(record.export.purpose == Purpose::Hibernate && record.phase == "durable"
+        && crate::machine_migration::is_held_source(catalog, &operation.operation_id)?) {
         return Err(unavailable(
             "StatePoint has no available durable restore root",
         ));
@@ -117,7 +118,11 @@ pub(crate) fn exact_heads(
 }
 
 pub(crate) fn submit(catalog: &mut Catalog, request: &Request, input: Input) -> Result<Operation> {
-    queue(catalog, request, input, None, None)
+    queue(catalog, request, input, None, None, false)
+}
+
+pub(crate) fn submit_migration(catalog: &mut Catalog, request: &Request, input: Input) -> Result<Operation> {
+    queue(catalog, request, input, None, None, true)
 }
 
 pub(crate) fn queue_rollback(
@@ -176,6 +181,7 @@ pub(crate) fn queue_rollback(
         },
         Some(rescue_capture_id),
         Some(&parent.operation_id),
+        false,
     )
 }
 
@@ -185,6 +191,7 @@ fn queue(
     input: Input,
     rescue_capture_id: Option<&str>,
     predecessor: Option<&str>,
+    migration: bool,
 ) -> Result<Operation> {
     let (id, _) = request.operation()?;
     let (route, bundle, expected) = request.scope()?;
@@ -339,7 +346,7 @@ fn queue(
                 (captured.volume_id.clone(), Some(head.clone()), true)
             } else {
                 (
-                    key(id, "volume", index),
+                    if migration { captured.volume_id.clone() } else { key(id, "volume", index) },
                     Some(key(id, "head", index)),
                     false,
                 )
@@ -387,6 +394,15 @@ fn queue(
     let volume_map_json = serde_json::to_string(&volume_map).map_err(invalid)?;
     catalog.begin_with_handoff(request, "restore_target", predecessor, |tx| {
         crate::admission::reserve(tx, id, &expected.instance_id, capacity)?;
+        if migration {
+            for device in &devices {
+                let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM volume_heads WHERE volume_id=?)",
+                    [&device.volume_id], |row| row.get(0))?;
+                if exists {
+                    return Err(Fault::new("E_VOLUME_CONFLICT", "target already has the migrated logical volume"));
+                }
+            }
+        }
         tx.execute("INSERT INTO managed_launches(operation_id,incarnation_id,serve_instance,machine_name,spec_json,devices_json,vcpus,memory_mib)
             VALUES(?,?,?,?,?,?,?,?)", params![id,incarnation,namespace,machine.name,machine_json,devices_json,machine.cpus,machine.memory_mib])?;
         tx.execute("INSERT INTO managed_state_restores(operation_id,capture_id,rescue_capture_id,mode,volume_map_json)

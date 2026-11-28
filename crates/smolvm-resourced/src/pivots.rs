@@ -548,6 +548,31 @@ pub(crate) fn validate_archived_origin(
             "restore differs from its authorized archived source",
         ));
     }
+    // A migration imports the exact cut for this prepared target operation.
+    // Its heads must be fresh local objects with the original logical IDs.
+    // Other archive restores retain their independent-volume contract.
+    let migrating: bool = catalog.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM machine_migrations m
+          JOIN managed_state_restores t ON t.operation_id=m.native_operation_id
+          JOIN root_refs r ON r.owner_id=m.migration_id AND r.owner_kind=?11
+          WHERE m.side='target' AND m.native_operation_id=?1 AND m.instance_id=?2
+            AND m.state IN ('imported','prepared') AND m.decision_json IS NULL
+            AND t.capture_id=?3 AND t.mode='clone_conflicts'
+            AND r.resource_id=?4 AND r.state='active'
+            AND json_extract(m.ticket_json,'$.mode')='live'
+            AND json_extract(m.ticket_json,'$.target.bundle_digest')=?5
+            AND json_extract(m.ticket_json,'$.target.execution.incarnation_id')=?6
+            AND json_extract(m.ticket_json,'$.target.execution.execution_epoch')=?7
+            AND json_extract(m.ticket_json,'$.source.execution.instance_id')=?8
+            AND json_extract(m.ticket_json,'$.source.execution.incarnation_id')=?9
+            AND json_extract(m.ticket_json,'$.source.execution.execution_epoch')=?10)",
+        params![
+            target.last_operation_id, target.instance_id, capture, record.point.representation_id,
+            target.bundle_digest, target.incarnation_id, target.execution_epoch, source.instance_id,
+            record.point.incarnation_id, record.point.execution_epoch, crate::disk_closure_import::KIND
+        ],
+        |row| row.get(0),
+    )?;
     let mut seen = HashSet::new();
     for disk in record
         .point
@@ -558,17 +583,23 @@ pub(crate) fn validate_archived_origin(
         let Some(head) = &disk.writable_head_id else {
             continue;
         };
+        let target_head = target_volumes.get(&disk.volume_id);
+        let valid_target = if migrating {
+            target_head.is_some_and(|target| target != head)
+        } else {
+            target_head.is_none()
+        };
         if disk.grant_id.as_deref() != Some(origin.grant_id.as_str())
             || source_heads.get(&disk.volume_id) != Some(head)
-            || target_volumes.contains_key(&disk.volume_id)
+            || !valid_target
             || !seen.insert(&disk.volume_id)
         {
             return Err(fence_unproven(
-                "restore must clone every archived writable volume from its sealed generation",
+                "restore writers must match every sealed archived volume and its restore policy",
             ));
         }
     }
-    if seen.len() != source_heads.len() {
+    if seen.len() != source_heads.len() || seen.len() != target_volumes.len() {
         return Err(fence_unproven(
             "restore contains writers outside the archived capture",
         ));

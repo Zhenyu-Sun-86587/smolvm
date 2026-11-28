@@ -724,9 +724,11 @@ pub(crate) fn mutate(catalog: &mut Catalog, objects: &File, request: &Request) -
                 None => Ok(reply),
             };
         }
+        crate::migration_product_volumes::guard_mutation(catalog, &input.volume_id)?;
         catalog.active_operation(request)?;
         (old, capacity)
     } else {
+        crate::migration_product_volumes::guard_mutation(catalog, &input.volume_id)?;
         let current = if matches!(input.command, Action::Create { .. }) {
             if input.expected_revision != 0
                 || catalog.db.query_row(

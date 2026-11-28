@@ -324,7 +324,7 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
                 migrate_capture_journal(&tx)?;
             }
-            1..=35 => {
+            1..=36 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -455,7 +455,9 @@ impl Catalog {
         tx.execute_batch(include_str!("schema_network_overlay.sql"))?;
         tx.execute_batch(include_str!("schema_saved_files.sql"))?;
         tx.execute_batch(include_str!("schema_bucket_bases.sql"))?;
-        tx.pragma_update(None, "user_version", 35)?;
+        tx.execute_batch(include_str!("schema_machine_migration.sql"))?;
+        tx.execute_batch(include_str!("schema_migration_product_volumes.sql"))?;
+        tx.pragma_update(None, "user_version", 36)?;
         tx.commit()?;
         Ok(Self { db })
     }
@@ -698,6 +700,7 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::machine_migration::guard_operation(&tx,route,&expected.instance_id,id)?;
         let (epoch, incarnation, active) = binding(&tx, route, &expected.instance_id)?;
         if epoch != expected.execution_epoch || incarnation != expected.incarnation_id {
             return Err(stale());
@@ -934,6 +937,7 @@ impl Catalog {
     }
 
     pub fn verify_launch(&self, operation: &Operation, expected: &Expected) -> Result<()> {
+        crate::machine_migration::permit_target_process(self, operation)?;
         self.ready()?;
         let (epoch, incarnation, active) =
             binding(&self.db, &operation.route_id, &operation.instance_id)?;

@@ -88,7 +88,11 @@ pub(crate) fn has_root(db: &Connection, record: &Record) -> Result<bool> {
         "SELECT EXISTS(SELECT 1 FROM root_refs WHERE owner_kind=?1 AND owner_id=?2
            AND resource_id=?3 AND state='active') OR EXISTS(
            SELECT 1 FROM native_backup_imports b JOIN root_refs r ON r.owner_id=b.backup_id
-           WHERE b.capture_id=?2 AND r.owner_kind='backup_import' AND r.resource_id=?3 AND r.state='active')",
+           WHERE b.capture_id=?2 AND r.owner_kind='backup_import' AND r.resource_id=?3 AND r.state='active')
+           OR EXISTS(SELECT 1 FROM root_refs r JOIN machine_migrations m ON m.migration_id=r.owner_id
+                     JOIN native_backup_imports b ON b.capture_id=?2
+                WHERE r.owner_kind='disk_closure_import' AND r.resource_id=?3 AND r.state='active'
+                  AND m.side='target' AND m.import_json IS NOT NULL)",
         params![root(record.export.purpose), record.point.capture_id, record.point.representation_id],
         |row| row.get(0),
     )?)

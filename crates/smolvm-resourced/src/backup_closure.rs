@@ -499,7 +499,7 @@ pub(crate) fn load(
     Ok((manifest, raw))
 }
 
-fn disk_set(
+pub(crate) fn disk_set(
     root: &File,
     blocks: &BTreeMap<String, BlockSpec>,
     generations: &[String],
@@ -677,7 +677,7 @@ pub(crate) fn restore(
     )
 }
 
-fn sync_directories(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directories(path: &Path) -> io::Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
