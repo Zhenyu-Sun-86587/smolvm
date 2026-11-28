@@ -198,6 +198,7 @@ pub(crate) struct Worker {
     forks: crate::managed_fork::Actor,
     lifecycle:crate::lifecycle_controller::Controller,
     resize: crate::resource_resize::Controller,
+    bucket: crate::bucket_online::Actor,
 }
 
 struct Reply {
@@ -525,7 +526,9 @@ impl Worker {
                 layers,
             });
         }
-        let ranges = crate::bucket_bases::launch(&self.catalog, &self.objects, &op.bundle_digest, &layouts, self.admin_uid)?;
+        let mut ranges = crate::bucket_bases::launch(&self.catalog, &self.objects, &op.bundle_digest, &layouts, self.admin_uid)?;
+        ranges.append(&mut self.bucket.launch(&self.catalog, &execution.instance_id, &op.bundle_digest,
+            &op.operation_id, &layouts, self.admin_uid)?);
         let heads = plan.heads();
         let mut packet = if heads.is_empty() {
             Reply {
@@ -648,6 +651,16 @@ impl Worker {
                     return Err(Fault::new("E_PERMISSION_DENIED", "Bucket bases require the Worker administrator"));
                 }
                 crate::bucket_bases::register(&self.catalog, &self.objects, request, self.admin_uid)
+            }
+            "BucketStatus" | "BucketConfigure" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new("E_PERMISSION_DENIED", "Bucket storage requires the Worker administrator"));
+                }
+                if request.method == "BucketStatus" {
+                    self.bucket.status(&self.catalog, request, self.admin_uid)
+                } else {
+                    self.bucket.configure(&self.catalog, request, self.admin_uid)
+                }
             }
             "PrepareSavedFiles" | "ReadSavedFiles" => {
                 if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
@@ -789,13 +802,30 @@ impl Worker {
             }
             "PrepareWriterPivot" => {
                 let execution = self.authenticated_execution(request, peer)?;
-                let offer = crate::pivots::prepare(
+                let mut offer = crate::pivots::prepare(
                     &mut self.catalog,
                     &self.objects,
                     &mut self.reserved,
                     request,
                     &execution,
                 )?;
+                let ranges = self.bucket.ranges(&self.catalog, &execution.instance_id, &execution.bundle_digest,
+                    request.operation()?.0, offer.table.iter().filter(|entry| entry.role == "block_ancestor")
+                    .map(|entry| entry.resource_id.as_str()), self.admin_uid)?;
+                if offer.descriptors.len() + ranges.len() > ipc::MAX_FDS {
+                    return Err(Fault::new("E_RESOURCE_LIMIT", "writer pivot exceeds Worker descriptor limits"));
+                }
+                let mut index = std::collections::BTreeMap::new();
+                for (resource_id, (bytes, descriptor)) in ranges {
+                    index.insert(resource_id.clone(), bytes);
+                    offer.table.push(ipc::FdEntry {
+                        index: offer.descriptors.len(), resource_id, role: "bucket_range".into(),
+                    });
+                    offer.descriptors.push(descriptor);
+                }
+                if !index.is_empty() {
+                    offer.result["bucket_ranges"] = json!(index);
+                }
                 return Ok(Reply {
                     result: offer.result,
                     table: offer.table,
@@ -2862,6 +2892,7 @@ fn serve(
         forks: Default::default(),
         lifecycle: Default::default(),
         resize: Default::default(),
+        bucket: crate::bucket_online::Actor::new(),
     };
     worker.network.overlay().configure_catalog(&worker.catalog)?;
     worker
@@ -2918,6 +2949,9 @@ fn serve(
                 .forks
                 .tick(&mut worker.catalog, &worker.objects, &mut worker.escrow, &worker.boot)
                 .map_err(|e| io::Error::other(e.message))?;
+            if let Err(error) = worker.bucket.tick(&mut worker.catalog, &worker.objects, &worker.boot, worker.admin_uid) {
+                eprintln!("resourced Bucket storage: {}", error.message);
+            }
             if let Err(error) = worker.reconcile_failed_managed_targets() {
                 eprintln!("resourced managed target failure recovery: {error}");
             }
