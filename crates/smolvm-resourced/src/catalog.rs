@@ -456,6 +456,7 @@ impl Catalog {
         tx.execute_batch(include_str!("schema_saved_files.sql"))?;
         tx.execute_batch(include_str!("schema_bucket_bases.sql"))?;
         tx.execute_batch(include_str!("schema_machine_migration.sql"))?;
+        tx.execute_batch(include_str!("schema_migration_product_volumes.sql"))?;
         tx.pragma_update(None, "user_version", 36)?;
         tx.commit()?;
         Ok(Self { db })

@@ -1,12 +1,13 @@
 //! Exact-attempt Worker authority for a cross-Worker transfer.
 
 use crate::catalog::{Catalog, Execution, Operation};
-use crate::ipc::{valid_digest, valid_id, Expected, Fault, FdEntry, Request, Result, PROTOCOL};
+use crate::ipc::{Expected, Fault, FdEntry, PROTOCOL, Request, Result, valid_digest, valid_id};
 use crate::managed::{self, Device, Machine};
+use crate::migration_product_volumes as products;
 use crate::statepoint_catalog::Record;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -95,6 +96,22 @@ struct HeldDetails {
     machine: Machine,
     devices: Vec<Device>,
     profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    product_volumes: Vec<products::Volume>,
+}
+
+fn product_volumes(
+    catalog: &Catalog,
+    input: &Input,
+    devices: &[Device],
+) -> Result<Vec<products::Volume>> {
+    let source = &input.ticket().source;
+    products::source(
+        catalog,
+        &source.bundle_digest,
+        &source.execution.instance_id,
+        devices,
+    )
 }
 
 fn conflict(message: &str) -> Fault {
@@ -524,7 +541,9 @@ fn hold_source(catalog: &mut Catalog, objects: &File, boot: &str, input: &Input)
     } else {
         None
     };
+    let selected = product_volumes(catalog, input, &plan.devices)?;
     reserve(catalog, input)?;
+    products::reserve_source(catalog, &input.ticket().id, &selected)?;
     let request = input.native(input.endpoint().execution.clone(), json!({}));
     let capture = managed::key(&input.op(), "point", 0);
     let op = crate::managed_fork::submit(
@@ -612,12 +631,15 @@ fn hold_source(catalog: &mut Catalog, objects: &File, boot: &str, input: &Input)
         .duration_since(UNIX_EPOCH)
         .map_err(|error| Fault::new("E_HOST_IO", error.to_string()))?
         .as_millis() as u64;
+    let product_volumes = product_volumes(catalog, input, &devices)?;
+    products::check_held(catalog, &input.ticket().id, &product_volumes)?;
     let details = HeldDetails {
         generation_ids: record.point.disk_generations,
         capture_operation_id: op.operation_id,
         machine: plan.machine,
         devices,
         profile,
+        product_volumes,
     };
     remember(
         catalog,
@@ -645,7 +667,11 @@ fn inspect(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Value> {
     } else {
         None
     };
-    make_receipt(input, json!({"details":{"profile":profile}}))
+    let product_volumes = product_volumes(catalog, input, &plan.devices)?;
+    make_receipt(
+        input,
+        json!({"details":{"profile":profile,"product_volumes":product_volumes}}),
+    )
 }
 
 fn preflight(catalog: &mut Catalog, input: &Input) -> Result<Value> {
@@ -790,6 +816,13 @@ fn prepare_target(
         execution_epoch: endpoint.execution.execution_epoch - 1,
     };
     let native = input.native(expected, json!({}));
+    products::install_target(
+        catalog,
+        &native,
+        &input.ticket().id,
+        &details.product_volumes,
+        &details.devices,
+    )?;
     if live {
         crate::managed_state_restore::submit_migration(
             catalog,
@@ -819,12 +852,13 @@ fn prepare_target(
     } else {
         queue_cold(catalog, &native, details, &endpoint.runtime_name)?;
     }
+    let product_volumes = products::observations(catalog, &native, &input.ticket().id)?;
     remember(
         catalog,
         input,
         "prepared",
         json!({"details":{"native_operation_id":op,
-        "request_digest":input.ticket_digest, "held_live":live},
+        "request_digest":input.ticket_digest, "held_live":live,"product_volumes":product_volumes},
         "capture_id":hold["capture_id"], "manifest_digest":hold["manifest_digest"]}),
     )
 }
@@ -1088,7 +1122,14 @@ impl crate::worker::Worker {
                 let native = input.native(input.endpoint().execution.clone(), json!({}));
                 let execution = self.scoped_execution(&native)?;
                 self.verify_live_execution(&execution)?;
-                remember(&mut self.catalog, &input, "active", json!({}))
+                let product_volumes =
+                    products::observations(&self.catalog, &native, &input.ticket().id)?;
+                remember(
+                    &mut self.catalog,
+                    &input,
+                    "active",
+                    json!({"details":{"product_volumes":product_volumes}}),
+                )
             }
             ("abort_target", "reserved" | "prepared" | "aborting") if decision.is_none() => {
                 self.catalog.db.execute(
@@ -1129,12 +1170,13 @@ impl crate::worker::Worker {
                         self.catalog.finish(&native, true, operation.revision)?;
                     }
                     Ok(operation) if operation.phase != "ABORTED" => {
-                        return Err(fenced("target operation has effects"))
+                        return Err(fenced("target operation has effects"));
                     }
                     Ok(_) => (),
                     Err(error) if error.code == "E_NOT_FOUND" => (),
                     Err(error) => return Err(error),
                 }
+                products::remove_aborted_target(&self.catalog, &input.ticket().id)?;
                 release_import(&mut self.catalog, &self.objects, &input)?;
                 remember(&mut self.catalog, &input, "aborted", json!({}))
             }
@@ -1303,7 +1345,9 @@ fn hold_stopped_source(
     input: &Input,
     plan: managed::Plan,
 ) -> Result<Value> {
+    let product_volumes = product_volumes(catalog, input, &plan.devices)?;
     reserve(catalog, input)?;
+    products::reserve_source(catalog, &input.ticket().id, &product_volumes)?;
     let expected = &input.endpoint().execution;
     let request = input.native(expected.clone(), json!({}));
     let operation = catalog.begin(&request, "migration_copy")?;
@@ -1379,6 +1423,7 @@ fn hold_stopped_source(
         machine: plan.machine,
         devices,
         profile: None,
+        product_volumes,
     };
     let manifest_digest = digest(encode(&details)?.as_bytes());
     remember(
