@@ -70,7 +70,7 @@ fn inspect_socket(path: &Path, admin: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn connect(path: &Path, admin: u32) -> Result<OwnedFd> {
+pub(crate) fn connect(path: &Path, admin: u32) -> Result<OwnedFd> {
     inspect_socket(path, admin).map_err(unavailable)?;
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(unavailable)?;
     let address = SockAddr::unix(path).map_err(unavailable)?;

@@ -17,7 +17,11 @@ mod blocks;
 #[cfg(target_os = "linux")]
 mod bucket_bases;
 #[cfg(target_os = "linux")]
+mod bucket_online;
+#[cfg(target_os = "linux")]
 mod catalog;
+#[cfg(target_os = "linux")]
+mod disk_backup;
 #[cfg(target_os = "linux")]
 pub mod client;
 #[cfg(target_os = "linux")]

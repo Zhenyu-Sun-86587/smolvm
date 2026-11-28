@@ -137,12 +137,14 @@ impl Job {
             "exporting" if purpose == Purpose::Checkpoint => self.next(c,"source_return")?,
             "exporting" => self.next(c,"durable_hold")?,
             "checkpoint_export" if record.phase=="durable" => {
+                if !crate::bucket_online::require_capture_commit(c,&op,&record)? {return Ok(None)}
                 let tx=c.db.transaction()?;
                 tx.execute("UPDATE managed_fork_batches SET stage='complete',error=NULL WHERE operation_id=? AND source_released=1",[&self.id])?;
                 tx.execute("UPDATE operations SET phase='COMPLETED',revision=revision+1 WHERE operation_id=? AND phase='NEW'",[&self.id])?;
                 tx.commit()?;
             }
             "durable_hold" if record.phase=="durable" || record.phase=="stop_committed" => {
+                if !crate::bucket_online::require_capture_commit(c,&op,&record)? {return Ok(None)}
                 if crate::machine_migration::source_operation(c, &op.operation_id)? {
                     return Ok(None);
                 }
