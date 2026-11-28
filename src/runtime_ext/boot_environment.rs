@@ -147,7 +147,7 @@ pub(super) async fn submit(State(socket): State<PathBuf>, body: axum::body::Byte
 }
 
 pub(crate) fn socket(control: &Path) -> PathBuf {
-    control.with_file_name("environment.sock")
+    control.with_file_name("e.sock")
 }
 
 pub(super) fn start(
@@ -236,4 +236,21 @@ fn deliver(path: &Path, delivery: Delivery, attempt: &Attempt) -> std::io::Resul
         return Err(std::io::ErrorKind::InvalidData.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn socket_fits_the_maximum_managed_incarnation_path() {
+        let control = Path::new("/run/smolvm-custom/managed")
+            .join("a".repeat(32))
+            .join(format!("vmm-{}", "b".repeat(32)))
+            .join("c.sock");
+        let environment = socket(&control);
+        assert_eq!(environment.parent(), control.parent());
+        assert!(environment.as_os_str().as_bytes().len() <= 107);
+    }
 }
