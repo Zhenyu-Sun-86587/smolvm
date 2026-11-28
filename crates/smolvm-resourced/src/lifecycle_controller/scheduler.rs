@@ -131,27 +131,31 @@ fn observe(c: &Catalog, m: &Machine, boot: &str, now: i64) -> Result<Observation
     let id = &m.expected.instance_id;
     let mut gate = None;
     let power = if let Some(inc) = m.expected.incarnation_id.as_deref() {
-        let result = Endpoint::load(&c.db, inc, boot).and_then(|ep| ep.inventory());
-        match result {
-            Ok(inv) => {
-                if !inv.measured_helper || inv.standby_blocker.is_some() {
-                    blockers.push(
-                        inv.standby_blocker
-                            .unwrap_or_else(|| "Guest helper unavailable".into()),
-                    )
-                }
-                if inv.source_disposition == "STANDBY" && inv.guest_gate == "parked" {
-                    let pinned:bool=c.db.query_row("SELECT EXISTS(SELECT 1 FROM native_standby s JOIN native_transitions n USING(operation_id)
-                        WHERE s.incarnation_id=? AND n.mode='managed' AND n.session=? AND n.stage='complete')",params![inc,inv.last_session],|r|r.get(0))?;
-                    if pinned {
-                        gate = Some(inv.last_session)
+        if m.active.is_some() && crate::managed_fork::source_is_pivoting(&c.db, "deep", id, inc)? {
+            "HELD".into()
+        } else {
+            let result = Endpoint::load(&c.db, inc, boot).and_then(|ep| ep.inventory());
+            match result {
+                Ok(inv) => {
+                    if !inv.measured_helper || inv.standby_blocker.is_some() {
+                        blockers.push(
+                            inv.standby_blocker
+                                .unwrap_or_else(|| "Guest helper unavailable".into()),
+                        )
                     }
+                    if inv.source_disposition == "STANDBY" && inv.guest_gate == "parked" {
+                        let pinned:bool=c.db.query_row("SELECT EXISTS(SELECT 1 FROM native_standby s JOIN native_transitions n USING(operation_id)
+                            WHERE s.incarnation_id=? AND n.mode='managed' AND n.session=? AND n.stage='complete')",params![inc,inv.last_session],|r|r.get(0))?;
+                        if pinned {
+                            gate = Some(inv.last_session)
+                        }
+                    }
+                    inv.source_disposition
                 }
-                inv.source_disposition
-            }
-            Err(_) => {
-                blockers.push("unknown:native_inventory".into());
-                "UNKNOWN".into()
+                Err(_) => {
+                    blockers.push("unknown:native_inventory".into());
+                    "UNKNOWN".into()
+                }
             }
         }
     } else if m.saved(&c.db)?.is_some() {
@@ -559,7 +563,6 @@ impl Controller {
         if new_epoch > 0 {
             return Ok(());
         }
-        let obs = observe(c, &m, boot, now)?;
         let demand = m.demand(&c.db)?;
         if let Some(active) = &m.active {
             // A pending access may race an explicitly requested hibernate as well.
@@ -580,6 +583,7 @@ impl Controller {
             }
             return Ok(());
         }
+        let obs = observe(c, &m, boot, now)?;
         if demand && now >= m.next {
             let unbound:bool=c.db.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_protections WHERE instance_id=? AND kind='wake' AND state='pending' AND wake_operation IS NULL)",[id],|r|r.get(0))?;
             let kind = match obs.power.as_str() {

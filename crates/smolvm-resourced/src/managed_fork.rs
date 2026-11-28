@@ -146,6 +146,24 @@ fn credential_relay_fork_eligible(kind: &str, inventory: &Inventory) -> bool {
         && inventory.credential_relay_fork == Some(true)
 }
 
+pub(crate) fn source_is_pivoting(
+    db: &Connection,
+    route: &str,
+    instance: &str,
+    incarnation: &str,
+) -> Result<bool> {
+    // A held VMM waits on this Worker during the pivot. Callers can observe
+    // the hold without waiting for that VMM's native control socket.
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM instance_bindings b
+           JOIN managed_fork_batches f ON f.operation_id=b.active_operation_id
+           WHERE b.route_id=?1 AND b.instance_id=?2
+             AND f.source_incarnation=?3 AND f.stage='pivoting')",
+        params![route, instance, incarnation],
+        |row| row.get(0),
+    )?)
+}
+
 pub(crate) fn restore(c: &Catalog, child: &str) -> Result<Option<Restore>> {
     Ok(c.db.query_row("SELECT b.operation_id,b.capture_id,b.anchor,b.helper_digest,b.pivot_json IS NOT NULL FROM managed_fork_children ch JOIN managed_fork_batches b ON b.operation_id=ch.batch_id WHERE ch.operation_id=? AND b.source_released=1",[child],
         |r|Ok(Restore{batch_id:r.get(0)?,capture_id:r.get(1)?,anchor:r.get(2)?,helper_digest:r.get(3)?,source_pivot:r.get(4)?,durable:None})).optional()?)

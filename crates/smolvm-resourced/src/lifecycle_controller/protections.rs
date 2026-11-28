@@ -54,7 +54,7 @@ fn deadline(input: &Input) -> Result<i64> {
     Ok(monotonic()? + 1000 * ttl)
 }
 
-fn running_access(tx: &Transaction<'_>, expected: &Expected) -> Result<bool> {
+fn running_access(tx: &Transaction<'_>, route: &str, expected: &Expected) -> Result<bool> {
     let Some(incarnation) = expected.incarnation_id.as_deref() else {
         return Ok(false);
     };
@@ -62,7 +62,9 @@ fn running_access(tx: &Transaction<'_>, expected: &Expected) -> Result<bool> {
         "SELECT EXISTS(SELECT 1 FROM instance_bindings b JOIN operations o ON o.operation_id=b.active_operation_id
          WHERE b.instance_id=? AND o.kind IN ('standby','hibernate','stop','vm_rollback'))",
         [&expected.instance_id], |row| row.get(0))?;
-    if changing {
+    if changing
+        || crate::managed_fork::source_is_pivoting(tx, route, &expected.instance_id, incarnation)?
+    {
         return Ok(false);
     }
     let boot: String = tx.query_row("SELECT host_boot_id FROM worker_state", [], |row| {
@@ -177,7 +179,7 @@ pub(crate) fn mutate(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> 
                     if policy.permits_wake(trigger) {
                         "wake"
                     } else if matches!(trigger, "api_access" | "service_access")
-                        && running_access(tx, expected)?
+                        && running_access(tx, r.scope()?.0, expected)?
                     {
                         "hold"
                     } else {
@@ -187,7 +189,7 @@ pub(crate) fn mutate(tx: &Transaction<'_>, r: &Request, expected: &Expected) -> 
                         ));
                     }
                 }
-                _ if running_access(tx, expected)? => "hold",
+                _ if running_access(tx, r.scope()?.0, expected)? => "hold",
                 _ => return Err(conflict("offline access requires a wake demand")),
             };
             if kind != "wake" {

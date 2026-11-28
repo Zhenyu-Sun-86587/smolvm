@@ -836,6 +836,17 @@ impl Worker {
                     ));
                 }
                 let execution = self.scoped_execution(request)?;
+                if crate::managed_fork::source_is_pivoting(
+                    &self.catalog.db,
+                    &execution.route_id,
+                    &execution.instance_id,
+                    &execution.incarnation_id,
+                )? {
+                    return Err(Fault::new(
+                        "E_STATE_CONFLICT",
+                        "Guest management requires a running execution",
+                    ));
+                }
                 let endpoint = crate::native_control::Endpoint::load(
                     &self.catalog.db,
                     &execution.incarnation_id,
