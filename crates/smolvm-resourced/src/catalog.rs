@@ -459,6 +459,7 @@ impl Catalog {
         tx.execute_batch(include_str!("schema_saved_files.sql"))?;
         tx.execute_batch(include_str!("schema_bucket_bases.sql"))?;
         tx.execute_batch(include_str!("schema_bucket_online.sql"))?;
+        tx.execute_batch(include_str!("schema_disk_backup.sql"))?;
         tx.execute_batch(include_str!("schema_machine_migration.sql"))?;
         tx.execute_batch(include_str!("schema_migration_product_volumes.sql"))?;
         if version < 37 {
@@ -586,7 +587,7 @@ impl Catalog {
              )
              SELECT EXISTS (SELECT 1 FROM executions WHERE phase='unknown')
                 OR EXISTS (SELECT 1 FROM operations o WHERE o.phase='NEW'
-                           AND o.kind!='disk_closure_import'
+                           AND o.kind NOT IN ('disk_closure_import','disk_backup')
                            AND NOT EXISTS (SELECT 1 FROM replayable_operations p WHERE p.operation_id=o.operation_id))
                 OR EXISTS (SELECT 1 FROM writer_reservations r LEFT JOIN writer_grants g USING(operation_id)
                     WHERE g.grant_id IS NULL OR g.state!='attached')

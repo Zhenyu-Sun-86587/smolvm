@@ -662,6 +662,12 @@ impl Worker {
                     self.bucket.configure(&self.catalog, request, self.admin_uid)
                 }
             }
+            "DiskBackup" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new("E_PERMISSION_DENIED", "disk backup requires the Worker administrator"));
+                }
+                crate::disk_backup::apply(&mut self.catalog, &self.objects, request)
+            }
             "PrepareSavedFiles" | "ReadSavedFiles" => {
                 if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
                     return Err(Fault::new("E_PERMISSION_DENIED", "saved files require the Worker administrator"));
