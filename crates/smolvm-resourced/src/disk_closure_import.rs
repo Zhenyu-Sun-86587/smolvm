@@ -9,10 +9,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fs::{File, Permissions};
+use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Read, Seek, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 
 pub(crate) const KIND: &str = "disk_closure_import";
 
@@ -59,13 +60,14 @@ fn bundle<'a>(catalog: &Catalog, request: &'a Request) -> Result<(&'a str, Strin
 fn ordered_blocks<'a>(
     manifest: &'a Manifest,
     generations: &[String],
+    migration: bool,
 ) -> Result<Vec<&'a BlockSpec>> {
     let mut ordered = Vec::new();
     let mut visited = std::collections::BTreeMap::new();
     if manifest.generations != generations
-        || !manifest.captures.is_empty()
+        || (if migration {manifest.captures.len() != 1} else {!manifest.captures.is_empty()})
         || manifest.blocks.len() > backup_closure::MAX_CLOSURE
-        || manifest.members.len() != manifest.blocks.len()
+        || (!migration && manifest.members.len() != manifest.blocks.len())
         || manifest.block_digests.len() != manifest.blocks.len()
     {
         return Err(invalid("expected an exact disk-only closure"));
@@ -192,6 +194,34 @@ pub(crate) fn import(
     request: &Request,
     descriptors: Vec<OwnedFd>,
 ) -> Result<Value> {
+    import_closure(catalog, objects, request, descriptors, None)
+}
+
+pub(crate) struct MigrationCapture<'a> {
+    pub points: &'a Path,
+    pub capture_id: &'a str,
+    pub operation_id: &'a str,
+    pub manifest_digest: &'a str,
+    pub source: &'a crate::ipc::Expected,
+}
+
+pub(crate) fn import_migration(
+    catalog: &mut Catalog,
+    objects: &File,
+    request: &Request,
+    descriptors: Vec<OwnedFd>,
+    capture: MigrationCapture<'_>,
+) -> Result<Value> {
+    import_closure(catalog, objects, request, descriptors, Some(capture))
+}
+
+fn import_closure(
+    catalog: &mut Catalog,
+    objects: &File,
+    request: &Request,
+    descriptors: Vec<OwnedFd>,
+    migration: Option<MigrationCapture<'_>>,
+) -> Result<Value> {
     let (bundle, executable) = bundle(catalog, request)?;
     let input: Import = request.payload()?;
     let generation_set: BTreeSet<_> = input.generation_ids.iter().collect();
@@ -214,7 +244,7 @@ pub(crate) fn import(
         .strip_prefix("sha256:")
         .ok_or_else(|| invalid("invalid registered Worker hash"))?;
     let handshake =
-        smolvm_runtime_protocol::handshake(input.bundle_manifest, executable).map_err(invalid)?;
+        smolvm_runtime_protocol::handshake(input.bundle_manifest.clone(), executable).map_err(invalid)?;
     if handshake.bundle_digest != bundle || handshake.state_reader_id != input.state_reader_id {
         return Err(Fault::new(
             "E_BUNDLE_UNAVAILABLE",
@@ -244,7 +274,17 @@ pub(crate) fn import(
         &input.state_reader_id,
     )
     .map_err(invalid)?;
-    let layers = ordered_blocks(&manifest, &input.generation_ids)?;
+    let layers = ordered_blocks(&manifest, &input.generation_ids, migration.is_some())?;
+    if let Some(capture) = &migration {
+        let archived = &manifest.captures[0];
+        if archived.commit_id != capture.operation_id || archived.manifest_digest != capture.manifest_digest
+            || archived.point.capture_id != capture.capture_id
+            || Some(&archived.point.incarnation_id) != capture.source.incarnation_id.as_ref()
+            || archived.point.execution_epoch != capture.source.execution_epoch
+            || archived.point.disk_generations != input.generation_ids {
+            return Err(invalid("archive does not carry the ticket's final held StatePoint"));
+        }
+    }
     match catalog.operation(&op) {
         Ok(previous)
             if previous.kind != KIND
@@ -260,7 +300,8 @@ pub(crate) fn import(
             let count: i64 = catalog.db.query_row(
                 "SELECT COUNT(*) FROM root_refs WHERE owner_kind=? AND owner_id=? AND state='active'",
                 params![KIND, input.import_id], |row| row.get(0))?;
-            if count != input.generation_ids.len() as i64 {
+            let expected_count = input.generation_ids.len() + usize::from(migration.is_some());
+            if count != expected_count as i64 {
                 return Err(conflict("disk closure import was released"));
             }
             return Ok(result);
@@ -349,9 +390,10 @@ pub(crate) fn import(
         };
         prepared.push(object);
     }
-    let tx = catalog
-        .db
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(capture) = &migration {
+        publish_capture(&directory, &input, &manifest, capture.points, bundle)?;
+    }
+    let tx = catalog.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for object in &prepared {
         blocks::publish_block_record(&tx, &op, object)?;
     }
@@ -361,12 +403,68 @@ pub(crate) fn import(
             params![KIND, input.import_id, id, op],
         )?;
     }
+    if migration.is_some() {
+        let item = &manifest.captures[0];
+        crate::backup_import::capture(&tx, &manifest, item)?;
+        // The captured frame is a migration staging root, owned by this attempt.
+        tx.execute("DELETE FROM root_refs WHERE owner_kind='backup_import' AND owner_id=? AND resource_id=?",
+            params![manifest.backup_id,item.point.representation_id])?;
+        tx.execute("INSERT INTO root_refs VALUES(?,?,?,'active',1,?)",
+            params![KIND,input.import_id,item.point.representation_id,op])?;
+    }
     tx.execute(
         "UPDATE operations SET phase='COMPLETED',revision=revision+1 WHERE operation_id=?",
         [&op],
     )?;
     tx.commit()?;
     Ok(result)
+}
+
+fn publish_capture(
+    directory: &File, input: &Import, manifest: &Manifest, points: &Path, bundle: &str,
+) -> Result<()> {
+    let item = &manifest.captures[0];
+    let representation = &item.point.representation_id;
+    let prefix = format!("statepoints/{representation}/");
+    let stage = tempfile::Builder::new().prefix(".migrate-point-").tempdir_in(points).map_err(invalid)?;
+    let destination = points.join(representation);
+    if !destination.exists() {
+        for (member, bytes) in manifest.members.iter().filter(|(name, _)| !name.starts_with("blocks/")) {
+            let path = member.strip_prefix(&prefix).ok_or_else(|| invalid("unexpected migration StatePoint member"))?;
+            if path.is_empty() || path.split('/').any(|part| !valid_id(part)) {
+                return Err(invalid("invalid migration StatePoint member path"));
+            }
+            let target = stage.path().join(representation).join(path);
+            fs::create_dir_all(target.parent().ok_or_else(|| invalid("missing StatePoint member directory"))?).map_err(invalid)?;
+            let output = OpenOptions::new().write(true).create_new(true).mode(0o400).open(target).map_err(invalid)?;
+            let source = backup_closure::open_member(directory, member).map_err(invalid)?;
+            if source.metadata().map_err(invalid)?.len() != *bytes {
+                return Err(invalid("StatePoint member length changed"));
+            }
+            // The StatePoint reader verifies the manifest, exact chunk digests,
+            // checkpoint, RAM, and immutable disk hashes before catalog publication.
+            let mut source = source.take(bytes.saturating_add(1));
+            if io::copy(&mut source, &mut &output).map_err(invalid)? != *bytes {
+                return Err(invalid("StatePoint member changed during transfer"));
+            }
+            output.sync_all().map_err(invalid)?;
+        }
+    }
+    let existing = destination.exists();
+    let root = if existing {points} else {stage.path()};
+    let stored = crate::statepoint_store::read(root, &item.point, bundle, &item.commit_id).map_err(invalid)?;
+    if stored.digest().map_err(invalid)? != item.manifest_digest {
+        return Err(invalid("imported capture does not match the final StatePoint digest"));
+    }
+    let disks = backup_closure::disk_set(directory, &manifest.blocks, &input.generation_ids).map_err(invalid)?;
+    crate::statepoint_store::materialize_in(root, &stored, disks, stage.path()).map_err(invalid)?;
+    if !existing {
+        let from = stage.path().join(representation);
+        backup_closure::sync_directories(&from).map_err(invalid)?;
+        fs::rename(from, &destination).map_err(invalid)?;
+        File::open(points).and_then(|file| file.sync_all()).map_err(invalid)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn release(catalog: &mut Catalog, objects: &File, request: &Request) -> Result<Value> {

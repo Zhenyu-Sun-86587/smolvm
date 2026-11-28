@@ -38,6 +38,7 @@ mod kernel_mm_anchor;
 mod kernel_mm_anchor_process;
 #[cfg(target_os = "linux")]
 pub mod managed;
+mod machine_migration;
 #[cfg(target_os = "linux")]
 mod managed_fork;
 #[cfg(target_os = "linux")]

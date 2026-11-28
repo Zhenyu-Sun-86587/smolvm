@@ -181,11 +181,11 @@ struct Permit {
     kernel_import: Option<crate::managed_kernel_cow::Import>,
 }
 
-struct Worker {
-    catalog: Catalog,
+pub(crate) struct Worker {
+    pub(crate) catalog: Catalog,
     last_gc_row: i64,
-    objects: File,
-    boot: String,
+    pub(crate) objects: File,
+    pub(crate) boot: String,
     admin_uid: u32,
     native_signal: std::sync::mpsc::SyncSender<()>,
     permits: HashMap<String, Permit>,
@@ -194,7 +194,7 @@ struct Worker {
     escrow: Escrow,
     network: crate::network_runtime::NetworkRuntime,
     activation: ActivationRuntime,
-    statepoints: StatePoints,
+    pub(crate) statepoints: StatePoints,
     forks: crate::managed_fork::Actor,
     lifecycle:crate::lifecycle_controller::Controller,
     resize: crate::resource_resize::Controller,
@@ -617,6 +617,7 @@ impl Worker {
                 | "ReconcileExecutionExports"
                 | "ImportImmutableBlock"
                 | "ImportImmutableClosure"
+                | "MachineMigrationStep"
                 | "ReconcileWriterSet"
                 | "CommitWriterPivot"
                 | "FinalizeWriterPivot"
@@ -630,6 +631,12 @@ impl Worker {
             ));
         }
         let result = match request.method.as_str() {
+            "MachineMigrationStep" => {
+                if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
+                    return Err(Fault::new("E_PERMISSION_DENIED", "migration requires the Worker administrator"));
+                }
+                self.machine_migration(request, descriptors)
+            }
             "ImportImmutableClosure" => {
                 if peer.uid != self.admin_uid && peer.uid != unsafe { libc::geteuid() } {
                     return Err(Fault::new("E_PERMISSION_DENIED", "disk closure import requires the Worker administrator"));
@@ -1181,8 +1188,10 @@ impl Worker {
                     result => result,
                 }
             }
-            "StopCommit" => self.stop_statepoint(request),
-            "AbortStatePoint" => self.abort_statepoint(request),
+            "StopCommit" | "AbortStatePoint" => {
+                crate::machine_migration::reject_source_command(&self.catalog, request.operation()?.0)?;
+                if request.method=="StopCommit" {self.stop_statepoint(request)} else {self.abort_statepoint(request)}
+            },
             "ProgressManagedForkTarget" => {
                 let execution = self.scoped_execution(request)?;
                 self.verify_live_execution(&execution)?;
@@ -1211,7 +1220,8 @@ impl Worker {
                             ),
                         )?
                     }
-                    "identity_ready" if crate::network_transfer::awaiting_owner(&self.catalog, &op.operation_id)? => record,
+                    "identity_ready" if crate::network_transfer::awaiting_owner(&self.catalog, &op.operation_id)?
+                        || crate::machine_migration::requires_owner(&self.catalog,&op.operation_id)? => record,
                     "identity_ready" => self.activation.commit(
                         &self.catalog,
                         &self.network,
@@ -1323,6 +1333,7 @@ impl Worker {
             "RetryManagedFork" => Ok(json!(crate::managed_fork::retry(&mut self.catalog,request,request.payload()?)?)),
             "CancelNativeOperation" => {
                 let op=self.catalog.matching_operation(request)?;
+                crate::machine_migration::reject_source_command(&self.catalog,&op.operation_id)?;
                 if matches!(op.kind.as_str(),"independent_fork"|"fork_batch"|"hibernate"|"vm_rollback"|"vm_snapshot") {
                     return Ok(json!(crate::managed_fork::cancel(&mut self.catalog, request, request.payload()?)?));
                 }
@@ -1838,7 +1849,7 @@ impl Worker {
         )
     }
 
-    fn scoped_execution(&self, r: &Request) -> Result<Execution> {
+    pub(crate) fn scoped_execution(&self, r: &Request) -> Result<Execution> {
         let (route, bundle, expected) = r.scope()?;
         let id = expected
             .incarnation_id
@@ -1890,7 +1901,7 @@ impl Worker {
         Ok(())
     }
 
-    fn verify_live_execution(&self, execution: &Execution) -> Result<()> {
+    pub(crate) fn verify_live_execution(&self, execution: &Execution) -> Result<()> {
         Self::verify_live_execution_at(&self.catalog, &self.boot, &self.executions, execution)
     }
 
@@ -1965,7 +1976,7 @@ impl Worker {
         recorded_process_exited(execution.pid, execution.pid_start_time).map_err(broker_error)
     }
 
-    fn finalize_scoped_execution(&mut self, execution: Execution) -> Result<Value> {
+    pub(crate) fn finalize_scoped_execution(&mut self, execution: Execution) -> Result<Value> {
         if execution.phase == "exited" {
             return Ok(json!(execution));
         }
@@ -2107,7 +2118,7 @@ impl Worker {
         }))
     }
 
-    fn stop_vmm(&mut self, source: &Execution) -> Result<bool> {
+    pub(crate) fn stop_vmm(&mut self, source: &Execution) -> Result<bool> {
         if source.host_boot_id == self.boot && source.phase != "exited" {
             if let Some(pidfd) = self.executions.get(&source.incarnation_id) {
                 if !pid_exited(pidfd).map_err(broker_error)? {
@@ -2153,7 +2164,7 @@ impl Worker {
         Ok(true)
     }
 
-    fn drive_statepoint_stop(&mut self, record: StatePoint) -> Result<StatePoint> {
+    pub(crate) fn drive_statepoint_stop(&mut self, record: StatePoint) -> Result<StatePoint> {
         let source = self.catalog.execution(&record.point.incarnation_id)?;
         if !self.stop_vmm(&source)? {
             return Ok(record);

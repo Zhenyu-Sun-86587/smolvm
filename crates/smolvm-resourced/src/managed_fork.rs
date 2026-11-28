@@ -440,7 +440,7 @@ pub(crate) fn submit(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Control {
-    expected_revision: i64,
+    pub(crate) expected_revision: i64,
 }
 
 fn control_scope(c: &Catalog, r: &Request) -> Result<Operation> {

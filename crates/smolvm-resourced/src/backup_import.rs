@@ -152,7 +152,7 @@ fn descriptor(
 
 /// Archival origin rows are historical and cannot authorize any live VMM.
 /// Only a separately created new target may claim the imported StatePoint.
-fn capture(tx: &Transaction<'_>, manifest: &Manifest, item: &Capture) -> Result<()> {
+pub(crate) fn capture(tx: &Transaction<'_>, manifest: &Manifest, item: &Capture) -> Result<()> {
     let point = &item.point;
     let origin = item
         .origin

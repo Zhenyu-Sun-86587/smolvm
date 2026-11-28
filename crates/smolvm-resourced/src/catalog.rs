@@ -698,6 +698,7 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::machine_migration::guard_operation(&tx,route,&expected.instance_id,id)?;
         let (epoch, incarnation, active) = binding(&tx, route, &expected.instance_id)?;
         if epoch != expected.execution_epoch || incarnation != expected.incarnation_id {
             return Err(stale());
@@ -934,6 +935,7 @@ impl Catalog {
     }
 
     pub fn verify_launch(&self, operation: &Operation, expected: &Expected) -> Result<()> {
+        crate::machine_migration::permit_target_process(self, operation)?;
         self.ready()?;
         let (epoch, incarnation, active) =
             binding(&self.db, &operation.route_id, &operation.instance_id)?;

@@ -499,6 +499,8 @@ pub(crate) fn pending(c: &Catalog, serve: &str, bundle: &str) -> Result<Vec<Plan
     let mut q = c.db.prepare(
         "SELECT m.operation_id FROM managed_launches m JOIN operations o USING(operation_id)
         WHERE m.serve_instance=? AND o.bundle_digest=? AND o.phase='NEW'
+          AND NOT EXISTS (SELECT 1 FROM machine_migrations mm WHERE mm.native_operation_id=o.operation_id
+            AND (mm.state IN ('aborting','aborted') OR (o.kind='launch' AND mm.decision_json IS NULL)))
           AND ((SELECT NOT recovering FROM worker_state) OR EXISTS (
               SELECT 1 FROM executions e WHERE e.incarnation_id=m.incarnation_id
                 AND e.last_operation_id=o.operation_id AND e.instance_id=o.instance_id
