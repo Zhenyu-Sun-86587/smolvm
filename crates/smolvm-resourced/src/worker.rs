@@ -49,6 +49,9 @@ enum Command {
         /// Read the operator's optional PrivateNetworkPeering/1 JSON policy.
         #[arg(long)]
         private_network_peering_config: Option<PathBuf>,
+        /// Enable the explicitly configured Worker overlay in its isolated namespace.
+        #[arg(long)]
+        private_network_overlay_config: Option<PathBuf>,
     },
     Call {
         #[arg(long)]
@@ -1044,6 +1047,15 @@ impl Worker {
                     .ok_or_else(|| Fault::invalid("Kernel CoW probe requires a bundle identity"))?;
                 Ok(crate::managed_kernel_cow::capability(bundle))
             }
+            "QueryOverlayStatus" => self.network.overlay().status(&self.catalog, request.payload()?),
+            "ApplyOverlayRoutes" => self.network.apply_overlay_routes(&self.catalog, request.payload()?),
+            "FenceOverlayTransfer" => {
+                let execution = self.scoped_execution(request)?;
+                let proof = crate::network_transfer::fence_source(
+                    &self.catalog, &execution, &mut self.network, request.payload()?,
+                )?;
+                Ok(json!(proof))
+            }
             "QueryPrivateNetworkPeering" => {
                 self.catalog.ready()?;
                 self.network.peering_status(request)
@@ -1283,7 +1295,7 @@ impl Worker {
             }
             "ReserveNetworkAttachment" => Ok(json!(self
                 .catalog
-                .reserve_network(request, &request.payload()?)?)),
+                .reserve_network_with_overlay(request, &request.payload()?, self.network.overlay())?)),
             "QueryNetworkReservation" => Ok(json!(self
                 .catalog
                 .get_network_reservation(request, &request.payload()?)?)),
@@ -1361,7 +1373,7 @@ impl Worker {
                     .expect("network attachment ID");
                 let dns = format!("{}.private", crate::managed::key(&op.instance_id, "vm", 0));
                 self.catalog
-                    .reserve_managed_network(request, &attachment_id, &dns, network)?;
+                    .reserve_managed_network(request, &attachment_id, &dns, network, self.network.overlay())?;
                 let fixed = network.fixed_route();
                 let prepare = request.derived(
                     "PrepareNetworkAttachment",
@@ -2724,6 +2736,7 @@ fn serve(
     socket_gid: Option<u32>,
     admin_uid: Option<u32>,
     private_network_peering_config: Option<PathBuf>,
+    private_network_overlay_config: Option<PathBuf>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     crate::worker_scope::configured_slice()?;
     check_socket_parent(socket_path)?;
@@ -2765,13 +2778,15 @@ fn serve(
         network: crate::network_runtime::NetworkRuntime::new(
             network_namespaces,
             private_network_peering_config,
-        ),
+            private_network_overlay_config.as_deref(),
+        )?,
         activation: ActivationRuntime::default(),
         statepoints: StatePoints::new(statepoints),
         forks: Default::default(),
         lifecycle: Default::default(),
         resize: Default::default(),
     };
+    worker.network.overlay().configure_catalog(&worker.catalog)?;
     worker
         .network
         .cleanup_namespace_pins(&worker.catalog)
@@ -2932,12 +2947,14 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             socket_gid,
             admin_uid,
             private_network_peering_config,
+            private_network_overlay_config,
         } => serve(
             &state_dir,
             &socket,
             socket_gid,
             admin_uid,
             private_network_peering_config,
+            private_network_overlay_config,
         ),
         Command::RecoverBackupClosure {archive,manifest_digest,bundle_digest,state_reader_id,output,bundle_manifest,executable_sha256} => {
             let registered_bundle=bundle_manifest.as_deref().zip(executable_sha256.as_deref());
