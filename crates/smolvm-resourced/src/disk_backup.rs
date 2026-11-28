@@ -47,6 +47,7 @@ struct Slot {
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct Selection {
     slot: Slot,
+    product_revision: Option<i64>,
     top: String,
     backing_identity: String,
 }
@@ -334,16 +335,20 @@ fn stopped_selection(catalog: &Catalog, attempt: &Attempt<'_>) -> Result<Vec<Sel
     for device in plan.devices {
         let disk = device.disk;
         let is_root = disk.role == "root" && disk.device_id == "root" && !disk.read_only;
-        let product: Option<Product> = catalog.db.query_row(
-            "SELECT v.owner_id,a.revision,a.generation_id FROM product_volume_attachments a JOIN product_volumes v USING(volume_id)
+        let product: Option<(Product, i64)> = catalog.db.query_row(
+            "SELECT v.owner_id,a.revision,a.generation_id,v.revision FROM product_volume_attachments a JOIN product_volumes v USING(volume_id)
              WHERE a.volume_id=? AND a.attachment_id=? AND a.instance_id=? AND a.device_key=?
                AND a.state='reserved' AND a.mode=? AND a.capture_policy='include'
                AND v.state='available' AND v.route_id=? AND v.bundle_digest=?
                AND NOT EXISTS(SELECT 1 FROM product_volume_operations p WHERE p.volume_id=v.volume_id AND p.result_json IS NULL)",
             params![device.volume_id, disk.attachment_id, expected.instance_id, disk.device_id,
                 if disk.read_only { "ro" } else { "rw" }, route, bundle],
-            |r| Ok(Product { owner_id: r.get(0)?, attachment_revision: r.get(1)?, generation_id: r.get(2)? }),
+            |r| Ok((Product { owner_id: r.get(0)?, attachment_revision: r.get(1)?, generation_id: r.get(2)? }, r.get(3)?)),
         ).optional()?;
+        let (product, product_revision) = match product {
+            Some((product, revision)) => (Some(product), Some(revision)),
+            None => (None, None),
+        };
         if !is_root && (disk.role != "data" || product.is_none()) {
             return Err(fenced(
                 "a disk is not the original reserved, included product volume",
@@ -379,6 +384,7 @@ fn stopped_selection(catalog: &Catalog, attempt: &Attempt<'_>) -> Result<Vec<Sel
             return Err(fenced("current disk mode does not match the stopped slot"));
         }
         if !disk.read_only {
+            catalog.require_unsealed_head(&top)?;
             let head = VolumeHead {
                 volume_id: device.volume_id.clone(),
                 head_resource_id: top.clone(),
@@ -406,6 +412,7 @@ fn stopped_selection(catalog: &Catalog, attempt: &Attempt<'_>) -> Result<Vec<Sel
                 capacity_bytes: current.spec.capacity_bytes,
                 product,
             },
+            product_revision,
             top,
             backing_identity: current.backing_identity.clone(),
         });
@@ -623,10 +630,11 @@ fn prepare_restore(
                 json!({"volume_id": current.slot.volume_id, "owner_id": product.owner_id}),
             );
             let mut observed = product_volumes::query(catalog, &query)?;
-            let revision = observed["revision"]
-                .as_i64()
+            let revision = current
+                .product_revision
+                .filter(|value| Some(*value) == observed["revision"].as_i64())
                 .and_then(|value| value.checked_add(1))
-                .ok_or_else(|| bad_catalog("product volume has no valid current revision"))?;
+                .ok_or_else(|| fenced("product volume revision changed during disk restore"))?;
             if observed["state"] != "available" || observed["head_resource_id"] != current.top {
                 return Err(fenced(
                     "product volume no longer describes the stopped writer",
@@ -678,6 +686,9 @@ impl Publish {
                 "stopped slot no longer grants the disk backup attempt writer authority",
             ));
         }
+        for selected in selection {
+            verify_product_scope(&tx, route, bundle, &expected.instance_id, selected)?;
+        }
         for replacement in &self.staged {
             blocks::publish_block_record(&tx, native_id, replacement)?;
         }
@@ -724,12 +735,50 @@ impl Publish {
                         "one of the original disk writers changed before the whole-set replacement",
                     ));
                 }
+                if let Some(revision) = old.product_revision {
+                    let next: i64 = tx.query_row(
+                        "SELECT revision FROM product_volumes WHERE volume_id=?",
+                        [&old.slot.volume_id],
+                        |r| r.get(0),
+                    )?;
+                    if revision.checked_add(1) != Some(next) {
+                        return Err(bad_catalog(
+                            "changing a product writer did not advance the volume revision",
+                        ));
+                    }
+                }
             }
         }
         settle(&tx, attempt, &receipt, false)?;
         tx.commit()?;
         Ok(receipt)
     }
+}
+
+fn verify_product_scope(
+    tx: &Transaction<'_>,
+    route: &str,
+    bundle: &str,
+    instance: &str,
+    selected: &Selection,
+) -> Result<()> {
+    let slot = &selected.slot;
+    if let (Some(product), Some(revision)) = (&slot.product, selected.product_revision) {
+        let matches: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM product_volume_attachments a JOIN product_volumes v USING(volume_id)
+            WHERE a.volume_id=? AND a.attachment_id=? AND a.instance_id=? AND a.device_key=? AND a.revision=?
+              AND a.mode=? AND a.generation_id IS ? AND a.state='reserved' AND a.capture_policy='include'
+              AND v.owner_id=? AND v.revision=? AND v.route_id=? AND v.bundle_digest=? AND v.state='available'
+              AND NOT EXISTS(SELECT 1 FROM product_volume_operations p WHERE p.volume_id=v.volume_id AND p.result_json IS NULL))",
+            params![slot.volume_id, slot.attachment_id, instance, slot.device_id, product.attachment_revision,
+                if slot.read_only { "ro" } else { "rw" }, product.generation_id, product.owner_id, revision, route, bundle],
+            |r| r.get(0))?;
+        if !matches {
+            return Err(fenced(
+                "product volume ownership or attachment changed during disk backup",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn settle(
