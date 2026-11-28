@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Volume {
     volume_id: String,
@@ -160,15 +160,12 @@ fn insert(tx: &Transaction<'_>, migration: &str, volume: &Volume) -> Result<()> 
 pub(crate) fn reserve_source(catalog: &Catalog, migration: &str, volumes: &[Volume]) -> Result<()> {
     let tx = catalog.db.unchecked_transaction()?;
     let existing = read(&tx, migration)?;
-    if !existing.is_empty() && existing != volumes {
-        return Err(invalid(
-            "source product volume selection changed after reservation",
-        ));
-    }
     if existing.is_empty() {
         for volume in volumes {
             insert(&tx, migration, volume)?;
         }
+    } else {
+        check_selection(&existing, volumes)?;
     }
     tx.commit()?;
     Ok(())
@@ -176,27 +173,55 @@ pub(crate) fn reserve_source(catalog: &Catalog, migration: &str, volumes: &[Volu
 
 pub(crate) fn check_held(catalog: &Catalog, migration: &str, volumes: &[Volume]) -> Result<()> {
     let reserved = read(&catalog.db, migration)?;
+    check_selection(&reserved, volumes)
+}
+
+fn check_selection(reserved: &[Volume], volumes: &[Volume]) -> Result<()> {
     if reserved.len() != volumes.len() {
         return Err(invalid(
             "held product volume selection differs from the source reservation",
         ));
     }
     for (before, after) in reserved.iter().zip(volumes) {
-        if before.volume_id != after.volume_id
-            || before.owner_id != after.owner_id
-            || before.attachment_id != after.attachment_id
-            || before.device_key != after.device_key
-            || before.fork_policy != after.fork_policy
-            || before.capacity_bytes != after.capacity_bytes
-            || before.attachment_revision != after.attachment_revision
-            || before.revision > after.revision
-        {
+        // The authorized WriterPivot advances the volume revision as it
+        // replaces the source head. All product topology stays fixed.
+        let mut identity = after.clone();
+        identity.revision = before.revision;
+        if &identity != before || before.revision > after.revision {
             return Err(invalid(
                 "held product volume metadata changed outside the capture",
             ));
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn held_writer_pivot_can_advance_only_the_volume_revision() {
+        let original = Volume {
+            volume_id: "volume".into(),
+            owner_id: "owner".into(),
+            revision: 2,
+            attachment_id: "attachment".into(),
+            attachment_revision: 1,
+            device_key: "slot".into(),
+            fork_policy: "clone".into(),
+            capacity_bytes: 32 << 20,
+        };
+        let before = [original.clone()];
+        let mut observed = [original];
+        observed[0].revision = 3;
+        assert!(check_selection(&before, &observed).is_ok());
+        observed[0].attachment_revision = 2;
+        assert!(check_selection(&before, &observed).is_err());
+        observed[0].attachment_revision = 1;
+        observed[0].revision = 1;
+        assert!(check_selection(&before, &observed).is_err());
+    }
 }
 
 pub(crate) fn install_target(
