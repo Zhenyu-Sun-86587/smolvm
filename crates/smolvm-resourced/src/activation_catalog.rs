@@ -715,7 +715,16 @@ fn network_binding(
                     "source and target TAP leases do not match the activation placement",
                 ));
             }
-            if input.source_attachment_id == input.target_attachment_id {
+            if let Some(transfer) = crate::machine_migration::live_network_transfer(
+                catalog, &execution.last_operation_id, new,
+            )? {
+                if !has_attestation || !crate::network_transfer::source_descriptor(&old.attachment, &transfer)
+                    || old.lease_revision != transfer.attachment_revision || old.lease_id == new.lease_id
+                    || !crate::network_transfer::target_descriptor(&transfer, &new.attachment)
+                {
+                    return Err(tap_fence("migration TAP differs from the captured stable identity"));
+                }
+            } else if input.source_attachment_id == input.target_attachment_id {
                 if !has_attestation || !stable_network_rebind(catalog, resource, source, &old, new, execution)? {
                     return Err(tap_fence("stable network identity requires a fenced StatePoint predecessor"));
                 }

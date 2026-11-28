@@ -387,10 +387,17 @@ impl Catalog {
         let allocation = overlay.allocation().filter(|pool| pool.network_id == data.network_id);
         let operation = self.matching_operation(request)?;
         verify_epoch(request, &operation)?;
-        if data.preferred_private_ipv4.is_some() != data.transfer_id.is_some()
-            || data.transfer_id.as_ref().is_some_and(|id| !valid_id(id) || operation.kind != "restore_target")
-        {
+        if data.preferred_private_ipv4.is_some() != data.transfer_id.is_some() {
             return Err(Fault::invalid("stable address reservation requires a designated transfer target"));
+        }
+        if let Some(id) = &data.transfer_id {
+            if !valid_id(id)
+                || (operation.kind != "restore_target"
+                    && (operation.kind != "launch"
+                        || !crate::machine_migration::cold_target(&self.db, &operation.operation_id, id)?))
+            {
+                return Err(Fault::invalid("stable address reservation requires a designated transfer target"));
+            }
         }
         if !valid_id(&data.attachment_id)
             || !valid_id(&data.network_id)
