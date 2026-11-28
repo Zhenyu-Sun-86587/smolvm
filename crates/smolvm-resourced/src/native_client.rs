@@ -396,6 +396,17 @@ impl Client<'_> {
             &input.request_digest, &input.expected, json!({"machine":input.parameters,"environment":attempt})))
             .map_err(boot_environment_error)
     }
+    pub fn query_migration_boot_environment(
+        &self,
+        operation: &str,
+        digest: &str,
+        expected: &ExecutionRef,
+        attempt: &crate::boot_environment::Attempt,
+    ) -> Result<OperationReceipt, QueryError> {
+        self.receipt("QueryMigrationBootEnvironment", operation, digest, expected, json!(attempt))
+            .map_err(boot_environment_error)
+    }
+
     pub fn acknowledge_boot_environment(&self, launch: &Launch, revision: crate::boot_environment::Revision) -> Result<(), QueryError> {
         let reply: Value = self.call("AckBootEnvironment", Some(&launch.execution),
             Some((&launch.operation_id, &launch.request_digest)), json!(revision))?;

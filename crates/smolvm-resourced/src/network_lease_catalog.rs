@@ -93,6 +93,8 @@ fn read(db: &Connection, id: &str) -> Result<Option<TapLease>> {
                 host_boot_id,broker_session_id,state,revision,descriptor_json,
                 CASE
                   WHEN state='unknown' THEN 'unknown'
+                  WHEN EXISTS (SELECT 1 FROM machine_migration_source_taps f
+                    WHERE f.lease_id=network_tap_leases.lease_id AND f.phase<>'reopened') THEN 'closed'
                   WHEN state='attached' THEN COALESCE((
                     SELECT CASE a.phase WHEN 'policy_armed' THEN 'armed' WHEN 'released' THEN 'open' WHEN 'unknown' THEN 'unknown' ELSE 'closed' END
                     FROM target_activations a
@@ -434,6 +436,8 @@ fn published_lease_can_recover(db: &Connection, lease: &TapLease) -> Result<bool
              AND t.host_boot_id=w.host_boot_id AND t.host_boot_id=e.host_boot_id AND e.phase='registered'
              AND e.route_id=t.route_id AND e.bundle_digest=t.bundle_digest AND e.instance_id=t.instance_id
              AND e.execution_epoch=t.execution_epoch AND e.last_operation_id=t.operation_id
+             AND NOT EXISTS (SELECT 1 FROM machine_migration_source_taps f
+               WHERE f.lease_id=t.lease_id AND f.phase<>'reopened')
              AND op.phase='COMPLETED' AND op.decision='NONE'
              AND ((op.kind='launch' AND EXISTS (SELECT 1 FROM initial_network_activations i
                   WHERE i.lease_id=t.lease_id AND i.phase='open'))

@@ -521,6 +521,8 @@ impl NetworkRuntime {
     ) -> Result<TapLease> {
         let data: Acknowledge = request.payload()?;
         let operation = catalog.matching_operation(request)?;
+        crate::machine_migration::permit_target_activation(catalog, &operation.operation_id)?;
+        crate::network_transfer::permit_activation(catalog, &operation.operation_id)?;
         if operation.kind != "launch" || operation.operation_id != execution.last_operation_id {
             return Err(Fault::invalid(
                 "only a cold execution uses initial network activation",
@@ -542,6 +544,7 @@ impl NetworkRuntime {
         if lease.state != "attached" {
             return Err(unknown_attachment());
         }
+        crate::network_transfer::permit_initial_migration_publication(catalog, execution, &lease)?;
         if lease.gate == "open" {
             return Ok(lease);
         }
@@ -594,6 +597,30 @@ impl NetworkRuntime {
         self.target_port(binding)?
             .close_identity()
             .map_err(host_error)
+    }
+
+    pub(crate) fn close_migration_source(&self, lease: &TapLease) -> Result<()> {
+        self.ports.get(&lease.attachment.attachment_id)
+            .ok_or_else(unknown_attachment)?
+            .close_identity().map_err(host_error)
+    }
+
+    pub(crate) fn reopen_migration_source(&self, catalog: &Catalog, lease: &TapLease) -> Result<()> {
+        let port = self.ports.get(&lease.attachment.attachment_id).ok_or_else(unknown_attachment)?;
+        let expected = catalog.network_kernel_proof(lease)?.ok_or_else(unknown_attachment)?;
+        let result = (|| {
+            port.arm_identity().map_err(host_error)?;
+            port.publish_identity().map_err(host_error)?;
+            let observed = port.record_kernel_proof(&self.namespaces).map_err(host_error)?;
+            if observed != expected {
+                return Err(unknown_attachment());
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            port.close_identity().map_err(host_error)?;
+        }
+        result
     }
 
     pub(crate) fn dial(

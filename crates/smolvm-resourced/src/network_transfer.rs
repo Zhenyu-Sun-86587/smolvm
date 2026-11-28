@@ -3,8 +3,8 @@
 
 use crate::activation_runtime::{self, ActivationRuntime};
 use crate::catalog::{Catalog, Execution};
-use crate::ipc::{valid_id, Fault, Request, Result};
-use crate::network_lease_catalog::TapLease;
+use crate::ipc::{valid_id, Expected, Fault, Request, Result};
+use crate::network_lease_catalog::{AttachmentDescriptor, TapLease};
 use crate::network_memberships::{self, Membership};
 use crate::network_runtime::NetworkRuntime;
 use rusqlite::{params, OptionalExtension};
@@ -59,7 +59,7 @@ pub(crate) struct FenceInput {
     transfer: Transfer,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SourceFence {
     transfer: Transfer,
@@ -77,6 +77,12 @@ pub(crate) struct SourceFence {
 }
 
 impl SourceFence {
+    pub(crate) fn binds(&self, expected: &Expected) -> bool {
+        self.source_instance_id == expected.instance_id
+            && self.source_execution_epoch == expected.execution_epoch
+            && expected.incarnation_id.as_deref() == Some(&self.source_incarnation_id)
+    }
+
     fn matches(&self, transfer: &Transfer) -> bool {
         &self.transfer == transfer
             && self.migration_id == transfer.migration_id
@@ -101,31 +107,25 @@ pub(crate) fn fence_source(
 ) -> Result<SourceFence> {
     catalog.ready()?;
     let transfer = input.transfer;
-    if transfer.network_mode != "native" || execution.route_id != "deep"
+    if transfer.network_mode != "native"
+        || execution.route_id != "deep"
         || !network.overlay().has_peer(
-            &transfer.route_domain_id, &transfer.source_worker_id, &transfer.target_worker_id,
+            &transfer.route_domain_id,
+            &transfer.source_worker_id,
+            &transfer.target_worker_id,
         )
-        || !valid_id(&transfer.machine_id) || !valid_id(&transfer.migration_id)
-        || transfer.expected_owner_epoch < 1 || transfer.attachment_revision < 1
+        || !valid_id(&transfer.machine_id)
+        || !valid_id(&transfer.migration_id)
+        || transfer.expected_owner_epoch < 1
+        || transfer.attachment_revision < 1
         || transfer.policy_revision < 1
     {
-        return Err(Fault::invalid("source fence requires an explicit native overlay transfer"));
+        return Err(Fault::invalid(
+            "source fence requires an explicit native overlay transfer",
+        ));
     }
 
-    let receipt = SourceFence {
-        transfer: transfer.clone(),
-        migration_id: transfer.migration_id.clone(),
-        machine_id: transfer.machine_id.clone(),
-        source_worker_id: transfer.source_worker_id.clone(),
-        expected_owner_epoch: transfer.expected_owner_epoch,
-        source_execution_epoch: execution.execution_epoch,
-        source_instance_id: execution.instance_id.clone(),
-        source_incarnation_id: execution.incarnation_id.clone(),
-        source_attachment_id: transfer.attachment_id.clone(),
-        source_attachment_revision: transfer.attachment_revision,
-        route_domain_id: transfer.route_domain_id.clone(),
-        private_ipv4: transfer.private_ipv4,
-    };
+    let receipt = source_receipt(execution, &transfer);
 
     // The retired TAP and its prior kernel publication receipt are durable.
     // Retrying after source exit or Worker restart returns the same fence.
@@ -137,10 +137,14 @@ pub(crate) fn fence_source(
         return Err(conflict());
     }
     let lease = catalog.tap_lease(&transfer.attachment_id)?;
-    if !lease.matches(execution) || lease.state != "attached" || lease.gate != "open"
-        || lease.revision != transfer.attachment_revision || !source_descriptor(&lease.attachment, &transfer)
+    if !lease.matches(execution)
+        || lease.state != "attached"
+        || lease.gate != "open"
+        || lease.revision != transfer.attachment_revision
+        || !source_descriptor(&lease.attachment, &transfer)
         || catalog.network_kernel_proof(&lease)?.is_none()
-        || network_memberships::lookup(&catalog.db, &execution.instance_id)?.policy_revision != transfer.policy_revision
+        || network_memberships::lookup(&catalog.db, &execution.instance_id)?.policy_revision
+            != transfer.policy_revision
     {
         return Err(fenced());
     }
@@ -153,6 +157,23 @@ pub(crate) fn fence_source(
     Ok(receipt)
 }
 
+pub(crate) fn source_receipt(execution: &Execution, transfer: &Transfer) -> SourceFence {
+    SourceFence {
+        transfer: transfer.clone(),
+        migration_id: transfer.migration_id.clone(),
+        machine_id: transfer.machine_id.clone(),
+        source_worker_id: transfer.source_worker_id.clone(),
+        expected_owner_epoch: transfer.expected_owner_epoch,
+        source_execution_epoch: execution.execution_epoch,
+        source_instance_id: execution.instance_id.clone(),
+        source_incarnation_id: execution.incarnation_id.clone(),
+        source_attachment_id: transfer.attachment_id.clone(),
+        source_attachment_revision: transfer.attachment_revision,
+        route_domain_id: transfer.route_domain_id.clone(),
+        private_ipv4: transfer.private_ipv4,
+    }
+}
+
 fn save_source_hold(catalog: &Catalog, execution: &Execution, transfer: &Transfer) -> Result<()> {
     // The source slice must retain the stable address across retries, Worker
     // restarts, and withdrawal snapshots. M13 retires the address when the
@@ -162,8 +183,13 @@ fn save_source_hold(catalog: &Catalog, execution: &Execution, transfer: &Transfe
         "INSERT OR IGNORE INTO network_overlay_source_fences
          (migration_id,route_domain_id,private_ipv4,source_incarnation_id,transfer_json)
          VALUES(?1,?2,?3,?4,?5)",
-        params![transfer.migration_id, transfer.route_domain_id, u32::from(transfer.private_ipv4),
-            execution.incarnation_id, encoded],
+        params![
+            transfer.migration_id,
+            transfer.route_domain_id,
+            u32::from(transfer.private_ipv4),
+            execution.incarnation_id,
+            encoded
+        ],
     )?;
     let matches = catalog.db.query_row(
         "SELECT EXISTS(SELECT 1 FROM network_overlay_source_fences
@@ -177,13 +203,10 @@ fn save_source_hold(catalog: &Catalog, execution: &Execution, transfer: &Transfe
     Ok(())
 }
 
-fn source_descriptor(
-    attachment: &crate::network_lease_catalog::AttachmentDescriptor,
-    transfer: &Transfer,
-) -> bool {
+pub(crate) fn source_descriptor(attachment: &AttachmentDescriptor, transfer: &Transfer) -> bool {
     attachment.attachment_id == transfer.attachment_id
         && attachment.route_domain_id == transfer.route_domain_id
-        && attachment.mode == "native"
+        && attachment.mode == transfer.network_mode
         && attachment.private_ipv4 == transfer.private_ipv4
         && attachment.guest_ipv4 == transfer.guest_ipv4
         && attachment.gateway_ipv4 == transfer.guest_gateway_ipv4
@@ -192,25 +215,38 @@ fn source_descriptor(
 }
 
 fn source_retired(catalog: &Catalog, execution: &Execution, transfer: &Transfer) -> Result<bool> {
-    let recorded: Option<String> = catalog.db.query_row(
-        "SELECT t.descriptor_json FROM network_tap_leases t
+    let recorded: Option<String> = catalog
+        .db
+        .query_row(
+            "SELECT t.descriptor_json FROM network_tap_leases t
          JOIN network_kernel_receipts k USING(lease_id)
          WHERE t.attachment_id=?1 AND t.incarnation_id=?2 AND t.execution_epoch=?3
            AND t.operation_id=?4 AND t.instance_id=?5 AND t.state='retired'
            AND t.revision=?6+1 AND k.published_revision<=?6
            AND NOT EXISTS(SELECT 1 FROM network_tap_leases active
                           WHERE active.attachment_id=t.attachment_id AND active.state<>'retired')",
-        params![transfer.attachment_id, execution.incarnation_id, execution.execution_epoch,
-            execution.last_operation_id, execution.instance_id, transfer.attachment_revision],
-        |row| row.get(0),
-    ).optional()?;
-    recorded.map(|raw| serde_json::from_str(&raw)
-        .map(|attachment| source_descriptor(&attachment, transfer))
-        .map_err(|_| Fault::new("E_CATALOG", "cannot read source overlay fence")))
-        .transpose().map(|value| value.unwrap_or(false))
+            params![
+                transfer.attachment_id,
+                execution.incarnation_id,
+                execution.execution_epoch,
+                execution.last_operation_id,
+                execution.instance_id,
+                transfer.attachment_revision
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    recorded
+        .map(|raw| {
+            serde_json::from_str(&raw)
+                .map(|attachment| source_descriptor(&attachment, transfer))
+                .map_err(|_| Fault::new("E_CATALOG", "cannot read source overlay fence"))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(false))
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Receipt {
     pub transfer: Transfer,
     pub state: String,
@@ -277,7 +313,14 @@ fn journal(catalog: &Catalog, migration: &str) -> Result<Option<Journal>> {
 }
 
 fn validates_target(transfer: &Transfer, execution: &Execution, lease: &TapLease) -> bool {
-    let attachment = &lease.attachment;
+    execution.execution_epoch == transfer.target_execution_epoch
+        && lease.matches(execution)
+        && lease.state == "attached"
+        && lease.revision == transfer.target_attachment_revision
+        && target_descriptor(transfer, &lease.attachment)
+}
+
+pub(crate) fn target_descriptor(transfer: &Transfer, attachment: &AttachmentDescriptor) -> bool {
     [
         &transfer.machine_id,
         &transfer.source_worker_id,
@@ -293,10 +336,6 @@ fn validates_target(transfer: &Transfer, execution: &Execution, lease: &TapLease
         && transfer.expected_owner_epoch > 0
         && transfer.attachment_revision > 0
         && transfer.policy_revision > 0
-        && execution.execution_epoch == transfer.target_execution_epoch
-        && lease.matches(execution)
-        && lease.state == "attached"
-        && lease.revision == transfer.target_attachment_revision
         && attachment.attachment_id == transfer.target_attachment_id
         && attachment.route_domain_id == transfer.route_domain_id
         && attachment.mode == transfer.network_mode
@@ -308,6 +347,15 @@ fn validates_target(transfer: &Transfer, execution: &Execution, lease: &TapLease
 }
 
 impl OwnerDecision {
+    pub(crate) fn migration(transfer: &Transfer, owner_epoch: i64) -> Self {
+        Self {
+            migration_id: transfer.migration_id.clone(),
+            previous_owner_epoch: transfer.expected_owner_epoch,
+            owner_epoch,
+            owner_worker_id: transfer.target_worker_id.clone(),
+        }
+    }
+
     fn matches(&self, transfer: &Transfer) -> bool {
         self.migration_id == transfer.migration_id
             && self.previous_owner_epoch == transfer.expected_owner_epoch
@@ -353,13 +401,192 @@ pub(crate) fn authorize_overlay_commit(
     source_fence: Option<&SourceFence>,
 ) -> Result<()> {
     if !overlay.has_peer(
-        &transfer.route_domain_id, &transfer.target_worker_id, &transfer.source_worker_id,
+        &transfer.route_domain_id,
+        &transfer.target_worker_id,
+        &transfer.source_worker_id,
     ) || !source_fence.is_some_and(|proof| proof.matches(transfer))
         || !overlay.withdrawn(&transfer.machine_id, transfer.private_ipv4)
     {
         return Err(fenced());
     }
     Ok(())
+}
+
+pub(crate) fn prepare_cold(
+    catalog: &Catalog,
+    network: &mut NetworkRuntime,
+    operation: &str,
+    transfer: &Transfer,
+    membership: &Membership,
+) -> Result<Receipt> {
+    let lease = catalog.tap_lease(&transfer.target_attachment_id)?;
+    if lease.operation_id != operation
+        || lease.state != "quarantined"
+        || lease.gate != "closed"
+        || lease.revision.checked_add(2) != Some(transfer.target_attachment_revision)
+        || !target_descriptor(transfer, &lease.attachment)
+        || !guard_matches(
+            &catalog.db,
+            operation,
+            &transfer.target_attachment_id,
+            &transfer.migration_id,
+        )?
+        || membership.policy_revision != transfer.policy_revision
+    {
+        return Err(fenced());
+    }
+    if let Some(prior) = journal(catalog, &transfer.migration_id)? {
+        if prior.operation_id != operation
+            || prior.transfer != *transfer
+            || prior.phase != "prepared"
+            || network_memberships::lookup(&catalog.db, &lease.instance_id)? != *membership
+        {
+            return Err(conflict());
+        }
+        return Ok(migration_receipt(prior, false));
+    }
+    network.apply_membership(catalog, &lease.instance_id, membership)?;
+    catalog.db.execute(
+        "INSERT INTO network_transfers(migration_id,operation_id,intent_json,phase)
+         VALUES(?1,?2,?3,'prepared')",
+        params![
+            transfer.migration_id,
+            operation,
+            encoded(&(transfer, lease.revision))?
+        ],
+    )?;
+    Ok(migration_receipt(
+        require_journal(catalog, transfer, operation)?,
+        false,
+    ))
+}
+
+fn require_journal(catalog: &Catalog, transfer: &Transfer, operation: &str) -> Result<Journal> {
+    let entry = journal(catalog, &transfer.migration_id)?.ok_or_else(fenced)?;
+    if entry.transfer != *transfer || entry.operation_id != operation {
+        return Err(conflict());
+    }
+    Ok(entry)
+}
+
+fn migration_receipt(entry: Journal, published: bool) -> Receipt {
+    Receipt {
+        transfer: entry.transfer,
+        state: entry.phase,
+        activation_revision: entry.activation_revision,
+        published,
+    }
+}
+
+pub(crate) fn authorize_cold(
+    catalog: &Catalog,
+    operation: &str,
+    transfer: &Transfer,
+    decision: &OwnerDecision,
+) -> Result<()> {
+    crate::machine_migration::permit_target_activation(catalog, operation)?;
+    let prior = require_journal(catalog, transfer, operation)?;
+    if !decision.matches(transfer)
+        || !matches!(prior.phase.as_str(), "prepared" | "committed")
+        || prior
+            .decision
+            .as_ref()
+            .is_some_and(|saved| saved != decision)
+    {
+        return Err(fenced());
+    }
+    if prior.phase == "prepared" {
+        let lease = catalog.tap_lease(&transfer.target_attachment_id)?;
+        if lease.state != "quarantined"
+            || lease.gate != "closed"
+            || lease.operation_id != operation
+            || lease.revision != prior.activation_revision
+            || !target_descriptor(transfer, &lease.attachment)
+            || network_memberships::lookup(&catalog.db, &lease.instance_id)?.policy_revision
+                != transfer.policy_revision
+        {
+            return Err(fenced());
+        }
+        catalog.db.execute(
+            "UPDATE network_transfers SET phase='committed',decision_json=? WHERE migration_id=? AND phase='prepared'",
+            params![encoded(decision)?, transfer.migration_id],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn permit_initial_migration_publication(
+    catalog: &Catalog,
+    execution: &Execution,
+    lease: &TapLease,
+) -> Result<()> {
+    let migration: Option<String> = catalog
+        .db
+        .query_row(
+            "SELECT migration_id FROM network_transfer_guards WHERE operation_id=?",
+            [&execution.last_operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(migration) = migration {
+        let entry = journal(catalog, &migration)?.ok_or_else(fenced)?;
+        if entry.phase != "committed"
+            || entry.operation_id != execution.last_operation_id
+            || !validates_target(&entry.transfer, execution, lease)
+            || network_memberships::lookup(&catalog.db, &execution.instance_id)?.policy_revision
+                != entry.transfer.policy_revision
+        {
+            return Err(fenced());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn observe_cold(
+    catalog: &Catalog,
+    operation: &str,
+    transfer: &Transfer,
+    execution: &Execution,
+) -> Result<Receipt> {
+    let entry = require_journal(catalog, transfer, operation)?;
+    let lease = catalog.tap_lease(&transfer.target_attachment_id)?;
+    if entry.phase != "committed"
+        || !validates_target(transfer, execution, &lease)
+        || lease.gate != "open"
+        || catalog.network_kernel_proof(&lease)?.is_none()
+    {
+        return Err(fenced());
+    }
+    Ok(migration_receipt(entry, true))
+}
+
+pub(crate) fn abort_migration(
+    catalog: &Catalog,
+    transfer: &Transfer,
+    operation: &str,
+) -> Result<Receipt> {
+    crate::machine_migration::permit_target_abort(catalog, operation)?;
+    let entry = require_journal(catalog, transfer, operation)?;
+    if entry.phase == "committed" {
+        return Err(fenced());
+    }
+    // The caller has already proved writer/relay exit. A retired or absent
+    // lease is the only state that can attest an aborted transfer.
+    match catalog.tap_lease(&transfer.target_attachment_id) {
+        Err(error) if error.code == "E_NOT_FOUND" => (),
+        Err(error) => return Err(error),
+        Ok(_) => return Err(fenced()),
+    }
+    if entry.phase == "prepared" {
+        catalog.db.execute(
+            "UPDATE network_transfers SET phase='aborted' WHERE migration_id=? AND phase='prepared'",
+            [&transfer.migration_id],
+        )?;
+    }
+    Ok(migration_receipt(
+        require_journal(catalog, transfer, operation)?,
+        false,
+    ))
 }
 
 pub(crate) fn handle(
@@ -392,10 +619,18 @@ pub(crate) fn handle(
         return Err(fenced());
     }
     let overlay = transfer.network_mode == "native";
-    if overlay && request.method == "PrepareTransfer" && !network.overlay().has_peer(
-        &transfer.route_domain_id, &transfer.target_worker_id, &transfer.source_worker_id,
-    ) {
-        return Err(Fault::new("E_OVERLAY_UNAVAILABLE", "cross-Worker native transfer requires the same configured overlay domain"));
+    if overlay
+        && request.method == "PrepareTransfer"
+        && !network.overlay().has_peer(
+            &transfer.route_domain_id,
+            &transfer.target_worker_id,
+            &transfer.source_worker_id,
+        )
+    {
+        return Err(Fault::new(
+            "E_OVERLAY_UNAVAILABLE",
+            "cross-Worker native transfer requires the same configured overlay domain",
+        ));
     }
     let prior = journal(catalog, &transfer.migration_id)?;
     if prior
@@ -406,7 +641,8 @@ pub(crate) fn handle(
     }
     let preparing = request.method == "PrepareTransfer";
     let committing = request.method == "CommitTransfer";
-    if preparing != input.membership.is_some() || committing != input.owner_decision.is_some()
+    if preparing != input.membership.is_some()
+        || committing != input.owner_decision.is_some()
         || (committing && overlay) != input.source_fence.is_some()
     {
         return Err(Fault::invalid(
@@ -469,10 +705,15 @@ pub(crate) fn handle(
             )
         }
         "CommitTransfer" => {
+            crate::machine_migration::permit_target_activation(catalog, operation)?;
             let prior = prior.ok_or_else(fenced)?;
             let decision = input.owner_decision.as_ref().ok_or_else(fenced)?;
             if !decision.matches(&transfer)
-                || (overlay && !input.source_fence.as_ref().is_some_and(|proof| proof.matches(&transfer)))
+                || (overlay
+                    && !input
+                        .source_fence
+                        .as_ref()
+                        .is_some_and(|proof| proof.matches(&transfer)))
                 || prior.phase == "aborted"
                 || prior
                     .decision
@@ -485,7 +726,11 @@ pub(crate) fn handle(
             }
             if prior.phase == "prepared" {
                 if overlay {
-                    authorize_overlay_commit(network.overlay(), &transfer, input.source_fence.as_ref())?;
+                    authorize_overlay_commit(
+                        network.overlay(),
+                        &transfer,
+                        input.source_fence.as_ref(),
+                    )?;
                 }
                 if activation.phase != "identity_ready"
                     || activation.revision != prior.activation_revision
@@ -511,6 +756,7 @@ pub(crate) fn handle(
             )
         }
         "AbortTransfer" => {
+            crate::machine_migration::permit_target_abort(catalog, operation)?;
             let prior = prior.ok_or_else(fenced)?;
             if prior.phase == "committed" {
                 return Err(fenced());

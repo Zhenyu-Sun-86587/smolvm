@@ -8,7 +8,7 @@ use serde_json::json;
 use smolvm_resourced::boot_environment::{self as protocol, Attempt, Delivery};
 use smolvm_resourced::client::QueryError;
 use smolvm_resourced::managed::Plan;
-use smolvm_resourced::native_client::{Client, Launch, Submission};
+use smolvm_resourced::native_client::{Client, ExecutionRef, Launch, Submission};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -28,6 +28,30 @@ struct Input {
     environment: Attempt,
     nonce: String,
     values: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationInput {
+    migration: MigrationBinding,
+    environment: Attempt,
+    nonce: String,
+    values: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationBinding {
+    operation_id: String,
+    request_digest: String,
+    expected: ExecutionRef,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DeliveryInput {
+    Launch(Input),
+    Migration(MigrationInput),
 }
 
 struct Pending {
@@ -88,7 +112,7 @@ pub(super) async fn probe(State(socket): State<PathBuf>) -> Response {
 }
 
 pub(super) async fn submit(State(socket): State<PathBuf>, body: axum::body::Bytes) -> Response {
-    let Ok(input) = serde_json::from_slice::<Input>(&body) else {
+    let Ok(input) = serde_json::from_slice::<DeliveryInput>(&body) else {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(
@@ -99,45 +123,81 @@ pub(super) async fn submit(State(socket): State<PathBuf>, body: axum::body::Byte
     };
     drop(body);
     native(socket, move |client| {
-        let launch = input.launch;
-        launch::require_own(&launch.expected.instance_id)?;
-        if launch.kind != "launch"
-            || launch.expected.incarnation_id.is_some()
-            || !protocol::matches(&input.environment, &input.nonce, &input.values)
-        {
+        let (launch, migration, environment, nonce, values) = match input {
+            DeliveryInput::Launch(input) => (
+                Some(input.launch),
+                None,
+                input.environment,
+                input.nonce,
+                input.values,
+            ),
+            DeliveryInput::Migration(input) => (
+                None,
+                Some(input.migration),
+                input.environment,
+                input.nonce,
+                input.values,
+            ),
+        };
+        let (operation, digest, expected) = if let Some(launch) = launch.as_ref() {
+            if launch.kind != "launch" {
+                return Err(fault(
+                    "E_INVALID_REQUEST",
+                    "boot environment requires a launch",
+                ));
+            }
+            (
+                &launch.operation_id,
+                &launch.request_digest,
+                &launch.expected,
+            )
+        } else {
+            let migration = migration.as_ref().unwrap();
+            (
+                &migration.operation_id,
+                &migration.request_digest,
+                &migration.expected,
+            )
+        };
+        launch::require_own(&expected.instance_id)?;
+        if expected.incarnation_id.is_some() || !protocol::matches(&environment, &nonce, &values) {
             return Err(fault(
                 "E_INVALID_REQUEST",
                 "boot environment does not match its launch commitment",
             ));
         }
-        launch::ensure_binding(client, &launch.expected.instance_id)?;
+        launch::ensure_binding(client, &expected.instance_id)?;
         {
             let pending = pending();
-            if pending.len() >= MAX_PENDING && !pending.contains_key(&launch.operation_id) {
+            if pending.len() >= MAX_PENDING && !pending.contains_key(operation) {
                 return Err(fault(
                     "E_RESOURCE_LIMIT",
                     "too many pending boot environment deliveries",
                 ));
             }
         }
-        let receipt = client.submit_boot_environment(&launch, &input.environment)?;
+        let receipt = if let Some(launch) = launch.as_ref() {
+            client.submit_boot_environment(launch, &environment)?
+        } else {
+            client.query_migration_boot_environment(operation, digest, expected, &environment)?
+        };
         let mut pending = pending();
         if receipt.phase != "NEW" {
-            pending.remove(&launch.operation_id);
-        } else if !input.environment.expired()
-            && (pending.len() < MAX_PENDING || pending.contains_key(&launch.operation_id))
+            pending.remove(operation);
+        } else if !environment.expired()
+            && (pending.len() < MAX_PENDING || pending.contains_key(operation))
         {
             let delivery = Delivery {
-                revision: input.environment.revision,
-                values: input.values,
+                revision: environment.revision,
+                values,
             };
             pending.insert(
-                launch.operation_id,
+                operation.clone(),
                 Pending {
-                    attempt: input.environment,
-                    request_digest: launch.request_digest,
-                    instance: launch.expected.instance_id,
-                    preceding_epoch: launch.expected.execution_epoch,
+                    attempt: environment,
+                    request_digest: digest.clone(),
+                    instance: expected.instance_id.clone(),
+                    preceding_epoch: expected.execution_epoch,
                     delivery,
                 },
             );
