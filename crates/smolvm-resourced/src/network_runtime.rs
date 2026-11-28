@@ -7,6 +7,7 @@ use crate::network::topology::{
 use crate::network::{NamespaceIdentity, PreparedTapPort};
 use crate::network_catalog::NetworkReservation;
 use crate::network_lease_catalog::{AttachmentDescriptor, TapLease};
+use crate::network_memberships::{self, Membership};
 use crate::network_peering::Peering;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -20,6 +21,13 @@ pub(crate) struct NetworkRuntime {
     ports: HashMap<String, QuarantinedPort>,
     packet_wake: crate::packet_wake::Observer,
     peering: Peering,
+    membership_filters: HashMap<String, MembershipFilter>,
+}
+
+#[derive(Default, Eq, PartialEq)]
+struct MembershipFilter {
+    internal: Vec<(Ipv4Addr, Ipv4Addr)>,
+    peered: Vec<(Ipv4Addr, Ipv4Addr)>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +77,7 @@ impl NetworkRuntime {
             ports: HashMap::new(),
             packet_wake: Default::default(),
             peering: Peering::new(peering_policy),
+            membership_filters: HashMap::new(),
         }
     }
 
@@ -166,12 +175,63 @@ impl NetworkRuntime {
         if self.ports.contains_key(&lease.attachment.attachment_id) {
             return Err(unknown_attachment());
         }
+        if !self.routers.contains_key(&lease.attachment.route_domain_id) {
+            router.apply_membership_filter(&[], &[]).map_err(host_error)?;
+        }
         catalog.adopt_published_tap(lease)?;
         port.adopt_published(router.clone());
         self.routers
             .insert(lease.attachment.route_domain_id.clone(), router);
         self.ports.insert(lease.attachment.attachment_id.clone(), port);
+        self.reconcile_memberships(catalog)
+    }
+
+    fn reconcile_memberships(&mut self, catalog: &Catalog) -> Result<()> {
+        let groups = network_memberships::endpoints(&catalog.db)?;
+        for (domain, router) in &self.routers {
+            let network: String = catalog.db.query_row(
+                "SELECT network_id FROM private_networks WHERE route_domain_id=?",
+                [domain],
+                |row| row.get(0),
+            )?;
+            let local = groups.get(&network).map(Vec::as_slice).unwrap_or_default();
+            let internal = network_memberships::allowed_pairs(local, local);
+            let mut peered = Vec::new();
+            for remote in self.peering.active_peers(&network) {
+                if let Some(endpoints) = groups.get(remote) {
+                    peered.extend(network_memberships::allowed_pairs(local, endpoints));
+                }
+            }
+            let filter = MembershipFilter { internal, peered };
+            if self.membership_filters.get(domain) != Some(&filter) {
+                router.apply_membership_filter(&filter.internal, &filter.peered).map_err(host_error)?;
+                self.membership_filters.insert(domain.clone(), filter);
+            }
+        }
         Ok(())
+    }
+
+    pub(crate) fn apply_membership(
+        &mut self,
+        catalog: &Catalog,
+        instance: &str,
+        desired: &Membership,
+    ) -> Result<()> {
+        catalog.ready()?;
+        if catalog.check_network_membership(instance, desired)? {
+            // A failed update cannot retain the old grants after the new
+            // revision becomes durable. Close the router transit gates first.
+            let block = self.routers.iter().try_for_each(|(domain, router)| {
+                router.apply_membership_filter(&[], &[]).map_err(host_error)?;
+                self.membership_filters.insert(domain.clone(), MembershipFilter::default());
+                Ok::<_, Fault>(())
+            });
+            if let Err(error) = block.and_then(|()| catalog.save_network_membership(instance, desired)) {
+                let _ = self.reconcile_memberships(catalog);
+                return Err(error);
+            }
+        }
+        self.reconcile_memberships(catalog)
     }
 
     pub(crate) fn packet_rule(&mut self, catalog: &mut Catalog, request: &Request) -> Result<serde_json::Value> {
@@ -180,6 +240,7 @@ impl NetworkRuntime {
 
     pub(crate) fn poll(&mut self, catalog: &mut Catalog) -> Result<()> {
         self.peering.refresh(catalog, &self.routers, &self.ports);
+        self.reconcile_memberships(catalog)?;
         self.packet_wake.poll(catalog, &self.ports)
     }
 
@@ -291,6 +352,7 @@ impl NetworkRuntime {
                         "prepared guest route differs",
                     ));
                 }
+                self.reconcile_memberships(catalog)?;
                 return Ok(lease);
             }
             Err(error) if error.code == "E_NOT_FOUND" => {}
@@ -337,6 +399,7 @@ impl NetworkRuntime {
         self.packet_wake.replaced_port(&data.attachment_id);
         self.ports.insert(data.attachment_id, port);
         self.peering.refresh(catalog, &self.routers, &self.ports);
+        self.reconcile_memberships(catalog)?;
         Ok(lease)
     }
 
@@ -595,6 +658,7 @@ impl NetworkRuntime {
         let domain = &lease.attachment.route_domain_id;
         if self.routers.get(domain).is_some_and(PrivateRouter::idle) {
             self.routers.remove(domain);
+            self.membership_filters.remove(domain);
         }
         self.cleanup_namespace_pins(catalog)
     }

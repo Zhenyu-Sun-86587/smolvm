@@ -55,6 +55,8 @@ pub(crate) struct ReserveNetwork {
     device_id: String,
     mode: Mode,
     guest_ipv4: Option<Ipv4Addr>,
+    preferred_private_ipv4: Option<Ipv4Addr>,
+    transfer_id: Option<String>,
     rebind_revision: Option<i64>,
     dns_name: Option<String>,
 }
@@ -260,6 +262,8 @@ impl Catalog {
                     Mode::Native
                 },
                 guest_ipv4: fixed.map(|(guest, _, _)| guest),
+                preferred_private_ipv4: None,
+                transfer_id: None,
                 rebind_revision: prior.map(|before| before.revision),
                 dns_name: Some(dns_name.into()),
             },
@@ -364,6 +368,11 @@ impl Catalog {
     ) -> Result<NetworkReservation> {
         let operation = self.matching_operation(request)?;
         verify_epoch(request, &operation)?;
+        if data.preferred_private_ipv4.is_some() != data.transfer_id.is_some()
+            || data.transfer_id.as_ref().is_some_and(|id| !valid_id(id) || operation.kind != "restore_target")
+        {
+            return Err(Fault::invalid("stable address reservation requires a designated transfer target"));
+        }
         if !valid_id(&data.attachment_id)
             || !valid_id(&data.network_id)
             || !valid_id(&data.device_id)
@@ -382,6 +391,7 @@ impl Catalog {
                 || prior.device_id != data.device_id
                 || prior.mode != data.mode.as_str()
                 || (prior.state != "released" && prior.dns_name != data.dns_name)
+                || data.preferred_private_ipv4.is_some_and(|address| address != prior.private_ipv4)
                 || data
                     .guest_ipv4
                     .is_some_and(|address| address != prior.guest_ipv4)
@@ -390,6 +400,11 @@ impl Catalog {
                     "E_IDEMPOTENCY_CONFLICT",
                     "attachment ID already has another intent",
                 ));
+            }
+            if let Some(transfer) = &data.transfer_id {
+                if !crate::network_transfer::guard_matches(&self.db, &operation.operation_id, &data.attachment_id, transfer)? {
+                    return Err(Fault::new("E_IDEMPOTENCY_CONFLICT", "attachment already has another transfer intent"));
+                }
             }
             return if prior.operation_id == operation.operation_id {
                 Ok(prior)
@@ -433,7 +448,19 @@ impl Catalog {
                 "device already holds a private address",
             ));
         }
-        let private = unallocated_ipv4(&tx, &data.network_id, first, last)?;
+        let private = if let Some(address) = data.preferred_private_ipv4 {
+            let address = u32::from(address);
+            let taken: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM network_attachments WHERE network_id=? AND private_ipv4=? AND state<>'released')",
+                params![data.network_id, address], |row| row.get(0),
+            )?;
+            if !(first..=last).contains(&address) || taken {
+                return Err(Fault::new("E_NETWORK_ATTACHMENT_CONFLICT", "requested private address is outside the target pool or already reserved"));
+            }
+            address
+        } else {
+            unallocated_ipv4(&tx, &data.network_id, first, last)?
+        };
         let guest = data.guest_ipv4.map(u32::from).unwrap_or(private);
         tx.execute(
             "INSERT INTO network_attachments VALUES(?,?,?,?,?,?,?, ?,?,'reserved',1)",
@@ -449,6 +476,12 @@ impl Catalog {
                 guest
             ],
         )?;
+        if let Some(transfer) = &data.transfer_id {
+            tx.execute(
+                "INSERT INTO network_transfer_guards(operation_id,attachment_id,migration_id) VALUES(?,?,?)",
+                params![operation.operation_id, data.attachment_id, transfer],
+            )?;
+        }
         if let Some(name) = &data.dns_name {
             if tx.execute(
                 "INSERT OR IGNORE INTO network_dns_names VALUES(?,?,?)",
@@ -654,6 +687,8 @@ mod tests {
             device_id: "net0".to_owned(),
             mode: Mode::Native,
             guest_ipv4: None,
+            preferred_private_ipv4: None,
+            transfer_id: None,
             rebind_revision: None,
             dns_name: None,
         }

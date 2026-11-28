@@ -107,10 +107,13 @@ fn answer(db: &Connection, network: &str, peer: IpAddr, packet: &[u8]) -> Option
         return None;
     }
     let name = dns::normalize_hostname(&dns::question_name(packet)?)?;
-    let address = lookup(db, network, &name).and_then(|entry| match (entry, peer) {
-        (None, IpAddr::V4(peer)) => crate::packet_wake::sleeping_address(db, network, &name, peer),
-        _ => Ok(entry),
-    });
+    let address = match peer {
+        IpAddr::V4(peer) => lookup(db, network, &name, peer).and_then(|entry| match entry {
+            Some(_) => Ok(entry),
+            None => crate::packet_wake::sleeping_address(db, network, &name, peer),
+        }),
+        IpAddr::V6(_) => Ok(None),
+    };
     let mut reply = match address {
         Ok(Some(address)) => dns::addresses_response(packet, &[IpAddr::V4(address)], RESPONSE_TTL),
         Ok(None) => dns::error_response(packet, dns::DNS_RCODE_NXDOMAIN),
@@ -121,10 +124,23 @@ fn answer(db: &Connection, network: &str, peer: IpAddr, packet: &[u8]) -> Option
     Some(reply)
 }
 
-fn lookup(db: &Connection, network: &str, name: &str) -> rusqlite::Result<Option<Ipv4Addr>> {
+fn lookup(
+    db: &Connection,
+    network: &str,
+    name: &str,
+    peer: Ipv4Addr,
+) -> rusqlite::Result<Option<Ipv4Addr>> {
     let entry = db.query_row(
-        "SELECT address.private_ipv4,e.pid,e.pid_start_time FROM network_dns_names dns
+        "SELECT address.private_ipv4,e.pid,e.pid_start_time,address.instance_id,source.instance_id FROM network_dns_names dns
          JOIN network_attachments address USING(attachment_id)
+         JOIN network_attachments source ON source.network_id=dns.network_id AND source.private_ipv4=?3
+           AND source.state='reserved'
+         JOIN network_tap_leases source_tap ON source_tap.attachment_id=source.attachment_id
+           AND source_tap.operation_id=source.operation_id AND source_tap.state='attached'
+         JOIN instance_bindings source_binding ON source_binding.route_id=source_tap.route_id
+           AND source_binding.instance_id=source_tap.instance_id
+           AND source_binding.incarnation_id=source_tap.incarnation_id
+           AND source_binding.execution_epoch=source_tap.execution_epoch
          JOIN network_tap_leases tap ON tap.attachment_id=address.attachment_id AND tap.operation_id=address.operation_id
          LEFT JOIN network_kernel_receipts proof ON proof.lease_id=tap.lease_id
          JOIN executions e ON e.incarnation_id=tap.incarnation_id AND e.execution_epoch=tap.execution_epoch
@@ -133,19 +149,24 @@ fn lookup(db: &Connection, network: &str, name: &str) -> rusqlite::Result<Option
          JOIN operations o ON o.operation_id=tap.operation_id
          JOIN worker_state w ON w.singleton=1 AND w.host_boot_id=tap.host_boot_id
               AND w.broker_session_id=coalesce(proof.adopted_session_id,tap.broker_session_id)
-         WHERE dns.network_id=? AND dns.name=? AND address.state='reserved' AND e.phase='registered'
+         WHERE dns.network_id=?1 AND dns.name=?2 AND address.state='reserved' AND e.phase='registered'
            AND tap.state='attached' AND w.recovering=0 AND o.phase='COMPLETED'
            AND (EXISTS(SELECT 1 FROM initial_network_activations i WHERE i.lease_id=tap.lease_id AND i.phase='open')
              OR EXISTS(SELECT 1 FROM target_activations a WHERE a.operation_id=tap.operation_id AND a.phase='released'
                 AND a.decision='commit' AND a.incarnation_id=tap.incarnation_id AND a.execution_epoch=tap.execution_epoch
                 AND json_extract(a.binding_json, '$.network.target.lease_id')=tap.lease_id))",
-        [network, name],
-        |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i32>(1)?, row.get::<_, i64>(2)?)),
+        rusqlite::params![network, name, u32::from(peer)],
+        |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i32>(1)?, row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?, row.get::<_, String>(4)?)),
     ).optional()?;
-    Ok(entry.and_then(|(address, pid, start)| {
-        crate::worker::observe_pid(pid)
-            .ok()
-            .filter(|(observed, _)| *observed == start)
-            .map(|_| Ipv4Addr::from(address))
-    }))
+    let Some((address, pid, start, target, source)) = entry else {
+        return Ok(None);
+    };
+    if !crate::network_memberships::allowed(db, &source, &target)? {
+        return Ok(None);
+    }
+    Ok(crate::worker::observe_pid(pid)
+        .ok()
+        .filter(|(observed, _)| *observed == start)
+        .map(|_| Ipv4Addr::from(address)))
 }

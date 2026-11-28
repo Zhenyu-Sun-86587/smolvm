@@ -237,6 +237,7 @@ impl ActivationRuntime {
         request: &Request,
         verify_process: impl Fn() -> Result<()>,
     ) -> Result<ActivationReceipt> {
+        crate::network_transfer::permit_activation(catalog, &execution.last_operation_id)?;
         let mut record = receipt(catalog, execution, request)?;
         let revision: Revision = request.payload()?;
         match record.phase.as_str() {

@@ -625,6 +625,9 @@ struct Queued {
 }
 
 fn enqueue(catalog: &mut Catalog, rule: &Rule, target: &Endpoint) -> Result<Option<Queued>> {
+    if !crate::network_memberships::allowed_attachments(&catalog.db, &rule.source, &rule.target)? {
+        return Ok(None);
+    }
     let now = monotonic()?;
     let db = &catalog.db;
     let Some(expected) = current_target(db, target)? else {
@@ -763,6 +766,7 @@ fn reconcile(
         let eligible = demand.expires > now
             && rule.enabled
             && rule.revision == demand.revision
+            && crate::network_memberships::allowed_attachments(&catalog.db, &rule.source, &rule.target)?
             && policy.is_some_and(|(rev, policy)| {
                 rev == demand.policy_revision && policy.permits_wake(TRIGGER)
             })
@@ -876,6 +880,7 @@ fn reconcile(
             });
             let forwarded = sender
                 && recipient
+                && crate::network_memberships::allowed_attachments(&catalog.db, &rule.source, &rule.target)?
                 && held.until > monotonic()?
                 && ports[&rule.target].forward_wake_datagram(held.data).is_ok();
             catalog.db.execute("UPDATE private_packet_wake_results SET datagram=? WHERE rule_id=? AND operation_id=?",
@@ -919,7 +924,7 @@ pub(crate) fn sleeping_address(
     name: &str,
     peer: Ipv4Addr,
 ) -> rusqlite::Result<Option<Ipv4Addr>> {
-    let entry = db.query_row("SELECT destination.private_ipv4,source_vm.pid,source_vm.pid_start_time
+    let entry = db.query_row("SELECT destination.private_ipv4,source_vm.pid,source_vm.pid_start_time,source.instance_id,destination.instance_id
         FROM network_dns_names dns JOIN network_attachments destination USING(attachment_id)
         JOIN private_packet_wake_rules rule ON rule.target_attachment=destination.attachment_id
         JOIN network_attachments source ON source.attachment_id=rule.source_attachment AND source.network_id=dns.network_id
@@ -947,11 +952,15 @@ pub(crate) fn sleeping_address(
                 WHERE original.instance_id=asleep.instance_id AND original.execution_epoch=asleep.execution_epoch
                     AND original.phase='exited' AND p.phase='hibernated' AND predecessor.state='retired'
                     AND predecessor.attachment_id=destination.attachment_id)
-        LIMIT 1",params![network,name,u32::from(peer)], |r| Ok((r.get::<_,u32>(0)?,r.get::<_,i32>(1)?,r.get::<_,i64>(2)?))).optional()?;
-    Ok(entry.and_then(|(address, pid, start)| {
-        crate::worker::observe_pid(pid)
-            .ok()
-            .filter(|(actual, _)| *actual == start)
-            .map(|_| Ipv4Addr::from(address))
-    }))
+        LIMIT 1",params![network,name,u32::from(peer)], |r| Ok((r.get::<_,u32>(0)?,r.get::<_,i32>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional()?;
+    let Some((address, pid, start, source, target)) = entry else {
+        return Ok(None);
+    };
+    if !crate::network_memberships::allowed(db, &source, &target)? {
+        return Ok(None);
+    }
+    Ok(crate::worker::observe_pid(pid)
+        .ok()
+        .filter(|(actual, _)| *actual == start)
+        .map(|_| Ipv4Addr::from(address)))
 }
