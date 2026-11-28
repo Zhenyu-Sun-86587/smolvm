@@ -133,11 +133,61 @@ impl PrivateRouter {
             chain ingress { type filter hook prerouting priority filter; policy accept; ct state established counter; }\n\
             chain local { type filter hook output priority filter; policy accept; ct state established counter; }\n\
         }\n")?;
+        router.apply_membership_filter(&[], &[])?;
         Ok(router)
     }
 
     pub fn namespace(&self) -> BorrowedFd<'_> {
         self.namespace.as_ref().as_fd()
+    }
+
+    pub(crate) fn apply_membership_filter(
+        &self,
+        internal: &[(Ipv4Addr, Ipv4Addr)],
+        peered: &[(Ipv4Addr, Ipv4Addr)],
+    ) -> io::Result<()> {
+        use std::fmt::Write as _;
+        // Recreate the table atomically in this router's namespace. No
+        // established-state exception is allowed in forwarding, so a
+        // revoked pair stops passing packets in both directions immediately.
+        let mut script = String::from(
+            "add table ip sm_membership\ndelete table ip sm_membership\nadd table ip sm_membership\n\
+             add chain ip sm_membership transit { type filter hook forward priority 10; policy accept; }\n",
+        );
+        for (name, pairs, interfaces) in [
+            ("local_pairs", internal, r#"iifname "p*" oifname "p*""#),
+            ("peer_pairs", peered, r#"iifname "p*" oifname "sp*""#),
+        ] {
+            if pairs.is_empty() {
+                continue;
+            }
+            writeln!(script, "add set ip sm_membership {name} {{ type ipv4_addr . ipv4_addr; }}").unwrap();
+            // Bounded batches keep individual Netlink messages small.
+            for batch in pairs.chunks(128) {
+                write!(script, "add element ip sm_membership {name} {{ ").unwrap();
+                for (index, (source, target)) in batch.iter().enumerate() {
+                    if index > 0 {
+                        script.push_str(", ");
+                    }
+                    write!(script, "{source} . {target}").unwrap();
+                }
+                script.push_str(" }\n");
+            }
+            writeln!(script, "add rule ip sm_membership transit {interfaces} ip saddr . ip daddr @{name} accept").unwrap();
+            if name == "peer_pairs" {
+                writeln!(script, r#"add rule ip sm_membership transit iifname "sp*" oifname "p*" ip daddr . ip saddr @{name} accept"#).unwrap();
+            }
+        }
+        // The router owns these interfaces. Other destinations follow their
+        // existing path even when an operator provides an external uplink.
+        for interfaces in [
+            r#"iifname "p*" oifname "p*""#,
+            r#"iifname "p*" oifname "sp*""#,
+            r#"iifname "sp*" oifname "p*""#,
+        ] {
+            writeln!(script, "add rule ip sm_membership transit {interfaces} drop").unwrap();
+        }
+        nft(self.namespace(), &script)
     }
 
     pub(crate) fn idle(&self) -> bool {

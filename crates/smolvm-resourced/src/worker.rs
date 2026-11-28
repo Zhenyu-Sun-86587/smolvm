@@ -1319,6 +1319,17 @@ impl Worker {
                 self.verify_live_execution(&execution)?;
                 Ok(json!(record))
             }
+            "PrepareTransfer" | "CheckReady" | "CommitTransfer" | "AbortTransfer" => {
+                let execution = self.scoped_execution(request)?;
+                let catalog = &self.catalog;
+                let verify = || Self::verify_live_execution_at(catalog, &self.boot, &self.executions, &execution);
+                verify()?;
+                let receipt = crate::network_transfer::handle(
+                    catalog, &execution, request, &mut self.network, &self.activation, verify,
+                )?;
+                verify()?;
+                Ok(json!(receipt))
+            }
             "PrepareNetworkAttachment" => self
                 .network
                 .prepare(&self.catalog, request)
@@ -1352,6 +1363,27 @@ impl Worker {
                     .prepare(&self.catalog, &prepare)
                     .map(|lease| json!(lease))
             }
+            "ApplyMachineNetworkMembership" => {
+                let (route, _, expected) = request.scope()?;
+                let binding = self.catalog.query_binding(&request.derived(
+                    "QueryInstanceBinding",
+                    json!({"instance_id":expected.instance_id}),
+                ))?;
+                if route != "deep"
+                    || binding["execution_epoch"] != expected.execution_epoch
+                    || binding["incarnation_id"] != json!(expected.incarnation_id)
+                    || binding["active_operation_id"] != Value::Null
+                {
+                    return Err(stale_execution());
+                }
+                if expected.incarnation_id.is_some() {
+                    let execution = self.scoped_execution(request)?;
+                    self.verify_live_execution(&execution)?;
+                }
+                let desired: crate::network_memberships::Membership = request.payload()?;
+                self.network.apply_membership(&self.catalog, &expected.instance_id, &desired)?;
+                Ok(json!(desired))
+            }
             "QueryNetworkAttachment" => {
                 crate::network_runtime::NetworkRuntime::query(&self.catalog, request)
                     .map(|lease| json!(lease))
@@ -1374,8 +1406,9 @@ impl Worker {
                 };
                 let operation = self.catalog.operation(&execution.last_operation_id)?;
                 let (network_id, dns_name) = self.catalog.tap_network_metadata(lease)?;
+                let policy = crate::network_memberships::lookup(&self.catalog.db, &execution.instance_id)?;
                 Ok(
-                    json!({"lease": lease, "request_digest": operation.request_digest, "network_id": network_id, "dns_name": dns_name}),
+                    json!({"lease": lease, "request_digest": operation.request_digest, "network_id": network_id, "dns_name": dns_name, "policy_revision": policy.policy_revision}),
                 )
             }
             "FenceNetworkAttachment" => {
@@ -1758,9 +1791,11 @@ impl Worker {
     }
 
     fn verify_execution_scope(&self, operation: &str, pid: i32) -> Result<()> {
-        let managed: Option<(String, String)> = self
-            .catalog
-            .db
+        Self::verify_execution_scope_at(&self.catalog, operation, pid)
+    }
+
+    fn verify_execution_scope_at(catalog: &Catalog, operation: &str, pid: i32) -> Result<()> {
+        let managed: Option<(String, String)> = catalog.db
             .query_row(
                 "SELECT serve_instance,machine_name FROM managed_launches WHERE operation_id=?",
                 [operation],
@@ -1779,20 +1814,28 @@ impl Worker {
     }
 
     fn verify_live_execution(&self, execution: &Execution) -> Result<()> {
-        if execution.phase != "registered" || execution.host_boot_id != self.boot {
+        Self::verify_live_execution_at(&self.catalog, &self.boot, &self.executions, execution)
+    }
+
+    fn verify_live_execution_at(
+        catalog: &Catalog,
+        boot: &str,
+        executions: &HashMap<String, OwnedFd>,
+        execution: &Execution,
+    ) -> Result<()> {
+        if execution.phase != "registered" || execution.host_boot_id != boot {
             return Err(stale_execution());
         }
-        let pidfd = self
-            .executions
+        let pidfd = executions
             .get(&execution.incarnation_id)
             .ok_or_else(stale_execution)?;
         verify_executable(
             execution.pid,
             execution.pid_start_time,
             pidfd,
-            &self.catalog.bundle(&execution.bundle_digest)?,
+            &catalog.bundle(&execution.bundle_digest)?,
         )?;
-        self.verify_execution_scope(&execution.last_operation_id, execution.pid)
+        Self::verify_execution_scope_at(catalog, &execution.last_operation_id, execution.pid)
     }
 
     fn reconcile_execution(&mut self, r: &Request, peer: libc::ucred) -> Result<Value> {

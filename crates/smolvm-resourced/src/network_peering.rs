@@ -50,6 +50,18 @@ impl Peering {
             "active":self.links.keys().collect::<Vec<_>>(), "error":self.error})
     }
 
+    pub(crate) fn active_peers<'a>(&'a self, network: &'a str) -> impl Iterator<Item = &'a str> {
+        self.links.keys().filter_map(move |pair| {
+            if pair.left == network {
+                Some(pair.right.as_str())
+            } else if pair.right == network {
+                Some(pair.left.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
     pub(crate) fn refresh(
         &mut self,
         catalog: &Catalog,
