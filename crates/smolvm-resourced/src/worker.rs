@@ -1363,6 +1363,14 @@ impl Worker {
                     .prepare(&self.catalog, &prepare)
                     .map(|lease| json!(lease))
             }
+            "ApplyHostBoundDelivery" => {
+                let execution = self.scoped_execution(request)?;
+                self.verify_live_execution(&execution)?;
+                self.network.apply_host_bound(&self.catalog, &execution, request.payload()?)?;
+                self.verify_live_execution(&execution)?;
+                Ok(json!({"instance_id":execution.instance_id,"incarnation_id":execution.incarnation_id,
+                    "execution_epoch":execution.execution_epoch}))
+            }
             "ApplyMachineNetworkMembership" => {
                 let (route, _, expected) = request.scope()?;
                 let binding = self.catalog.query_binding(&request.derived(

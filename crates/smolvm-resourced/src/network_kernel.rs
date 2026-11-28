@@ -172,6 +172,8 @@ impl PrivateRouter {
             gateway,
             mask: super::mask(prefix)?,
             dns: None,
+            host_bound_routes: Default::default(),
+            host_bound_relay: None,
         })
     }
 }
@@ -248,11 +250,12 @@ impl QuarantinedPort {
         let routed: Vec<_> = entries(&router_routes)?
             .iter()
             .filter(|entry| {
-                entry["dev"] == name
-                    || entry["dev"] == "lo"
-                    || entry["type"] == "blackhole"
-                    || entry["dst"] == private
-                    || entry["dst"] == host_route
+                !is_host_bound_address(&entry["dst"])
+                    && (entry["dev"] == name
+                        || entry["dev"] == "lo"
+                        || entry["type"] == "blackhole"
+                        || entry["dst"] == private
+                        || entry["dst"] == host_route)
             })
             .collect();
         if !routed.iter().any(|row| {
@@ -288,6 +291,10 @@ impl QuarantinedPort {
                 "published network routing settings are inactive",
             ));
         }
+        let mut router_loopback = address(router_ns, "lo")?;
+        if let Some(addresses) = router_loopback.as_array_mut() {
+            addresses.retain(|row| !is_host_bound_address(&row["local"]));
+        }
         let value = json!([
             tap,
             uplink,
@@ -297,7 +304,7 @@ impl QuarantinedPort {
             routed,
             address(port_ns, TAP_PORT_NAME)?,
             address(port_ns, "lo")?,
-            address(router_ns, "lo")?,
+            router_loopback,
             route_rules(router_ns)?,
             route_rules(port_ns)?,
             firewall(port_ns)?,
@@ -311,6 +318,10 @@ impl QuarantinedPort {
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
         })
     }
+}
+
+fn is_host_bound_address(value: &Value) -> bool {
+    matches!(value.as_str(), Some(address) if address.trim_end_matches("/32") == crate::host_bound::ADDRESS.to_string())
 }
 
 fn entries(value: &Value) -> io::Result<&[Value]> {
@@ -369,7 +380,15 @@ fn firewall(namespace: BorrowedFd<'_>) -> io::Result<Value> {
     let rows = raw["nftables"]
         .as_array_mut()
         .ok_or_else(|| io::Error::other("invalid nftables inventory"))?;
-    rows.retain(|row| row.get("metainfo").is_none());
+    // Membership sets are shared mutable authorization, independently
+    // reconstructed from the Worker catalog before an old port is adopted.
+    rows.retain(|row| {
+        row.get("metainfo").is_none() && !row.as_object().is_some_and(|row| {
+            row.iter().any(|(kind, entry)| {
+                (kind == "table" && entry["name"] == "sm_membership") || entry["table"] == "sm_membership"
+            })
+        })
+    });
     fn strip_statistics(value: &mut Value) {
         match value {
             Value::Object(object) => {

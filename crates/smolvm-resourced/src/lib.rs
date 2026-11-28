@@ -63,6 +63,8 @@ mod network_catalog;
 pub mod network_client;
 #[cfg(target_os = "linux")]
 mod network_dns;
+#[cfg(target_os = "linux")]
+mod host_bound;
 #[cfg(target_os="linux")]
 mod conntrack;
 #[cfg(target_os = "linux")]

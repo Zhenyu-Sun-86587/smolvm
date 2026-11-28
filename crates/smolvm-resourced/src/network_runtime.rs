@@ -234,6 +234,22 @@ impl NetworkRuntime {
         self.reconcile_memberships(catalog)
     }
 
+    pub(crate) fn apply_host_bound(
+        &mut self, catalog: &Catalog, execution: &Execution, apply: crate::host_bound::Apply,
+    ) -> Result<()> {
+        catalog.ready()?;
+        let execution_leases = catalog.tap_leases_for_execution(execution)?;
+        let [lease] = execution_leases.as_slice() else {
+            return Err(Fault::new("E_HOST_BOUND_UNAVAILABLE", "host-bound delivery requires one published managed attachment"));
+        };
+        let reservation = catalog.tap_network_reservation(lease)?;
+        if lease.state != "attached" || lease.gate != "open" || reservation.dns_name.is_none() {
+            return Err(Fault::new("E_HOST_BOUND_UNAVAILABLE", "host-bound delivery requires a published attachment with Worker DNS"));
+        }
+        let router = self.routers.get_mut(&lease.attachment.route_domain_id).ok_or_else(unknown_attachment)?;
+        router.apply_host_bound(lease.attachment.private_ipv4, apply)
+    }
+
     pub(crate) fn packet_rule(&mut self, catalog: &mut Catalog, request: &Request) -> Result<serde_json::Value> {
         self.packet_wake.rule(catalog, request, &self.ports)
     }
@@ -645,6 +661,9 @@ impl NetworkRuntime {
 
     fn retire_port(&mut self, catalog: &Catalog, lease: &TapLease) -> Result<()> {
         let attachment_id = &lease.attachment.attachment_id;
+        if let Some(router) = self.routers.get(&lease.attachment.route_domain_id) {
+            router.remove_host_bound(lease.attachment.private_ipv4);
+        }
         let port = self
             .ports
             .get_mut(attachment_id)

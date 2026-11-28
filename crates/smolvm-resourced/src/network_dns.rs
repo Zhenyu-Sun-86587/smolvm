@@ -37,6 +37,7 @@ impl Resolver {
         gateway: Ipv4Addr,
         catalog: &Path,
         network_id: &str,
+        host_bound: crate::host_bound::Routes,
     ) -> io::Result<Self> {
         let db = Connection::open_with_flags(
             catalog,
@@ -68,7 +69,9 @@ impl Resolver {
                 while active.load(Ordering::Relaxed) {
                     match socket.recv_from(&mut query) {
                         Ok((n, peer)) => {
-                            if let Some(reply) = answer(&db, &network_id, peer.ip(), &query[..n]) {
+                            if let Some(reply) =
+                                answer(&db, &network_id, &host_bound, peer.ip(), &query[..n])
+                            {
                                 let _ = socket.send_to(&reply, peer);
                             }
                         }
@@ -102,11 +105,24 @@ impl Drop for Resolver {
     }
 }
 
-fn answer(db: &Connection, network: &str, peer: IpAddr, packet: &[u8]) -> Option<Vec<u8>> {
+fn answer(
+    db: &Connection,
+    network: &str,
+    host_bound: &crate::host_bound::Routes,
+    peer: IpAddr,
+    packet: &[u8],
+) -> Option<Vec<u8>> {
     if !dns::is_plain_query(packet) {
         return None;
     }
     let name = dns::normalize_hostname(&dns::question_name(packet)?)?;
+    if matches!(peer, IpAddr::V4(source) if host_bound.covers(source, &name)) {
+        return Some(dns::addresses_response(
+            packet,
+            &[IpAddr::V4(crate::host_bound::ADDRESS)],
+            1,
+        ));
+    }
     let address = match peer {
         IpAddr::V4(peer) => lookup(db, network, &name, peer).and_then(|entry| match entry {
             Some(_) => Ok(entry),
