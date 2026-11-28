@@ -1143,6 +1143,7 @@ impl Worker {
                             ),
                         )?
                     }
+                    "identity_ready" if crate::network_transfer::awaiting_owner(&self.catalog, &op.operation_id)? => record,
                     "identity_ready" => self.activation.commit(
                         &self.catalog,
                         &self.network,
