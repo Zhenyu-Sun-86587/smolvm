@@ -1502,6 +1502,9 @@ fn queue_cold(
     let namespace = managed::serve_id(&expected.instance_id, name)?;
     let mut machine = details.machine;
     machine.name = name.into();
+    if environment.is_some() && machine.boot_profile != "system-debian-v1" {
+        return Err(unsupported("cold migration Boot environment requires the managed System profile"));
+    }
     if machine.disks.len() != details.devices.len() {
         return Err(fenced("target disk set differs from the held source"));
     }
