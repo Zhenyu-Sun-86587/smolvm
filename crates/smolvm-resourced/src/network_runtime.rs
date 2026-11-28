@@ -4,7 +4,7 @@ use crate::ipc::{valid_id, Fault, Request, Result};
 use crate::network::topology::{
     self, AttachmentMode, KernelProof, PortPolicy, PrivateRouter, QuarantinedPort,
 };
-use crate::network::{NamespaceIdentity, PreparedTapPort};
+use crate::network::{overlay, NamespaceIdentity, PreparedTapPort};
 use crate::network_catalog::NetworkReservation;
 use crate::network_lease_catalog::{AttachmentDescriptor, TapLease};
 use crate::network_memberships::{self, Membership};
@@ -21,6 +21,7 @@ pub(crate) struct NetworkRuntime {
     ports: HashMap<String, QuarantinedPort>,
     packet_wake: crate::packet_wake::Observer,
     peering: Peering,
+    overlay: overlay::Overlay,
     membership_filters: HashMap<String, MembershipFilter>,
 }
 
@@ -70,15 +71,44 @@ enum Transport {
 }
 
 impl NetworkRuntime {
-    pub(crate) fn new(namespaces: PathBuf, peering_policy: Option<PathBuf>) -> Self {
-        Self {
+    pub(crate) fn new(
+        namespaces: PathBuf,
+        peering_policy: Option<PathBuf>,
+        overlay_config: Option<&Path>,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
             namespaces,
             routers: HashMap::new(),
             ports: HashMap::new(),
             packet_wake: Default::default(),
             peering: Peering::new(peering_policy),
+            overlay: overlay::Overlay::new(overlay_config)?,
             membership_filters: HashMap::new(),
+        })
+    }
+
+    pub(crate) fn overlay(&self) -> &overlay::Overlay {
+        &self.overlay
+    }
+
+    pub(crate) fn apply_overlay_routes(
+        &mut self,
+        catalog: &Catalog,
+        input: overlay::Apply,
+    ) -> Result<serde_json::Value> {
+        catalog.ready()?;
+        let receipt = self.overlay.install(catalog, input)?;
+        self.reconcile_overlay(catalog)?;
+        Ok(receipt)
+    }
+
+    fn reconcile_overlay(&mut self, catalog: &Catalog) -> Result<()> {
+        let result = self.overlay.reconcile(catalog, &self.routers, &self.ports);
+        if result.is_err() {
+            self.overlay.remove_link();
         }
+        self.overlay.mark_reconciled(result.is_ok());
+        result
     }
 
     pub(crate) fn cleanup_namespace_pins(&self, catalog: &Catalog) -> Result<()> {
@@ -159,7 +189,7 @@ impl NetworkRuntime {
                 .path()
                 .ok_or_else(|| Fault::new("E_CATALOG", "private DNS requires the Worker database"))?;
             router
-                .ensure_dns(Path::new(path), &reservation.network_id)
+                .ensure_dns(Path::new(path), &reservation.network_id, self.overlay.dns_view(&reservation.route_domain_id))
                 .map_err(host_error)?;
         }
         Ok((router, port))
@@ -176,6 +206,7 @@ impl NetworkRuntime {
             return Err(unknown_attachment());
         }
         if !self.routers.contains_key(&lease.attachment.route_domain_id) {
+            overlay::clear_inherited_link(router.namespace()).map_err(host_error)?;
             router.apply_membership_filter(&[], &[], false).map_err(host_error)?;
         }
         catalog.adopt_published_tap(lease)?;
@@ -219,6 +250,7 @@ impl NetworkRuntime {
     ) -> Result<()> {
         catalog.ready()?;
         if catalog.check_network_membership(instance, desired)? {
+            self.overlay.revoke_local(instance)?;
             // A failed update cannot retain the old grants after the new
             // revision becomes durable. Close the router transit gates first.
             let block = self.routers.iter().try_for_each(|(domain, router)| {
@@ -231,7 +263,8 @@ impl NetworkRuntime {
                 return Err(error);
             }
         }
-        self.reconcile_memberships(catalog)
+        self.reconcile_memberships(catalog)?;
+        self.reconcile_overlay(catalog)
     }
 
     pub(crate) fn apply_host_bound(
@@ -257,6 +290,7 @@ impl NetworkRuntime {
     pub(crate) fn poll(&mut self, catalog: &mut Catalog) -> Result<()> {
         self.peering.refresh(catalog, &self.routers, &self.ports);
         self.reconcile_memberships(catalog)?;
+        self.reconcile_overlay(catalog)?;
         self.packet_wake.poll(catalog, &self.ports)
     }
 
@@ -388,7 +422,7 @@ impl NetworkRuntime {
                 Fault::new("E_CATALOG", "private DNS requires the Worker database")
             })?;
             router
-                .ensure_dns(std::path::Path::new(path), &reservation.network_id)
+                .ensure_dns(Path::new(path), &reservation.network_id, self.overlay.dns_view(&reservation.route_domain_id))
                 .map_err(host_error)?;
         }
         let mac = attachment_mac(reservation.private_ipv4);
@@ -659,7 +693,7 @@ impl NetworkRuntime {
         Ok(())
     }
 
-    fn retire_port(&mut self, catalog: &Catalog, lease: &TapLease) -> Result<()> {
+    pub(crate) fn retire_port(&mut self, catalog: &Catalog, lease: &TapLease) -> Result<()> {
         let attachment_id = &lease.attachment.attachment_id;
         if let Some(router) = self.routers.get(&lease.attachment.route_domain_id) {
             router.remove_host_bound(lease.attachment.private_ipv4);
@@ -679,6 +713,7 @@ impl NetworkRuntime {
             self.routers.remove(domain);
             self.membership_filters.remove(domain);
         }
+        self.reconcile_overlay(catalog)?;
         self.cleanup_namespace_pins(catalog)
     }
 }

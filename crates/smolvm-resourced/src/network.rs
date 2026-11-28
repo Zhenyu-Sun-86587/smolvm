@@ -11,6 +11,9 @@ use std::thread;
 #[path = "network_topology.rs"]
 pub mod topology;
 
+#[path = "network_overlay.rs"]
+pub(crate) mod overlay;
+
 pub const TAP_PORT_NAME: &str = "port0";
 pub const TAP_MTU: u16 = 1500;
 pub const TAP_VNET_HEADER_SIZE: u16 = 12;

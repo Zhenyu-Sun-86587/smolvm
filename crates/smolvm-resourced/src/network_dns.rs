@@ -38,6 +38,7 @@ impl Resolver {
         catalog: &Path,
         network_id: &str,
         host_bound: crate::host_bound::Routes,
+        overlay: crate::network::overlay::DnsView,
     ) -> io::Result<Self> {
         let db = Connection::open_with_flags(
             catalog,
@@ -70,7 +71,7 @@ impl Resolver {
                     match socket.recv_from(&mut query) {
                         Ok((n, peer)) => {
                             if let Some(reply) =
-                                answer(&db, &network_id, &host_bound, peer.ip(), &query[..n])
+                                answer(&db, &network_id, &host_bound, &overlay, peer.ip(), &query[..n])
                             {
                                 let _ = socket.send_to(&reply, peer);
                             }
@@ -109,6 +110,7 @@ fn answer(
     db: &Connection,
     network: &str,
     host_bound: &crate::host_bound::Routes,
+    overlay: &crate::network::overlay::DnsView,
     peer: IpAddr,
     packet: &[u8],
 ) -> Option<Vec<u8>> {
@@ -126,7 +128,10 @@ fn answer(
     let address = match peer {
         IpAddr::V4(peer) => lookup(db, network, &name, peer).and_then(|entry| match entry {
             Some(_) => Ok(entry),
-            None => crate::packet_wake::sleeping_address(db, network, &name, peer),
+            None => match overlay.lookup(peer, &name) {
+                Some(address) => Ok(Some(address)),
+                None => crate::packet_wake::sleeping_address(db, network, &name, peer),
+            },
         }),
         IpAddr::V6(_) => Ok(None),
     };

@@ -202,7 +202,7 @@ impl PrivateRouter {
         Arc::strong_count(&self.namespace) == 1
     }
 
-    pub(crate) fn ensure_dns(&mut self, catalog: &Path, network: &str) -> io::Result<()> {
+    pub(crate) fn ensure_dns(&mut self, catalog: &Path, network: &str, overlay: crate::network::overlay::DnsView) -> io::Result<()> {
         if self.dns.is_none() {
             self.dns = Some(Arc::new(crate::network_dns::Resolver::start(
                 self.namespace(),
@@ -210,6 +210,7 @@ impl PrivateRouter {
                 catalog,
                 network,
                 self.host_bound_routes.clone(),
+                overlay,
             )?));
         }
         Ok(())
@@ -489,19 +490,19 @@ fn mask(prefix: u8) -> io::Result<u32> {
     Ok(u32::MAX << (32 - prefix))
 }
 
-fn namespace_path(namespace: BorrowedFd<'_>) -> String {
+pub(crate) fn namespace_path(namespace: BorrowedFd<'_>) -> String {
     format!("/proc/{}/fd/{}", process::id(), namespace.as_raw_fd())
 }
 
-fn ip(namespace: BorrowedFd<'_>, script: &str) -> io::Result<()> {
+pub(crate) fn ip(namespace: BorrowedFd<'_>, script: &str) -> io::Result<()> {
     command(namespace, "ip", &["-batch", "-"], Some(script))
 }
 
-fn nft(namespace: BorrowedFd<'_>, script: &str) -> io::Result<()> {
+pub(crate) fn nft(namespace: BorrowedFd<'_>, script: &str) -> io::Result<()> {
     command(namespace, "nft", &["-f", "-"], Some(script))
 }
 
-fn command(
+pub(crate) fn command(
     namespace: BorrowedFd<'_>,
     program: &str,
     args: &[&str],

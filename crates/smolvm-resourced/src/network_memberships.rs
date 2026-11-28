@@ -24,7 +24,7 @@ impl Default for Membership {
 }
 
 impl Membership {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         self.policy_revision >= 1
             && (self.policy_revision > 1 || self.networks.is_empty())
             && self.networks.len() <= 32
@@ -39,7 +39,7 @@ impl Membership {
             })
     }
 
-    fn overlaps(&self, other: &Self) -> bool {
+    pub(crate) fn overlaps(&self, other: &Self) -> bool {
         self.networks.is_empty() && other.networks.is_empty()
             || self
                 .networks
