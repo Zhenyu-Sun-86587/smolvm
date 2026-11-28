@@ -1257,17 +1257,40 @@ fn reserve_target_tap(
         "dns_name":dns_name,
     })).map_err(|_|Fault::invalid("invalid transfer reservation"))?;
     catalog.reserve_network_with_overlay(native, &data, network.overlay())?;
-    let lease = network.prepare(
-        catalog,
-        &native.derived(
-            "PrepareNetworkAttachment",
-            json!({
-                "attachment_id":transfer.target_attachment_id,
-                "guest_gateway_ipv4":fixed.map(|(_,gateway,_)|gateway),
-                "guest_prefix":fixed.map(|(_,_,prefix)|prefix),
-            }),
-        ),
-    )?;
+    let lease = match catalog.tap_lease(&transfer.target_attachment_id) {
+        Ok(lease) if lease.operation_id == input.op() && lease.gate == "closed" => {
+            let expected = &input.ticket().target.execution;
+            let ready = match lease.state.as_str() {
+                "quarantined" => lease.incarnation_id.is_none() && lease.execution_epoch.is_none(),
+                "offered" | "attached" => {
+                    lease.incarnation_id == expected.incarnation_id
+                        && lease.execution_epoch == Some(expected.execution_epoch)
+                }
+                _ => false,
+            };
+            if !ready || lease.instance_id != expected.instance_id {
+                return Err(fenced("target TAP no longer owns the held execution lease"));
+            }
+            lease
+        }
+        Ok(_) => {
+            return Err(fenced(
+                "target TAP belongs to a different operation or gate",
+            ))
+        }
+        Err(error) if error.code == "E_NOT_FOUND" => network.prepare(
+            catalog,
+            &native.derived(
+                "PrepareNetworkAttachment",
+                json!({
+                    "attachment_id":transfer.target_attachment_id,
+                    "guest_gateway_ipv4":fixed.map(|(_,gateway,_)|gateway),
+                    "guest_prefix":fixed.map(|(_,_,prefix)|prefix),
+                }),
+            ),
+        )?,
+        Err(error) => return Err(error),
+    };
     if !network_transfer::target_descriptor(transfer, &lease.attachment) {
         return Err(fenced(
             "target TAP cannot preserve the original IP, MAC and gateway",
