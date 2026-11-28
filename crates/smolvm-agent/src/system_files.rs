@@ -1,5 +1,7 @@
 //! Bounded transfer methods for the System Agent's VM filesystem.
 
+pub(super) mod v2;
+
 use std::fs::{File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
