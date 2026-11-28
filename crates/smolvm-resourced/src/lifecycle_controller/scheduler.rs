@@ -507,9 +507,16 @@ fn cold_launch(c: &mut Catalog, m: &Machine, d: &Decision, request: &Request) ->
             AND kind='wake' AND state='pending' AND first_launch_json IS NOT NULL ORDER BY rowid DESC LIMIT 1",
             params![id,d.id],|row|row.get(0)).optional()?
     } else {
-        c.db.query_row("SELECT spec_json FROM managed_launches m JOIN operations o USING(operation_id)
-            WHERE o.instance_id=? AND o.phase='COMPLETED' ORDER BY o.expected_execution_epoch DESC LIMIT 1",
-            [id],|row|row.get(0)).optional()?
+        {
+            let latest: Option<(String, String)> = c.db.query_row("SELECT o.operation_id, spec_json FROM managed_launches m JOIN operations o USING(operation_id)
+                WHERE o.instance_id=? AND o.phase='COMPLETED' ORDER BY o.expected_execution_epoch DESC LIMIT 1",
+                [id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+            match latest {
+                Some((operation, spec)) if crate::boot_environment::attempt(&c.db, &operation)?.is_none() => Some(spec),
+                Some(_) => return Err(conflict("the previous System boot used a one-time environment and requires an explicit start")),
+                None => None,
+            }
+        }
     };
     let raw = raw.ok_or_else(|| conflict("the authorized cold wake has no launch plan"))?;
     crate::managed::submit(c, request, serde_json::from_str(&raw).map_err(invalid)?)

@@ -736,6 +736,11 @@ impl Worker {
                     &request.derived("PrepareTargetActivation", input)
                 )?))
             }
+            "AckBootEnvironment" => {
+                let execution = self.authenticated_execution(request, peer)?;
+                crate::boot_environment::acknowledge(&self.catalog, request, &execution)?;
+                Ok(json!({"applied":true}))
+            }
             "AcquireManagedLaunchDisks" => {
                 let execution = self.authenticated_execution(request, peer)?;
                 return self.managed_devices(request, &execution);
@@ -1264,6 +1269,22 @@ impl Worker {
                     &input.kind,
                     input.parameters
                 )?))
+            }
+            "QueryBootEnvironment" => {
+                if request.payload != json!({}) {
+                    return Err(Fault::invalid("boot environment probe requires an empty payload"));
+                }
+                Ok(json!({"contract_version":1}))
+            }
+            "SubmitBootEnvironment" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Input {
+                    machine: crate::managed::Machine,
+                    environment: crate::boot_environment::Attempt,
+                }
+                let input: Input = request.payload()?;
+                Ok(json!(crate::managed::submit_with_environment(&mut self.catalog, request, input.machine, Some(input.environment))?))
             }
             "SubmitManagedLaunch" => Ok(json!(crate::managed::submit(
                 &mut self.catalog,

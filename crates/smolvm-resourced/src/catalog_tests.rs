@@ -68,7 +68,7 @@ fn upgrades_both_version_30_capture_journals_without_losing_their_rows() {
         let work = tempfile::tempdir().unwrap();
         let path = work.path().join("catalog.sqlite");
         let old = Catalog::open(&path, "boot", "old").unwrap();
-        old.db.execute_batch("DROP TABLE verified_block_backings").unwrap();
+        old.db.execute_batch("DROP TABLE verified_block_backings; DROP TABLE boot_environment_attempts").unwrap();
         if version < 31 {
             old.db.execute_batch("ALTER TABLE managed_fork_children DROP COLUMN capture_lost").unwrap();
         }
@@ -121,7 +121,7 @@ fn upgrades_both_version_30_capture_journals_without_losing_their_rows() {
             assert_eq!(journal.1.as_deref(), relay.then_some("access-old"));
             assert_eq!(journal.2, i64::from(cow));
             assert_eq!(current.db.query_row("SELECT count(*) FROM verified_block_backings", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
-            assert_eq!(current.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 36);
+            assert_eq!(current.db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 37);
         }
     }
 }

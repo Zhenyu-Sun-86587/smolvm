@@ -41,6 +41,8 @@ pub mod managed;
 mod machine_migration;
 mod migration_product_volumes;
 #[cfg(target_os = "linux")]
+pub mod boot_environment;
+#[cfg(target_os = "linux")]
 mod managed_fork;
 #[cfg(target_os = "linux")]
 mod managed_kernel_cow;

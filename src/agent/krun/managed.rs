@@ -124,6 +124,9 @@ impl KrunFunctions {
         if system {
             env.push(c"KRUN_INIT_PID1=1".as_ptr());
         }
+        if plan.boot_environment.is_some() {
+            env.push(c"SMOLVM_BOOT_ENVIRONMENT=1".as_ptr());
+        }
         if let Some(attached) = network {
             env.push(string(&format!(
                 "KRUN_STATIC_IPV4={}/{},{},{}",

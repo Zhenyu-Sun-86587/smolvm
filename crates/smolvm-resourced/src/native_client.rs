@@ -86,6 +86,13 @@ fn fault(code: &str, msg: impl ToString) -> QueryError {
     }
 }
 
+fn boot_environment_error(error: QueryError) -> QueryError {
+    match error.code.as_str() {
+        "E_CAPABILITY_UNSUPPORTED" | "E_PROTOCOL_UNSUPPORTED" => fault("E_BOOT_ENVIRONMENT_UNSUPPORTED", "Worker does not support boot environment delivery"),
+        _ => error,
+    }
+}
+
 fn sealed_bytes(fd: OwnedFd, size: &Value, limit: u64) -> Result<Vec<u8>, QueryError> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
@@ -299,7 +306,8 @@ impl Client<'_> {
         let socket = ipc::connect(self.socket).map_err(transport)?;
         // Disk reattachment and volume mutation can hash a complete backing.
         let seconds = match method {
-            "QueryKernelCowBoot" => 1,
+            "QueryKernelCowBoot" | "QueryBootEnvironment" => 1,
+            "AckBootEnvironment" => 2,
             "ApplyProductVolume" => 120,
             "AcquireManagedLaunchDisks" => 90,
             _ => 20,
@@ -379,6 +387,22 @@ impl Client<'_> {
                 input.parameters.clone(),
             )
         })
+    }
+    pub fn boot_environment(&self) -> Result<Value, QueryError> {
+        self.call("QueryBootEnvironment", None, None, empty()).map_err(boot_environment_error)
+    }
+    pub fn submit_boot_environment(&self, input: &Submission, attempt: &crate::boot_environment::Attempt) -> Result<OperationReceipt, QueryError> {
+        self.recover_and_retry(|| self.receipt("SubmitBootEnvironment", &input.operation_id,
+            &input.request_digest, &input.expected, json!({"machine":input.parameters,"environment":attempt})))
+            .map_err(boot_environment_error)
+    }
+    pub fn acknowledge_boot_environment(&self, launch: &Launch, revision: crate::boot_environment::Revision) -> Result<(), QueryError> {
+        let reply: Value = self.call("AckBootEnvironment", Some(&launch.execution),
+            Some((&launch.operation_id, &launch.request_digest)), json!(revision))?;
+        if reply["applied"] != true {
+            return Err(fault("E_PROTOCOL_UNSUPPORTED", "invalid boot environment acknowledgement"));
+        }
+        Ok(())
     }
     pub fn managed_pending(&self, serve: &str) -> Result<Vec<crate::managed::Plan>, QueryError> {
         self.call(

@@ -21,6 +21,8 @@ mod guest_agent;
 pub(crate) mod launch;
 #[cfg(all(target_os = "linux", feature = "deep-runtime"))]
 pub(crate) mod managed;
+#[cfg(all(target_os = "linux", feature = "deep-runtime"))]
+pub(crate) mod boot_environment;
 
 fn installed_profile() -> Result<(Handshake, serde_json::Value, String), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -212,6 +214,9 @@ pub fn worker_operations_router(socket: std::path::PathBuf) -> axum::Router {
         router.route(
             "/api/v1/runtime-ext/v1/machines/{name}/binding",
             axum::routing::get(machine_binding),
+        ).route(
+            "/api/v1/runtime-ext/v1/boot-environment",
+            axum::routing::get(boot_environment::probe).post(boot_environment::submit),
         )
     };
     router.with_state(socket)
