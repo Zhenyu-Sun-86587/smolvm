@@ -149,7 +149,7 @@ pub(crate) fn register(
             base.closure_digest,
             base.manifest_digest,
             base.member_digest,
-            base.member_bytes,
+            base.member_bytes as i64,
             broker
         ],
     )?;
@@ -162,7 +162,7 @@ pub(crate) fn register(
             base.closure_digest,
             base.manifest_digest,
             base.member_digest,
-            base.member_bytes,
+            base.member_bytes as i64,
             broker
         ],
         |row| row.get(0),
@@ -200,11 +200,12 @@ pub(crate) fn launch(
         if !visited.insert(id) || layer.spec.mutable() {
             continue;
         }
-        let stored: Option<(u64, String)> = catalog.db.query_row(
+        let stored: Option<(i64, String)> = catalog.db.query_row(
             "SELECT member_bytes,broker_socket FROM bucket_block_bases WHERE resource_id=? AND bundle_digest=?",
             params![id,bundle], |row| Ok((row.get(0)?,row.get(1)?)),
         ).optional()?;
         if let Some((bytes, broker)) = stored {
+            let bytes = u64::try_from(bytes).map_err(unavailable)?;
             if physical_len(objects, layer)? != bytes {
                 return Err(unavailable(
                     "declared remote member differs from its sealed layer identity",

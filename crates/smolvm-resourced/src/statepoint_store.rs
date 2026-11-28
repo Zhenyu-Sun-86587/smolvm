@@ -506,6 +506,7 @@ mod tests {
             checkpoint,
             &mut io::repeat(0),
             disk(data.try_clone().unwrap()),
+            None,
         ).unwrap();
         let committed = manifest.digest().unwrap();
         let manifest = read(temp.path(), &point, &digest(b"bundle"), "commit").unwrap();
