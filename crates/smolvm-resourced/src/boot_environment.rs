@@ -8,7 +8,6 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const GUEST_PORT: u32 = 610;
 pub const MAX_VALUES_BYTES: usize = 256 << 10;
 pub const MAX_WIRE_BYTES: usize = 2 << 20;
 

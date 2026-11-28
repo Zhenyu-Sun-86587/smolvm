@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 const MAX_PENDING: usize = 64;
 const GREETING: &[u8; 10] = b"SMOLBOOT1\n";
+const DELIVERY: &[u8; 4] = b"ENV1";
 const APPLIED: &[u8; 2] = b"OK";
 
 #[derive(Deserialize)]
@@ -146,8 +147,10 @@ pub(super) async fn submit(State(socket): State<PathBuf>, body: axum::body::Byte
     .await
 }
 
-pub(crate) fn socket(control: &Path) -> PathBuf {
-    control.with_file_name("e.sock")
+fn socket(control: &Path) -> PathBuf {
+    // The Guest loader temporarily owns the standard Agent port during
+    // sysinit. Keep the existing port layout so parked readers can rebind it.
+    control.with_file_name("agent.sock")
 }
 
 pub(super) fn start(
@@ -225,7 +228,8 @@ fn deliver(path: &Path, delivery: Delivery, attempt: &Attempt) -> std::io::Resul
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     socket.set_write_timeout(Some(Duration::from_secs(10)))?;
     let result = socket
-        .write_all(&(body.len() as u32).to_be_bytes())
+        .write_all(DELIVERY)
+        .and_then(|()| socket.write_all(&(body.len() as u32).to_be_bytes()))
         .and_then(|()| socket.write_all(&body));
     body.fill(0);
     result?;

@@ -232,14 +232,6 @@ impl KrunFunctions {
                     (self.add_vsock_port2)(ctx, 6000, guest_socket.as_ptr(), true),
                 )?;
             }
-            if plan.boot_environment.is_some() {
-                let path = crate::runtime_ext::boot_environment::socket(control);
-                let socket = CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-                check(
-                    "System boot environment channel",
-                    (self.add_vsock_port2)(ctx, smolvm_resourced::boot_environment::GUEST_PORT, socket.as_ptr(), true),
-                )?;
-            }
             if let Some(path) = guest_relay.as_ref() {
                 check(
                     "Guest management relay",
