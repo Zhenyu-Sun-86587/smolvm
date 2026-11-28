@@ -102,6 +102,21 @@ struct Attachment {
     policy_revision: i64,
 }
 
+#[derive(Default, Serialize)]
+struct ResumedNetwork {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reopened_attachment: Option<Attachment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovered_tap: Option<RecoveredTap>,
+}
+
+#[derive(Serialize)]
+struct RecoveredTap {
+    original_revision: i64,
+    closed_revision: i64,
+    broker_session_id: String,
+}
+
 #[derive(Deserialize, Serialize)]
 struct ReadyNetwork {
     transfer: Transfer,
@@ -1714,7 +1729,7 @@ fn reopen_source_tap(
     input: &Input,
     network: &NetworkRuntime,
     execution: &Execution,
-) -> Result<Option<Attachment>> {
+) -> Result<ResumedNetwork> {
     let row: Option<(String,i64,String,String,String)> = catalog.db.query_row(
         "SELECT lease_id,lease_revision,transfer_json,phase,kernel_scope_json FROM machine_migration_source_taps WHERE migration_id=?",
         [&input.ticket().id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
@@ -1722,7 +1737,11 @@ fn reopen_source_tap(
     let Some((id, revision, scope, phase, kernel_scope)) = row else {
         let (_, plan) = source_plan(catalog, input)?;
         expected_source_attachment(catalog, input, execution, &plan)?;
-        return Ok(source_attachment(catalog, execution, &plan, false)?.map(|(a, _)| a));
+        return Ok(ResumedNetwork {
+            reopened_attachment: source_attachment(catalog, execution, &plan, false)?
+                .map(|(a, _)| a),
+            recovered_tap: None,
+        });
     };
     let transfer =
         requested_transfer(input).ok_or_else(|| fenced("source network scope is missing"))?;
@@ -1751,8 +1770,18 @@ fn reopen_source_tap(
         ));
     }
     let lease = catalog.tap_lease(&transfer.attachment_id)?;
-    let revision_now = revision + i64::from(phase == "reopened");
+    let reopened_revision = revision
+        .checked_add(1)
+        .ok_or_else(|| fenced("source TAP reopen revision is exhausted"))?;
+    let revision_now = if phase == "reopened" {
+        reopened_revision
+    } else {
+        revision
+    };
     if lease.lease_id != id
+        || lease.lease_id != reopened.lease.lease_id
+        || lease.broker_session_id != reopened.lease.broker_session_id
+        || revision < transfer.attachment_revision
         || lease.revision != revision_now
         || !lease.matches(execution)
         || lease.state != "attached"
@@ -1762,6 +1791,31 @@ fn reopen_source_tap(
     {
         return Err(fenced("source TAP reopen would change the original lease"));
     }
+    let recovered_tap = if revision > transfer.attachment_revision {
+        let broker_session_id = catalog
+            .db
+            .query_row(
+                "SELECT w.broker_session_id FROM network_kernel_receipts k
+             JOIN network_tap_leases l USING(lease_id)
+             JOIN worker_state w ON w.singleton=1 AND w.host_boot_id=l.host_boot_id
+             WHERE l.lease_id=?1 AND l.broker_session_id=?2
+               AND k.adopted_session_id=w.broker_session_id
+               AND w.broker_session_id<>l.broker_session_id",
+                params![id, reopened.lease.broker_session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                fenced("source TAP revision advanced without the exact broker recovery proof")
+            })?;
+        Some(RecoveredTap {
+            original_revision: transfer.attachment_revision,
+            closed_revision: revision,
+            broker_session_id,
+        })
+    } else {
+        None
+    };
     if phase != "reopened" {
         catalog.db.execute(
             "UPDATE machine_migration_source_taps SET phase='reopening' WHERE migration_id=?",
@@ -1796,10 +1850,18 @@ fn reopen_source_tap(
         tx.commit()?;
     }
     reopened.lease = catalog.tap_lease(&transfer.attachment_id)?;
-    if reopened.lease.gate != "open" {
-        return Err(fenced("reopened source TAP has no publication receipt"));
+    if reopened.lease.gate != "open"
+        || reopened.lease.lease_id != id
+        || reopened.lease.revision != reopened_revision
+    {
+        return Err(fenced(
+            "reopened source TAP has no exact publication receipt",
+        ));
     }
-    Ok(Some(reopened))
+    Ok(ResumedNetwork {
+        reopened_attachment: Some(reopened),
+        recovered_tap,
+    })
 }
 
 fn source_fence(
@@ -2599,13 +2661,13 @@ impl crate::worker::Worker {
                 } else {
                     let (execution, plan) = source_plan(&self.catalog, &input)?;
                     expected_source_attachment(&self.catalog, &input, &execution, &plan)?;
-                    None
+                    ResumedNetwork::default()
                 };
                 remember(
                     &mut self.catalog,
                     &input,
                     "resumed",
-                    json!({"details":{"reopened_attachment":reopened}}),
+                    json!({"details":reopened}),
                 )
             }
             ("finalize_source", "fenced") => {
