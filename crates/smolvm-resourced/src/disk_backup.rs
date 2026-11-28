@@ -163,7 +163,7 @@ impl<'a> Attempt<'a> {
             "SELECT bundle_digest,instance_id,execution_epoch,owner_epoch,binding_generation,disks_json,deleted
              FROM disk_backups WHERE backup_id=?",
             [&self.input.backup_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, String>(5)?, r.get(6)?)),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, bool>(6)?)),
         ).optional()?.ok_or_else(|| Fault::new("DISK_BACKUP_NOT_FOUND", "disk backup is unavailable"))?;
         let (_, wanted_bundle, expected) = self.scope.scope()?;
         if bundle != wanted_bundle
@@ -816,9 +816,8 @@ fn finish_pending(
     let op = attempt.native.operation()?.0;
     let staged: Vec<String> = {
         let mut query = catalog.db.prepare("SELECT spec_json FROM managed_blocks WHERE operation_id=? AND backing_identity IS NULL")?;
-        query
-            .query_map([op], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+        let rows = query.query_map([op], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for raw in staged {
         blocks::discard_staged(objects, op, &decode(&raw)?)?;
