@@ -72,6 +72,7 @@ pub mod retry;
 pub mod secrets;
 pub mod sni;
 pub mod tcp_forward;
+pub mod system_files_v2;
 pub mod workload_target;
 
 pub use credentials::{CredentialBinding, CredentialPolicy};
@@ -620,6 +621,11 @@ pub enum ManagedDisk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Filesystem operations on the execution-scoped System Agent only.
+    SystemFilesV2 {
+        /// Connection-owned v2 file request.
+        request: system_files_v2::Request,
+    },
     /// Execute a connection-owned command with independently addressable controls.
     VmExecControlled {
         /// Command and its caller-generated lifetime identifier.
@@ -1572,6 +1578,7 @@ impl AgentRequest {
     /// decision rather than an accidental leak in some future request type.
     pub fn log_summary(&self) -> String {
         match self {
+            AgentRequest::SystemFilesV2 { .. } => "SystemFilesV2".into(),
             AgentRequest::ContainerSession { .. } => "ContainerSession".into(),
             AgentRequest::OnlineMemory {
                 start_address,

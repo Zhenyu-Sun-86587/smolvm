@@ -1,5 +1,7 @@
 //! Bounded transfer methods for the System Agent's VM filesystem.
 
+pub(super) mod v2;
+
 use std::fs::{File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
@@ -286,6 +288,8 @@ fn write(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    mod v2;
+
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;

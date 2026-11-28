@@ -2480,6 +2480,7 @@ fn handle_connection(
     // another request type arriving mid-stream) takes it.
     let mut write_session: Option<WriteSession> = None;
     let mut system_upload = None;
+    let mut system_upload_v2 = None;
     let mut files_session: Option<container::FilesSession> = None;
     let mut directory_session: Option<directory_write::Session> = None;
 
@@ -2575,6 +2576,15 @@ fn handle_connection(
         debug!(method = %request.log_summary(), "received request");
 
         if mode.is_system() {
+            if !matches!(
+                request,
+                AgentRequest::SystemFilesV2 {
+                    request: smolvm_protocol::system_files_v2::Request::WriteChunk { .. }
+                        | smolvm_protocol::system_files_v2::Request::WriteCommit,
+                }
+            ) {
+                system_upload_v2 = None;
+            }
             if !matches!(request, AgentRequest::FileWriteChunk { .. }) {
                 system_upload = None;
             }
@@ -2585,6 +2595,7 @@ fn handle_connection(
                         "system-service-v1".to_owned(),
                         smolvm_protocol::SYSTEM_FILE_WRITE_CAPABILITY.to_owned(),
                         smolvm_protocol::SYSTEM_FILE_TRANSFER_CAPABILITY.to_owned(),
+                        smolvm_protocol::system_files_v2::CAPABILITY.to_owned(),
                         smolvm_protocol::SYSTEM_EXEC_STREAM_CAPABILITY.to_owned(),
                         smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY.to_owned(),
                         smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY.to_owned(),
@@ -2629,6 +2640,10 @@ fn handle_connection(
                 } if data.len() <= smolvm_protocol::FILE_WRITE_SINGLE_SHOT_MAX => {
                     let _permit = WORK_SLOTS.acquire();
                     handle_file_write(&path, &data, mode, uid, gid, Some(&WorkloadTarget::Vm))
+                }
+                AgentRequest::SystemFilesV2 { request } => {
+                    system_files::v2::handle(stream, request, &mut system_upload_v2)?;
+                    continue;
                 }
                 request @ (AgentRequest::FileRead { .. }
                 | AgentRequest::ListDirectory { .. }
@@ -3360,7 +3375,8 @@ fn handle_request(
 
         // Streaming uploads go through `handle_connection`'s
         // per-connection session state so they can't land here.
-        AgentRequest::FileWriteBegin { .. }
+        AgentRequest::SystemFilesV2 { .. }
+        | AgentRequest::FileWriteBegin { .. }
         | AgentRequest::DirectoryWriteBegin { .. }
         | AgentRequest::FileWriteChunk { .. } => AgentResponse::error(
             "streaming file write must be handled at connection level",
