@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use rustix::fs::{self as sys, AtFlags, RenameFlags, StatxFlags};
+use rustix::fs::{self as sys, AtFlags, Mode, OFlags, RenameFlags, StatxFlags};
 use smolvm_protocol::system_files_v2::{Overwrite, Request, MAX_ARCHIVE_ENTRIES, MAX_BYTES};
 use smolvm_protocol::AgentResponse;
 
@@ -69,11 +69,12 @@ pub(super) fn metadata(path: &Path) -> Result<Option<Metadata>> {
 }
 
 pub(super) fn open_path(path: &Path, follow: bool) -> Result<File> {
-    let flags = libc::O_PATH | if follow { 0 } else { libc::O_NOFOLLOW };
-    Ok(OpenOptions::new()
-        .read(true)
-        .custom_flags(flags)
-        .open(path)?)
+    let mut flags = OFlags::PATH | OFlags::CLOEXEC;
+    if !follow {
+        flags |= OFlags::NOFOLLOW;
+    }
+    let fd = sys::open(path, flags, Mode::empty()).map_err(io::Error::from)?;
+    Ok(File::from(fd))
 }
 
 pub(super) fn fd_path(file: &File) -> PathBuf {

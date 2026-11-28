@@ -732,6 +732,24 @@ mod tests {
             )["type"],
             "file"
         );
+        let copied = directory.path().join("copied");
+        v2_data(
+            &mut host,
+            FileRequest::Copy {
+                path: byte_path(&target),
+                destination: byte_path(&copied),
+                recursive: true,
+                overwrite: Overwrite::Reject,
+            },
+        );
+        assert_eq!(
+            std::fs::read_link(copied.join("link")).unwrap(),
+            std::path::Path::new("data")
+        );
+        assert_eq!(
+            std::fs::metadata(copied.join("data")).unwrap().ino(),
+            std::fs::metadata(copied.join("hard")).unwrap().ino()
+        );
         v2_data(
             &mut host,
             FileRequest::Remove {
