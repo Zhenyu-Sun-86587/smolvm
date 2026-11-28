@@ -431,13 +431,12 @@ fn publish_capture(
     if !destination.exists() {
         for (member, bytes) in manifest.members.iter().filter(|(name, _)| !name.starts_with("blocks/")) {
             let path = member.strip_prefix(&prefix).ok_or_else(|| invalid("unexpected migration StatePoint member"))?;
-            if path.is_empty() || path.split('/').any(|part| !valid_id(part)) {
-                return Err(invalid("invalid migration StatePoint member path"));
-            }
+            // The backup member reader validates every relative component and
+            // refuses symlinks. Check it before creating the destination path.
+            let source = backup_closure::open_member(directory, member).map_err(invalid)?;
             let target = stage.path().join(representation).join(path);
             fs::create_dir_all(target.parent().ok_or_else(|| invalid("missing StatePoint member directory"))?).map_err(invalid)?;
             let output = OpenOptions::new().write(true).create_new(true).mode(0o400).open(target).map_err(invalid)?;
-            let source = backup_closure::open_member(directory, member).map_err(invalid)?;
             if source.metadata().map_err(invalid)?.len() != *bytes {
                 return Err(invalid("StatePoint member length changed"));
             }
