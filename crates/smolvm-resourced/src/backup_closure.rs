@@ -18,6 +18,11 @@ use std::path::{Component, Path};
 const MAX_MANIFEST: usize = 16 << 20;
 const MAX_CLOSURE: usize = 1024;
 const SCHEMA: &str = "NativeBackupClosure/1";
+const TRANSFER_SCHEMA: &str = "NativeBackupTransfer/1";
+
+fn disabled(value: &bool) -> bool {
+    !value
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +32,8 @@ struct Selection {
     capture_ids: Vec<String>,
     generation_ids: Vec<String>,
     bundle_manifest: Value,
+    #[serde(default, skip_serializing_if = "disabled")]
+    require_member_digests: bool,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +67,16 @@ pub(crate) struct Manifest {
     #[serde(default)]
     block_digests: BTreeMap<String, String>,
     members: BTreeMap<String, u64>,
+}
+
+// The original closure is an opaque string so it keeps the exact digest and
+// encoding expected by every already-installed NativeBackupClosure/1 reader.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TransferManifest {
+    schema: String,
+    closure: String,
+    member_digests: BTreeMap<String, String>,
 }
 
 fn invalid(message: &str) -> Fault {
@@ -119,7 +136,14 @@ fn open_member(root: &File, path: &str) -> io::Result<File> {
     Ok(file)
 }
 
-fn enumerate(base: &Path, sub: &Path, depth: usize, result: &mut Manifest) -> io::Result<()> {
+fn enumerate(
+    base: &Path,
+    root: &File,
+    sub: &Path,
+    depth: usize,
+    members: &mut BTreeMap<String, u64>,
+    digests: &mut Option<BTreeMap<String, String>>,
+) -> io::Result<()> {
     if depth > 6 {
         return Err(io::Error::other(
             "StatePoint representation is too deeply nested",
@@ -130,14 +154,25 @@ fn enumerate(base: &Path, sub: &Path, depth: usize, result: &mut Manifest) -> io
         let name = sub.join(entry.file_name());
         let mode = entry.file_type()?;
         if mode.is_dir() {
-            enumerate(base, &name, depth + 1, result)?;
+            enumerate(base, root, &name, depth + 1, members, digests)?;
         } else if mode.is_file() {
             let name = name
                 .to_str()
                 .ok_or_else(|| io::Error::other("non-UTF8 StatePoint member"))?;
-            result
-                .members
-                .insert(format!("statepoints/{name}"), entry.metadata()?.len());
+            let member = format!("statepoints/{name}");
+            let bytes = if let Some(digests) = digests {
+                let mut file = open_member(root, name)?;
+                let bytes = file.metadata()?.len();
+                let hash = hash_file(&mut file)?;
+                if file.stream_position()? != bytes {
+                    return Err(io::Error::other("StatePoint member changed while pinning"));
+                }
+                digests.insert(member.clone(), hash);
+                bytes
+            } else {
+                entry.metadata()?.len()
+            };
+            members.insert(member, bytes);
         } else {
             return Err(io::Error::other(
                 "unexpected type in StatePoint representation",
@@ -221,6 +256,7 @@ pub(crate) fn prepare(
     let mut roots: BTreeSet<String> = selection.generation_ids.into_iter().collect();
     let mut pins = BTreeSet::new();
     let mut hashes = BTreeMap::new();
+    let mut member_digests = selection.require_member_digests.then(BTreeMap::new);
     for id in selection.capture_ids {
         let (record, operation) =
             crate::managed_state_restore::source(catalog, "deep", bundle, &id)?;
@@ -242,9 +278,11 @@ pub(crate) fn prepare(
         roots.extend(record.point.disk_generations.iter().cloned());
         enumerate(
             points,
+            &File::open(points).map_err(corrupt)?,
             Path::new(&record.point.representation_id),
             0,
-            &mut manifest,
+            &mut manifest.members,
+            &mut member_digests,
         )
         .map_err(corrupt)?;
         let origin = crate::backup_import::describe(catalog, &record, &operation)?;
@@ -285,13 +323,26 @@ pub(crate) fn prepare(
             } else {
                 hash_file(&mut file).map_err(corrupt)?
             };
-            manifest.members.insert(format!("blocks/{id}/data"), bytes);
+            let member = format!("blocks/{id}/data");
+            if let Some(digests) = &mut member_digests {
+                digests.insert(member.clone(), hash.clone());
+            }
+            manifest.members.insert(member, bytes);
             manifest.block_digests.insert(id.clone(), hash);
             pins.insert(id.clone());
             manifest.blocks.insert(id.clone(), layer.spec);
         }
     }
-    let raw = serde_json::to_string(&manifest).map_err(corrupt)?;
+    let closure = serde_json::to_string(&manifest).map_err(corrupt)?;
+    let raw = match member_digests {
+        Some(member_digests) => serde_json::to_string(&TransferManifest {
+            schema: TRANSFER_SCHEMA.into(),
+            closure,
+            member_digests,
+        })
+        .map_err(corrupt)?,
+        None => closure,
+    };
     if raw.len() > MAX_MANIFEST {
         return Err(Fault::new(
             "E_RESOURCE_LIMIT",
@@ -328,7 +379,7 @@ pub(crate) fn read(
     let bundle = bundle(catalog, request)?;
     let selection: Locate = request.payload()?;
     let raw = pinned_manifest(catalog, &selection.backup_id, bundle)?;
-    let manifest: Manifest = serde_json::from_str(&raw).map_err(corrupt)?;
+    let manifest = decode_pinned(&raw).map_err(corrupt)?;
     let member = selection
         .member
         .ok_or_else(|| invalid("backup member is missing"))?;
@@ -360,6 +411,23 @@ pub(crate) fn read(
         json!({"backup_id":selection.backup_id,"member":member,"bytes":bytes}),
         file,
     ))
+}
+
+fn decode_pinned(raw: &str) -> io::Result<Manifest> {
+    #[derive(Deserialize)]
+    struct PinnedTransfer {
+        schema: String,
+        closure: String,
+    }
+
+    if let Ok(manifest) = serde_json::from_str(raw) {
+        return Ok(manifest);
+    }
+    let transfer: PinnedTransfer = serde_json::from_str(raw)?;
+    if transfer.schema != TRANSFER_SCHEMA {
+        return Err(io::Error::other("unknown backup transfer schema"));
+    }
+    Ok(serde_json::from_str(&transfer.closure)?)
 }
 
 pub(crate) fn release(catalog: &mut Catalog, request: &Request) -> Result<Value> {
@@ -617,4 +685,68 @@ fn sync_directories(path: &Path) -> io::Result<()> {
         }
     }
     File::open(path)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_digests_keep_the_original_closure_reader_compatible() {
+        let root = tempfile::tempdir().unwrap();
+        let points = root.path().join("statepoints");
+        fs::create_dir_all(points.join("p1/pack")).unwrap();
+        fs::write(points.join("p1/pack/ram"), b"ram").unwrap();
+        fs::write(points.join("p1/statepoint.json"), b"point").unwrap();
+        let bundle = digest(b"bundle");
+        let mut manifest = Manifest {
+            schema: SCHEMA.into(),
+            backup_id: "backup".into(),
+            bundle_digest: bundle.clone(),
+            state_reader_id: "reader:v1".into(),
+            captures: Vec::new(),
+            generations: Vec::new(),
+            blocks: BTreeMap::new(),
+            block_digests: BTreeMap::new(),
+            members: BTreeMap::new(),
+        };
+        let mut member_digests = Some(BTreeMap::new());
+        enumerate(
+            &points,
+            &File::open(&points).unwrap(),
+            Path::new("p1"),
+            0,
+            &mut manifest.members,
+            &mut member_digests,
+        )
+        .unwrap();
+        let closure = serde_json::to_string(&manifest).unwrap();
+        let digest_map = member_digests.unwrap();
+        let member = "statepoints/p1/pack/ram";
+        assert_eq!(manifest.members[member], 3);
+        assert_eq!(digest_map[member], digest(b"ram"));
+        assert_eq!(
+            digest_map["statepoints/p1/statepoint.json"],
+            digest(b"point")
+        );
+
+        let transfer = serde_json::to_string(&TransferManifest {
+            schema: TRANSFER_SCHEMA.into(),
+            closure: closure.clone(),
+            member_digests: digest_map,
+        })
+        .unwrap();
+        assert_eq!(decode_pinned(&transfer).unwrap().members, manifest.members);
+        assert_eq!(decode_pinned(&closure).unwrap().members, manifest.members);
+        fs::write(root.path().join("closure.json"), &closure).unwrap();
+        let (archived, original) = load(
+            &File::open(root.path()).unwrap(),
+            &digest(closure.as_bytes()),
+            &bundle,
+            "reader:v1",
+        )
+        .unwrap();
+        assert_eq!(original, closure.as_bytes());
+        assert_eq!(archived.members, manifest.members);
+    }
 }
