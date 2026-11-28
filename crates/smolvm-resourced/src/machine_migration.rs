@@ -13,7 +13,6 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -627,12 +626,13 @@ fn hold_source(catalog: &mut Catalog, objects: &File, boot: &str, input: &Input)
             "captured writable device set differs from managed launch",
         ));
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| Fault::new("E_HOST_IO", error.to_string()))?
-        .as_millis() as u64;
     let product_volumes = product_volumes(catalog, input, &devices)?;
     products::check_held(catalog, &input.ticket().id, &product_volumes)?;
+    let parked_at: Option<i64> = catalog.db.query_row(
+        "SELECT parked_at_unix_ms FROM machine_migrations WHERE migration_id=?",
+        [&input.ticket().id],
+        |row| row.get(0),
+    )?;
     let details = HeldDetails {
         generation_ids: record.point.disk_generations,
         capture_operation_id: op.operation_id,
@@ -646,7 +646,7 @@ fn hold_source(catalog: &mut Catalog, objects: &File, boot: &str, input: &Input)
         input,
         "held",
         json!({"capture_id":capture,"manifest_digest":record.manifest_digest,
-        "paused_at_unix_ms":now,"details":details}),
+        "paused_at_unix_ms":parked_at,"details":details}),
     )
 }
 
@@ -668,9 +668,17 @@ fn inspect(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Value> {
         None
     };
     let product_volumes = product_volumes(catalog, input, &plan.devices)?;
+    let storage = plan
+        .devices
+        .iter()
+        .filter(|device| !device.disk.read_only)
+        .try_fold(0u64, |sum, device| sum.checked_add(device.capacity_bytes))
+        .ok_or_else(|| Fault::invalid("source disk capacity overflow"))?;
     make_receipt(
         input,
-        json!({"details":{"profile":profile,"product_volumes":product_volumes}}),
+        json!({"details":{"profile":profile,
+        "vcpus":plan.machine.cpus,"memory_mib":plan.machine.memory_mib,"storage_bytes":storage,
+        "product_volumes":product_volumes}}),
     )
 }
 
@@ -684,21 +692,40 @@ fn preflight(catalog: &mut Catalog, input: &Input) -> Result<Value> {
             "target slot is not empty at the admitted execution epoch",
         ));
     }
-    if input.ticket().mode == "live" {
-        let target = cpu_clock_profile()?;
-        if let Some(source) = input
-            .request
-            .hold
-            .as_ref()
-            .filter(|receipt| receipt["step"] == "inspect_source")
-        {
-            input.check(Some(source), "inspect_source", &input.ticket().source)?;
+    if let Some(source) = input.request.hold.as_ref() {
+        input.check(Some(source), "inspect_source", &input.ticket().source)?;
+        let capacity = crate::admission::status(&catalog.db)?;
+        for dimension in ["vcpus", "memory_mib", "storage_bytes"] {
+            let required = source["details"][dimension]
+                .as_u64()
+                .ok_or_else(|| Fault::invalid("source receipt lacks its managed capacity"))?;
+            let total = capacity["capacity"][dimension].as_u64().unwrap_or_default();
+            let used = capacity["allocated"][dimension]
+                .as_u64()
+                .unwrap_or_default();
+            if required > total.saturating_sub(used) {
+                return Err(Fault::new(
+                    "E_RESOURCE_LIMIT",
+                    format!("target lacks enough {dimension} for the admitted source"),
+                ));
+            }
+        }
+        if input.ticket().mode == "live" {
+            let target = cpu_clock_profile()?;
             if source["details"]["profile"] != target {
                 return Err(unsupported(
                     "held migration requires identical CPU fingerprints and KVM TSC support",
                 ));
             }
+            crate::admission::require_capture_space(
+                &catalog.db,
+                source["details"]["memory_mib"].as_u64().unwrap_or_default(),
+            )?;
         }
+    } else if input.ticket().mode == "live" {
+        return Err(fenced(
+            "held target preflight requires CPU, clock and geometry from the exact source",
+        ));
     }
     make_receipt(input, json!({}))
 }
@@ -754,13 +781,15 @@ fn prepare_target(
     reserve(catalog, input)?;
     let endpoint = input.endpoint();
     let op = input.op();
-    let saved_import: Option<String> = catalog.db.query_row(
-        "SELECT import_json FROM machine_migrations WHERE migration_id=?",
+    let (import_state, saved_import): (String, Option<String>) = catalog.db.query_row(
+        "SELECT state,import_json FROM machine_migrations WHERE migration_id=?",
         [&input.ticket().id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if let Some(saved) = saved_import {
-        if !descriptors.is_empty() && saved != encode(import_spec(input)?)? {
+    if import_state == "imported" {
+        if !descriptors.is_empty()
+            && saved_import.as_deref() != Some(encode(import_spec(input)?)?.as_str())
+        {
             return Err(fenced(
                 "target import receipt differs from the original transferred closure",
             ));
@@ -772,6 +801,18 @@ fn prepare_target(
                 "target import differs from the exact selected generations",
             ));
         }
+        let encoded = encode(&spec)?;
+        if saved_import
+            .as_deref()
+            .is_some_and(|saved| saved != encoded)
+        {
+            return Err(fenced("transfer retry changed its original closure digest"));
+        }
+        catalog.db.execute(
+            "UPDATE machine_migrations SET state='importing',import_json=?
+            WHERE migration_id=? AND decision_json IS NULL",
+            params![encoded, input.ticket().id],
+        )?;
         let mut request = input.native(endpoint.execution.clone(), spec.clone());
         request.fd_table = wire
             .fd_table
@@ -805,8 +846,8 @@ fn prepare_target(
             crate::disk_closure_import::import(catalog, objects, &request, descriptors)?;
         }
         catalog.db.execute(
-            "UPDATE machine_migrations SET import_json=? WHERE migration_id=?",
-            params![encode(&spec)?, input.ticket().id],
+            "UPDATE machine_migrations SET state='imported' WHERE migration_id=?",
+            [&input.ticket().id],
         )?;
     }
 
@@ -933,7 +974,7 @@ fn queue_cold(
     })
 }
 
-fn source_fence(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Value> {
+fn source_fence(catalog: &mut Catalog, objects: &File, input: &Input, boot: &str) -> Result<Value> {
     let ready = input.check(
         input.request.ready.as_ref(),
         "prepare_target",
@@ -971,6 +1012,27 @@ fn source_fence(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Valu
     }
     let endpoint =
         crate::native_control::Endpoint::load(&catalog.db, &record.point.incarnation_id, boot)?;
+    let execution = catalog.execution(&record.point.incarnation_id)?;
+    let operation = catalog.operation(&record.operation_id)?;
+    let sealed = crate::statepoint_capture::disk_roots(
+        catalog,
+        objects,
+        &operation,
+        &execution,
+        &record.export,
+        &record.point.devices,
+    )?;
+    if sealed != record.point.disk_generations
+        || record
+            .point
+            .devices
+            .iter()
+            .any(|device| device.is_network())
+    {
+        return Err(fenced(
+            "source writer set or measured network inventory changed",
+        ));
+    }
     let scope = format!("{} {}", record.export.session, record.export.hold_token);
     endpoint.command(&format!("CAPTURE_STOP_RESERVE {scope}"))?;
     let status = endpoint.command(&format!("CAPTURE_QUERY {scope}"))?;
@@ -1025,7 +1087,12 @@ fn record_decision(catalog: &Catalog, input: &Input, prior: Option<&str>) -> Res
     Ok(())
 }
 
-fn release_import(catalog: &mut Catalog, objects: &File, input: &Input) -> Result<()> {
+fn release_import(
+    catalog: &mut Catalog,
+    objects: &File,
+    points: &Path,
+    input: &Input,
+) -> Result<()> {
     let present: Option<String> = catalog.db.query_row(
         "SELECT import_json FROM machine_migrations WHERE migration_id=?",
         [&input.ticket().id],
@@ -1036,7 +1103,26 @@ fn release_import(catalog: &mut Catalog, objects: &File, input: &Input) -> Resul
             serde_json::from_str(&raw).map_err(|error| Fault::invalid(error.to_string()))?;
         let request = input.native(input.endpoint().execution.clone(), json!({"import_id":spec["import_id"],
             "closure_digest":spec["closure_digest"],"worker_manifest_digest":spec["worker_manifest_digest"]}));
-        crate::disk_closure_import::release(catalog, objects, &request)?;
+        if let Err(error) = crate::disk_closure_import::release(catalog, objects, &request) {
+            if error.code != "E_NOT_FOUND" {
+                return Err(error);
+            }
+        }
+    }
+    if input.ticket().mode == "live" {
+        // An interrupted StatePoint import can have published the verified
+        // directory before its catalog transaction. The migration-scoped
+        // representation has no owner in that case.
+        let source = native_id(&input.ticket().id, "source");
+        let representation = managed::key(&source, "representation", 0);
+        match catalog.resource(&representation) {
+            Ok(_) => (),
+            Err(error) if error.code == "E_NOT_FOUND" => {
+                crate::statepoint_store::collect(points, &representation)
+                    .map_err(crate::statepoint_capture::host_io)?;
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
@@ -1078,12 +1164,46 @@ impl crate::worker::Worker {
             }
         }
         if let Some(result) = previous(&self.catalog, &input, step)? {
-            let phase = state(&self.catalog, &input)?.unwrap().0;
+            let (phase, decision) = state(&self.catalog, &input)?.unwrap();
             if (phase == "aborted" && step != "abort_target")
                 || (phase == "resumed" && step != "resume_source")
                 || (step == "hold_source" && phase != "held")
             {
                 return Err(fenced("migration step no longer has the claimed authority"));
+            }
+            match step {
+                "activate_target" | "finalize_source" | "finalize_target" => {
+                    if decision.as_deref() != Some(input.decision()?.as_str()) {
+                        return Err(fenced("owner decision changed on replay"));
+                    }
+                    if step == "activate_target" {
+                        let native = input.native(input.endpoint().execution.clone(), json!({}));
+                        let execution = self.scoped_execution(&native)?;
+                        self.verify_live_execution(&execution)?;
+                    }
+                }
+                "hold_source"
+                    if input
+                        .request
+                        .hold
+                        .as_ref()
+                        .is_some_and(|hold| hold["step"] == "hold_source") =>
+                {
+                    require_local(
+                        &self.catalog,
+                        &input,
+                        "hold_source",
+                        input.request.hold.as_ref(),
+                    )?;
+                }
+                "resume_source" => {
+                    input.check(
+                        input.request.abort.as_ref(),
+                        "abort_target",
+                        &input.ticket().target,
+                    )?;
+                }
+                _ => (),
             }
             return Ok(result);
         }
@@ -1095,7 +1215,7 @@ impl crate::worker::Worker {
             ("hold_source", "new" | "reserved") => {
                 hold_source(&mut self.catalog, &self.objects, &self.boot, &input)
             }
-            ("prepare_target", "new" | "reserved") => prepare_target(
+            ("prepare_target", "new" | "reserved" | "importing" | "imported") => prepare_target(
                 &mut self.catalog,
                 &self.objects,
                 self.statepoints.directory(),
@@ -1103,7 +1223,9 @@ impl crate::worker::Worker {
                 request,
                 descriptors,
             ),
-            ("fence_source", "held") => source_fence(&mut self.catalog, &input, &self.boot),
+            ("fence_source", "held") => {
+                source_fence(&mut self.catalog, &self.objects, &input, &self.boot)
+            }
             ("activate_target", "prepared") => {
                 require_local(
                     &self.catalog,
@@ -1131,7 +1253,9 @@ impl crate::worker::Worker {
                     json!({"details":{"product_volumes":product_volumes}}),
                 )
             }
-            ("abort_target", "reserved" | "prepared" | "aborting") if decision.is_none() => {
+            ("abort_target", "reserved" | "importing" | "imported" | "prepared" | "aborting")
+                if decision.is_none() =>
+            {
                 self.catalog.db.execute(
                     "UPDATE machine_migrations SET state='aborting' WHERE migration_id=?",
                     [&input.ticket().id],
@@ -1177,7 +1301,12 @@ impl crate::worker::Worker {
                     Err(error) => return Err(error),
                 }
                 products::remove_aborted_target(&self.catalog, &input.ticket().id)?;
-                release_import(&mut self.catalog, &self.objects, &input)?;
+                release_import(
+                    &mut self.catalog,
+                    &self.objects,
+                    self.statepoints.directory(),
+                    &input,
+                )?;
                 remember(&mut self.catalog, &input, "aborted", json!({}))
             }
             ("resume_source", "reserved" | "held" | "fenced" | "resuming")
@@ -1196,7 +1325,7 @@ impl crate::worker::Worker {
                     Ok(operation)
                         if operation.phase == "NEW" && operation.kind == "migration_copy" =>
                     {
-                        finish_stopped_source(&mut self.catalog, &input)?;
+                        finish_stopped_source(&mut self.catalog, &self.objects, &input)?;
                     }
                     Ok(operation) if operation.phase == "NEW" => {
                         let native = input.native(input.endpoint().execution.clone(), json!({}));
@@ -1236,7 +1365,7 @@ impl crate::worker::Worker {
                 )?;
                 record_decision(&self.catalog, &input, decision.as_deref())?;
                 if input.endpoint().execution.incarnation_id.is_none() {
-                    finish_stopped_source(&mut self.catalog, &input)?;
+                    finish_stopped_source(&mut self.catalog, &self.objects, &input)?;
                     return remember(&mut self.catalog, &input, "complete", json!({}));
                 }
                 let mut record = source_point(&self.catalog, &input)?;
@@ -1251,6 +1380,9 @@ impl crate::worker::Worker {
                         "waiting for the old VMM and private writer heads to exit",
                     ));
                 }
+                self.catalog.db.execute("UPDATE root_refs SET state='dropped',revision=revision+1
+                    WHERE owner_kind='statepoint_hibernate' AND owner_id=? AND resource_id=? AND state='active'",
+                    params![record.point.capture_id,record.point.representation_id])?;
                 remember(&mut self.catalog, &input, "complete", json!({}))
             }
             ("finalize_target", "active") => {
@@ -1261,7 +1393,12 @@ impl crate::worker::Worker {
                     input.request.ready.as_ref(),
                 )?;
                 record_decision(&self.catalog, &input, decision.as_deref())?;
-                release_import(&mut self.catalog, &self.objects, &input)?;
+                release_import(
+                    &mut self.catalog,
+                    &self.objects,
+                    self.statepoints.directory(),
+                    &input,
+                )?;
                 remember(&mut self.catalog, &input, "complete", json!({}))
             }
             _ => Err(conflict(
@@ -1434,9 +1571,24 @@ fn hold_stopped_source(
     )
 }
 
-fn finish_stopped_source(catalog: &mut Catalog, input: &Input) -> Result<()> {
+fn finish_stopped_source(catalog: &mut Catalog, objects: &File, input: &Input) -> Result<()> {
     let operation = catalog.operation(&input.op())?;
     if operation.phase == "NEW" {
+        let staged: Vec<String> = {
+            let mut query = catalog.db.prepare(
+                "SELECT spec_json FROM managed_blocks WHERE operation_id=? AND backing_identity IS NULL")?;
+            let rows = query.query_map([&operation.operation_id], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for raw in staged {
+            let spec =
+                serde_json::from_str(&raw).map_err(|error| Fault::invalid(error.to_string()))?;
+            crate::blocks::discard_staged(objects, &operation.operation_id, &spec)?;
+        }
+        catalog.db.execute(
+            "DELETE FROM managed_blocks WHERE operation_id=? AND backing_identity IS NULL",
+            [&operation.operation_id],
+        )?;
         let native = input.native(input.endpoint().execution.clone(), json!({}));
         catalog.finish(&native, false, operation.revision)?;
     }
@@ -1446,4 +1598,137 @@ fn finish_stopped_source(catalog: &mut Catalog, input: &Input) -> Result<()> {
         [&input.op()],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(side: &str, epoch: i64) -> Endpoint {
+        let local = if side == "source" {
+            "1".repeat(32)
+        } else {
+            "2".repeat(32)
+        };
+        let name = format!("machine-{side}");
+        Endpoint {
+            worker_id: side.into(),
+            runtime_instance_id: format!("runtime-{side}"),
+            local_instance_id: local.clone(),
+            runtime_name: name.clone(),
+            bundle_id: "bundle".into(),
+            bundle_digest: digest(b"bundle"),
+            reader_id: "reader".into(),
+            binding_id: format!("binding-{side}"),
+            binding_incarnation_id: String::new(),
+            generation: epoch,
+            owner_epoch: epoch,
+            execution: Expected {
+                instance_id: managed::machine_id(&local, &name),
+                incarnation_id: Some(managed::key(&native_id("migration-one", side), "vmm", 0)),
+                execution_epoch: 1,
+            },
+        }
+    }
+
+    fn input(step: &str) -> Input {
+        Input {
+            request: Step {
+                ticket: Ticket {
+                    id: "migration-one".into(),
+                    machine_id: "machine".into(),
+                    mode: "cold".into(),
+                    source: endpoint("source", 1),
+                    target: endpoint("target", 2),
+                },
+                step: step.into(),
+                hold: None,
+                ready: None,
+                fence: None,
+                abort: None,
+                decision: None,
+                network: None,
+            },
+            ticket_digest: digest(b"matching controller ticket"),
+            bundle_manifest: Value::Null,
+            import: None,
+        }
+    }
+
+    #[test]
+    fn target_tombstone_blocks_delayed_prepare_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.sqlite");
+        let mut catalog = Catalog::open(&path, "boot", "serve").unwrap();
+        let abort = input("abort_target");
+        reserve(&catalog, &abort).unwrap();
+        let proof = remember(&mut catalog, &abort, "aborted", json!({})).unwrap();
+        drop(catalog);
+        let catalog = Catalog::open(&path, "boot", "restart").unwrap();
+        let prepare = input("prepare_target");
+        assert_eq!(state(&catalog, &prepare).unwrap().unwrap().0, "aborted");
+        assert_eq!(
+            previous(&catalog, &abort, "abort_target").unwrap(),
+            Some(proof)
+        );
+        assert!(requires_owner(&catalog, &abort.op()).unwrap());
+    }
+
+    #[test]
+    fn source_never_reacquires_writer_after_committed_retirement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.sqlite");
+        let mut catalog = Catalog::open(&path, "boot", "serve").unwrap();
+        let source = input("finalize_source");
+        reserve(&catalog, &source).unwrap();
+        remember(&mut catalog, &source, "complete", json!({})).unwrap();
+        drop(catalog);
+        let catalog = Catalog::open(&path, "boot", "restart").unwrap();
+        assert_eq!(
+            guard_operation(
+                &catalog.db,
+                "deep",
+                &source.endpoint().execution.instance_id,
+                "old-wake"
+            )
+            .unwrap_err()
+            .code,
+            "E_FENCE_UNPROVEN"
+        );
+        assert!(guard_operation(
+            &catalog.db,
+            "deep",
+            &source.ticket().target.execution.instance_id,
+            "new-wake"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn owner_decision_requires_the_exact_ready_and_source_fence() {
+        let mut activate = input("activate_target");
+        let fence = make_receipt(
+            &input("fence_source"),
+            json!({"manifest_digest":digest(b"final-cut")}),
+        )
+        .unwrap();
+        let ready = make_receipt(
+            &input("prepare_target"),
+            json!({"manifest_digest":digest(b"final-cut")}),
+        )
+        .unwrap();
+        activate.request.fence = Some(fence.clone());
+        activate.request.ready = Some(ready.clone());
+        activate.request.decision = Some(Decision {
+            migration_id: activate.ticket().id.clone(),
+            ticket_digest: activate.ticket_digest.clone(),
+            source: activate.ticket().source.clone(),
+            target: activate.ticket().target.clone(),
+            source_fence_proof: fence["proof"].as_str().unwrap().into(),
+            target_ready_proof: ready["proof"].as_str().unwrap().into(),
+        });
+        assert!(activate.decision().is_ok());
+        activate.request.fence.as_mut().unwrap()["execution"]["execution_epoch"] = json!(2);
+        assert_eq!(activate.decision().unwrap_err().code, "E_FENCE_UNPROVEN");
+    }
 }
