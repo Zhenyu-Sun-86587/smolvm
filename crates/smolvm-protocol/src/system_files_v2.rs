@@ -6,6 +6,8 @@ use crate::base64_bytes;
 
 /// Advertised independently of the base Agent protocol version.
 pub const CAPABILITY: &str = "system-file-transfer-v2";
+/// Supported on a System image provisioned with the desktop account.
+pub const DESKTOP_DROP_CAPABILITY: &str = "system-file-desktop-drop-v1";
 /// Byte limit for one streamed upload or download.
 pub const MAX_BYTES: u64 = 4 << 30;
 /// Maximum number of entries in a recursive operation.
@@ -67,6 +69,19 @@ pub enum Request {
         overwrite: Overwrite,
         /// Whether to follow a final symlink.
         follow: bool,
+        /// Whether to publish a tar archive under the selected parent.
+        archive: bool,
+    },
+    /// Stage a desktop upload into a directory belonging to the desktop account.
+    DesktopWriteBegin {
+        /// Absolute filesystem path.
+        path: BytePath,
+        /// Size in bytes.
+        size: u64,
+        /// Lowercase hexadecimal SHA-256 digest.
+        sha256: String,
+        /// Policy for an occupied destination.
+        overwrite: Overwrite,
         /// Whether to publish a tar archive under the selected parent.
         archive: bool,
     },

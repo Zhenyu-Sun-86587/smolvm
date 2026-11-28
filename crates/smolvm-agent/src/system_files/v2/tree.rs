@@ -12,8 +12,8 @@ use smolvm_protocol::system_files_v2::{Overwrite, Request, MAX_ARCHIVE_ENTRIES, 
 use smolvm_protocol::AgentResponse;
 
 use super::{
-    bytes, check_connected, invalid, limit, name_valid, path_from_bytes, reply, wrong_type, Fault,
-    Result, PATH_MAX,
+    bytes, check_connected, invalid, limit, name_valid, path_from_bytes, reply, wrong_type,
+    DesktopOwner, Fault, Result, PATH_MAX,
 };
 
 const MAX_DEPTH: usize = 64;
@@ -28,6 +28,27 @@ pub(super) struct Stage {
 impl Stage {
     pub(super) fn path(&self) -> PathBuf {
         fd_path(&self.root)
+    }
+
+    pub(super) fn destination(&self, path: &Path) -> Result<PathBuf> {
+        Ok(fd_path(&self.parent).join(
+            path.file_name()
+                .ok_or_else(|| invalid("destination requires a basename"))?,
+        ))
+    }
+
+    pub(super) fn verify_desktop_parent(&self, path: &Path, owner: DesktopOwner) -> Result<()> {
+        let selected = open_desktop_directory(path)?;
+        let metadata = selected.metadata()?;
+        owner.require(&metadata)?;
+        let staged = self.parent.metadata()?;
+        if (staged.dev(), staged.ino()) != (metadata.dev(), metadata.ino()) {
+            return Err(Fault::new(
+                "FILE_CHANGED",
+                "desktop drop directory changed during transfer",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -44,7 +65,26 @@ impl Drop for Stage {
 }
 
 pub(super) fn stage_in(parent: &Path) -> Result<Stage> {
-    let parent = open_path(parent, true)?;
+    stage_at(open_path(parent, true)?)
+}
+
+pub(super) fn stage_for_desktop(parent: &Path, owner: DesktopOwner) -> Result<Stage> {
+    let parent = open_desktop_directory(parent)?;
+    owner.require(&parent.metadata()?)?;
+    stage_at(parent)
+}
+
+fn open_desktop_directory(path: &Path) -> Result<File> {
+    let flags = OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY;
+    let mut directory = sys::open("/", flags, Mode::empty()).map_err(io::Error::from)?;
+    for item in path.components().skip(1) {
+        directory = sys::openat(&directory, item.as_os_str(), flags, Mode::empty())
+            .map_err(io::Error::from)?;
+    }
+    Ok(File::from(directory))
+}
+
+fn stage_at(parent: File) -> Result<Stage> {
     let path = tempfile::Builder::new()
         .prefix(".smolvm-files-v2.")
         .permissions(fs::Permissions::from_mode(0o700))
@@ -698,7 +738,12 @@ impl Extended {
     }
 }
 
-pub(super) fn extract(input: File, selected: &Path, client: RawFd) -> Result<PathBuf> {
+pub(super) fn extract(
+    input: File,
+    selected: &Path,
+    client: RawFd,
+    desktop_owner: Option<DesktopOwner>,
+) -> Result<PathBuf> {
     let mut archive = tar::Archive::new(input);
     let mut walk = Walk::default();
     let mut appended = HashSet::new();
@@ -757,6 +802,11 @@ pub(super) fn extract(input: File, selected: &Path, client: RawFd) -> Result<Pat
             return Err(invalid_archive("non-regular archive member has data"));
         }
         let mode = member.header().mode()? & 0o777;
+        if desktop_owner.is_some() && !kind.is_dir() && !kind.is_file() {
+            return Err(invalid_archive(
+                "desktop drops require regular files and directories",
+            ));
+        }
         if kind.is_dir() {
             fs::create_dir(&target)?;
             directory_names.insert(name.to_path_buf());
@@ -769,6 +819,9 @@ pub(super) fn extract(input: File, selected: &Path, client: RawFd) -> Result<Pat
                 .mode(0o600)
                 .open(target)?;
             copy_bytes(&mut member, &mut file, size, client)?;
+            if let Some(owner) = desktop_owner {
+                owner.apply(&file)?;
+            }
             file.set_permissions(fs::Permissions::from_mode(mode))?;
             file.sync_all()?;
             regular.insert(name.to_path_buf());
@@ -815,7 +868,15 @@ pub(super) fn extract(input: File, selected: &Path, client: RawFd) -> Result<Pat
         return Err(invalid_archive("archive ends before its extended member"));
     }
     for (path, mode) in directories.into_iter().rev() {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        check_connected(client)?;
+        if let Some(owner) = desktop_owner {
+            let directory = File::open(path)?;
+            owner.apply(&directory)?;
+            directory.set_permissions(fs::Permissions::from_mode(mode))?;
+            directory.sync_all()?;
+        } else {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
     }
     Ok(selected.join(root.ok_or_else(|| invalid_archive("archive is empty"))?))
 }

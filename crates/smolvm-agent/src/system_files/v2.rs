@@ -8,7 +8,7 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{fchown, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -73,7 +73,57 @@ pub(crate) struct Upload {
     bytes: u64,
     overwrite: Overwrite,
     archive: bool,
+    desktop_owner: Option<DesktopOwner>,
     _slot: ConnectionPermit,
+}
+
+#[derive(Clone, Copy)]
+struct DesktopOwner {
+    uid: u32,
+    gid: u32,
+}
+
+impl DesktopOwner {
+    fn apply(self, file: &File) -> io::Result<()> {
+        fchown(file, Some(self.uid), Some(self.gid))
+    }
+
+    fn require(self, metadata: &Metadata) -> Result<()> {
+        if metadata.uid() != self.uid {
+            return Err(Fault::new(
+                "FILE_PERMISSION_DENIED",
+                "desktop drop requires a destination owned by the desktop account",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn desktop_owner() -> Result<DesktopOwner> {
+    let mut passwd = Vec::new();
+    File::open("/etc/passwd")?
+        .take(1 << 20)
+        .read_to_end(&mut passwd)?;
+    for line in passwd.split(|byte| *byte == b'\n') {
+        let fields: Vec<_> = line.splitn(7, |byte| *byte == b':').collect();
+        if let [b"sandbox-desktop", _, uid, gid, _, _, _] = fields.as_slice() {
+            let parse = |raw| std::str::from_utf8(raw).ok()?.parse::<u32>().ok();
+            if let (Some(uid), Some(gid)) = (parse(uid), parse(gid)) {
+                if uid != 0 && gid != 0 && uid != u32::MAX && gid != u32::MAX {
+                    return Ok(DesktopOwner { uid, gid });
+                }
+            }
+            break;
+        }
+    }
+    Err(Fault::new(
+        "CAPABILITY_UNSUPPORTED",
+        "the System desktop account is unavailable",
+    ))
+}
+
+pub(crate) fn desktop_drop_supported() -> bool {
+    desktop_owner().is_ok()
 }
 
 pub(crate) fn handle(
@@ -89,6 +139,7 @@ pub(crate) fn handle(
                 "home": home.to_string_lossy(), "home_bytes": bytes(&home),
                 "max_upload_bytes": MAX_BYTES, "max_download_bytes": MAX_BYTES,
                 "max_archive_entries": MAX_ARCHIVE_ENTRIES,
+                "desktop_owner": desktop_drop_supported(),
             }))
         }
         Request::List { path, limit, after } => {
@@ -131,13 +182,22 @@ pub(crate) fn handle(
             overwrite,
             follow,
             archive,
-        } => match begin(&path, size, sha256, overwrite, follow, archive) {
-            Ok(staged) => {
-                *upload = Some(staged);
-                reply(())
-            }
-            Err(error) => error.response(),
-        },
+        } => start_upload(
+            upload,
+            begin(&path, size, sha256, overwrite, follow, archive, None),
+        ),
+        Request::DesktopWriteBegin {
+            path,
+            size,
+            sha256,
+            overwrite,
+            archive,
+        } => {
+            let staged = desktop_owner().and_then(|owner| {
+                begin(&path, size, sha256, overwrite, false, archive, Some(owner))
+            });
+            start_upload(upload, staged)
+        }
         Request::WriteChunk { data } => match upload.take() {
             Some(mut staged) => match staged.append(&data) {
                 Ok(()) => {
@@ -165,6 +225,16 @@ pub(crate) fn handle(
         }
     };
     send_response(stream, &response)
+}
+
+fn start_upload(upload: &mut Option<Upload>, staged: Result<Upload>) -> AgentResponse {
+    match staged {
+        Ok(staged) => {
+            *upload = Some(staged);
+            reply(())
+        }
+        Err(error) => error.response(),
+    }
 }
 
 fn guest_home() -> PathBuf {
@@ -453,6 +523,7 @@ fn begin(
     overwrite: Overwrite,
     follow: bool,
     archive: bool,
+    desktop_owner: Option<DesktopOwner>,
 ) -> Result<Upload> {
     if size > MAX_BYTES {
         return Err(Fault::new(
@@ -480,22 +551,33 @@ fn begin(
         }
         _ => target.to_path_buf(),
     };
-    if archive {
-        if !destination.metadata()?.is_dir() {
-            return Err(Fault::new(
-                "FILE_NOT_DIRECTORY",
-                "archive parent must be a directory",
-            ));
-        }
-    } else {
-        file_destination(&destination, overwrite)?;
-    }
-    let _slot = slot().map_err(|_| limit("too many active System file requests"))?;
-    let stage = tree::stage_in(if archive {
+    let parent = if archive {
         &destination
     } else {
         tree::parent(&destination)?
-    })?;
+    };
+    if desktop_owner.is_none() {
+        if archive {
+            if !parent.metadata()?.is_dir() {
+                return Err(Fault::new(
+                    "FILE_NOT_DIRECTORY",
+                    "archive parent must be a directory",
+                ));
+            }
+        } else {
+            file_destination(&destination, overwrite)?;
+        }
+    }
+    let _slot = slot().map_err(|_| limit("too many active System file requests"))?;
+    let stage = match desktop_owner {
+        Some(owner) => tree::stage_for_desktop(parent, owner)?,
+        None => tree::stage_in(parent)?,
+    };
+    if desktop_owner.is_some() && !archive {
+        let pinned = stage.destination(&destination)?;
+        desktop_destination(&pinned, overwrite, desktop_owner)?;
+        file_destination(&pinned, overwrite)?;
+    }
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -512,6 +594,7 @@ fn begin(
         bytes: 0,
         overwrite,
         archive,
+        desktop_owner,
         _slot,
     })
 }
@@ -535,6 +618,31 @@ fn file_destination(path: &Path, overwrite: Overwrite) -> Result<()> {
         }
         tree::check_mountpoint(path)?;
     }
+    Ok(())
+}
+
+fn desktop_destination(
+    path: &Path,
+    overwrite: Overwrite,
+    owner: Option<DesktopOwner>,
+) -> Result<()> {
+    if let Some(owner) = owner.filter(|_| overwrite == Overwrite::Replace) {
+        if let Some(metadata) = tree::metadata(path)? {
+            owner.require(&metadata)?;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_desktop_file(file: &File, target: &Path, owner: DesktopOwner) -> Result<()> {
+    if let Some(existing) = tree::metadata(target)? {
+        owner.require(&existing)?;
+        fchown(file, Some(owner.uid), Some(existing.gid()))?;
+        file.set_permissions(fs::Permissions::from_mode(existing.mode() & 0o777))?;
+    } else {
+        owner.apply(file)?;
+    }
+    file.sync_all()?;
     Ok(())
 }
 
@@ -565,22 +673,40 @@ impl Upload {
             self.file.rewind()?;
             let unpacked = self.stage.path().join("tree");
             fs::create_dir(&unpacked)?;
-            let root = tree::extract(self.file, &unpacked, client)?;
+            let root = tree::extract(self.file, &unpacked, client, self.desktop_owner)?;
             let destination = self
                 .destination
                 .join(root.file_name().expect("archive root name"));
-            tree::publish(&root, &destination, self.overwrite, client)?;
+            let target = match self.desktop_owner {
+                Some(owner) => {
+                    self.stage.verify_desktop_parent(&self.destination, owner)?;
+                    self.stage.destination(&destination)?
+                }
+                None => destination.clone(),
+            };
+            desktop_destination(&target, self.overwrite, self.desktop_owner)?;
+            tree::publish(&root, &target, self.overwrite, client)?;
             destination
         } else {
-            file_destination(&self.destination, self.overwrite)?;
-            prepare_permissions(&self.file, &self.destination).map_err(
-                |response| match response {
+            let target = match self.desktop_owner {
+                Some(owner) => {
+                    self.stage
+                        .verify_desktop_parent(tree::parent(&self.destination)?, owner)?;
+                    self.stage.destination(&self.destination)?
+                }
+                None => self.destination.clone(),
+            };
+            file_destination(&target, self.overwrite)?;
+            if let Some(owner) = self.desktop_owner {
+                prepare_desktop_file(&self.file, &target, owner)?;
+            } else {
+                prepare_permissions(&self.file, &target).map_err(|response| match response {
                     AgentResponse::Error { message, .. } => Fault::new("FILE_IO_FAILED", message),
                     _ => unreachable!("permission checks return an Agent error"),
-                },
-            )?;
+                })?;
+            }
             let staged = self.stage.path().join("data");
-            tree::publish(&staged, &self.destination, self.overwrite, client)?;
+            tree::publish(&staged, &target, self.overwrite, client)?;
             self.destination
         };
         Ok(reply(serde_json::json!({
@@ -598,4 +724,66 @@ fn check_connected(client: RawFd) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod desktop_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn desktop_transfer_publishes_under_the_original_owned_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        let metadata = selected.metadata().unwrap();
+        let owner = DesktopOwner {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+        let payload = b"desktop upload";
+        let target = selected.join("raw");
+        let raw = bytes(&target);
+        let begin_raw = |path, owner| {
+            begin(
+                path,
+                payload.len() as u64,
+                format!("{:x}", Sha256::digest(payload)),
+                Overwrite::Reject,
+                false,
+                false,
+                Some(owner),
+            )
+        };
+        let invalid_owner = DesktopOwner {
+            uid: owner.uid ^ 1,
+            gid: owner.gid,
+        };
+        assert!(matches!(
+            begin_raw(&raw, invalid_owner),
+            Err(Fault("FILE_PERMISSION_DENIED", _))
+        ));
+
+        let (_peer, agent) = UnixStream::pair().unwrap();
+        let fd = agent.as_raw_fd();
+        let mut staged = begin_raw(&raw, owner).unwrap();
+        staged.append(payload).unwrap();
+        let displaced = temporary.path().join("displaced");
+        fs::rename(&selected, &displaced).unwrap();
+        std::os::unix::fs::symlink(&displaced, &selected).unwrap();
+        assert!(staged.commit(fd).is_err());
+        assert!(!displaced.join("raw").exists());
+
+        fs::remove_file(&selected).unwrap();
+        fs::rename(&displaced, &selected).unwrap();
+        let mut staged = begin_raw(&raw, owner).unwrap();
+        staged.append(payload).unwrap();
+        assert!(matches!(staged.commit(fd), Ok(AgentResponse::Ok { .. })));
+        let uploaded = target.metadata().unwrap();
+        assert_eq!(
+            (uploaded.uid(), uploaded.gid(), uploaded.mode() & 0o777),
+            (owner.uid, owner.gid, 0o600)
+        );
+        assert_eq!(fs::read(&target).unwrap(), payload);
+    }
 }
