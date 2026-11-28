@@ -50,6 +50,8 @@ mod backup_closure;
 #[cfg(target_os = "linux")]
 mod backup_import;
 #[cfg(target_os = "linux")]
+mod disk_closure_import;
+#[cfg(target_os = "linux")]
 pub mod native_client;
 #[cfg(target_os = "linux")]
 mod native_control;
