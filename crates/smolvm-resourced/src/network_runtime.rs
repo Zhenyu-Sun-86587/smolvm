@@ -130,6 +130,7 @@ impl NetworkRuntime {
         lease: &TapLease,
         evidence: &KernelProof,
         pidfd: BorrowedFd<'_>,
+        held_migration: bool,
     ) -> Result<(PrivateRouter, QuarantinedPort)> {
         let reservation = catalog.tap_network_reservation(lease)?;
         let attachment = &lease.attachment;
@@ -177,7 +178,9 @@ impl NetworkRuntime {
                 mode,
             },
         );
-        if &port.kernel_proof().map_err(host_error)? != evidence {
+        if held_migration {
+            port.quarantine_recovered_migration(evidence).map_err(host_error)?;
+        } else if &port.kernel_proof().map_err(host_error)? != evidence {
             return Err(Fault::new(
                 "E_FENCE_UNPROVEN",
                 "published TAP topology or policy has changed",
@@ -201,6 +204,7 @@ impl NetworkRuntime {
         lease: &TapLease,
         router: PrivateRouter,
         mut port: QuarantinedPort,
+        held_migration: bool,
     ) -> Result<()> {
         if self.ports.contains_key(&lease.attachment.attachment_id) {
             return Err(unknown_attachment());
@@ -210,7 +214,7 @@ impl NetworkRuntime {
             router.apply_membership_filter(&[], &[], false).map_err(host_error)?;
         }
         catalog.adopt_published_tap(lease)?;
-        port.adopt_published(router.clone());
+        port.adopt_recovered(router.clone(), !held_migration);
         self.routers
             .insert(lease.attachment.route_domain_id.clone(), router);
         self.ports.insert(lease.attachment.attachment_id.clone(), port);
@@ -605,14 +609,18 @@ impl NetworkRuntime {
             .close_identity().map_err(host_error)
     }
 
-    pub(crate) fn reopen_migration_source(&self, catalog: &Catalog, lease: &TapLease) -> Result<()> {
+    pub(crate) fn migration_source_proof(&self, lease: &TapLease) -> Result<KernelProof> {
+        self.ports.get(&lease.attachment.attachment_id).ok_or_else(unknown_attachment)?
+            .migration_kernel_proof().map_err(host_error)
+    }
+
+    pub(crate) fn reopen_migration_source(&self, lease: &TapLease, expected: &KernelProof) -> Result<()> {
         let port = self.ports.get(&lease.attachment.attachment_id).ok_or_else(unknown_attachment)?;
-        let expected = catalog.network_kernel_proof(lease)?.ok_or_else(unknown_attachment)?;
         let result = (|| {
             port.arm_identity().map_err(host_error)?;
             port.publish_identity().map_err(host_error)?;
-            let observed = port.record_kernel_proof(&self.namespaces).map_err(host_error)?;
-            if observed != expected {
+            let observed = port.migration_kernel_proof().map_err(host_error)?;
+            if &observed != expected {
                 return Err(unknown_attachment());
             }
             Ok(())

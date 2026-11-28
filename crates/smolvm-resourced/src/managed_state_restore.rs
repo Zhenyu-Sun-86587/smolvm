@@ -220,7 +220,7 @@ fn queue(
         if capture != input.capture_id || mode != input.mode.as_str() || rescue.as_deref() != rescue_capture_id {
             return Err(Fault::new("E_IDEMPOTENCY_CONFLICT", "durable restore parameters changed"));
         }
-        if imported {
+        if imported && !migration {
             let recorded: Option<String>=catalog.db.query_row("SELECT json_extract(spec_json,'$.network.network_id') FROM managed_launches WHERE operation_id=?",
                 [id],|row|row.get(0))?;
             if recorded != input.network_id {

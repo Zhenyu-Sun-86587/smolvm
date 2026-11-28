@@ -618,11 +618,12 @@ fn overlay_commit_requires_real_source_tap_fence_and_withdrawal() {
         expires_at_unix_ms,
         routes,
     };
+    let original_scope = source_network.migration_source_proof(&opened).unwrap();
     source_network
         .apply_overlay_routes(&catalog, apply(1, vec![route.clone()]))
         .unwrap();
     target_network
-        .apply_overlay_routes(&target_catalog, apply(1, vec![route]))
+        .apply_overlay_routes(&target_catalog, apply(1, vec![route.clone()]))
         .unwrap();
     assert_eq!(
         authorize_overlay_commit(target_network.overlay(), &transfer, None)
@@ -633,8 +634,10 @@ fn overlay_commit_requires_real_source_tap_fence_and_withdrawal() {
 
     // M13 closes the original data path without retiring the guest's TAP.
     source_network.close_migration_source(&opened).unwrap();
-    source_network.reopen_migration_source(&catalog, &opened).unwrap();
+    source_network.apply_overlay_routes(&catalog, apply(2, Vec::new())).unwrap();
+    source_network.reopen_migration_source(&opened, &original_scope).unwrap();
     assert_eq!(catalog.tap_lease(&transfer.attachment_id).unwrap(), opened);
+    source_network.apply_overlay_routes(&catalog, apply(3, vec![route])).unwrap();
 
     let fence_request = || serde_json::from_value(json!({"transfer":transfer})).unwrap();
     let fence = fence_source(&catalog, &execution, &mut source_network, fence_request()).unwrap();

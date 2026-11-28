@@ -222,6 +222,16 @@ impl Catalog {
         self.network_kernel_proof(lease)?.ok_or_else(network_recovery_unproven)
     }
 
+    pub(crate) fn has_migration_source_gate(&self, lease: &TapLease) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM machine_migration_source_taps f
+             JOIN machine_migrations m USING(migration_id)
+             WHERE f.lease_id=? AND f.phase<>'reopened' AND f.lease_revision<?
+               AND m.side='source' AND m.instance_id=? AND m.state IN ('held','fenced','resuming'))",
+            params![lease.lease_id, lease.revision, lease.instance_id], |row|row.get(0),
+        )?)
+    }
+
     pub(crate) fn adopt_published_tap(&mut self, lease: &TapLease) -> Result<()> {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !published_lease_can_recover(&tx, lease)? {
@@ -237,6 +247,14 @@ impl Catalog {
         tx.execute(
             "UPDATE network_tap_leases SET state='attached',revision=revision+1 WHERE lease_id=?",
             [&lease.lease_id],
+        )?;
+        // The transfer's signed source revision remains immutable in its scope.
+        // This field follows the same exact lease through broker adoption.
+        tx.execute(
+            "UPDATE machine_migration_source_taps
+             SET lease_revision=CASE phase WHEN 'reopened' THEN ?2 ELSE ?2+1 END
+             WHERE lease_id=?1 AND lease_revision<?2",
+            params![lease.lease_id, lease.revision],
         )?;
         // Carry authorization only for rules scoped to the same port and
         // execution at its last attached revision. Datagrams are never replayed.
@@ -437,7 +455,9 @@ fn published_lease_can_recover(db: &Connection, lease: &TapLease) -> Result<bool
              AND e.route_id=t.route_id AND e.bundle_digest=t.bundle_digest AND e.instance_id=t.instance_id
              AND e.execution_epoch=t.execution_epoch AND e.last_operation_id=t.operation_id
              AND NOT EXISTS (SELECT 1 FROM machine_migration_source_taps f
-               WHERE f.lease_id=t.lease_id AND f.phase<>'reopened')
+               JOIN machine_migrations m USING(migration_id) WHERE f.lease_id=t.lease_id
+                 AND f.phase<>'reopened' AND (m.side<>'source' OR m.instance_id<>t.instance_id
+                   OR m.state NOT IN ('held','fenced','resuming') OR f.lease_revision>=t.revision))
              AND op.phase='COMPLETED' AND op.decision='NONE'
              AND ((op.kind='launch' AND EXISTS (SELECT 1 FROM initial_network_activations i
                   WHERE i.lease_id=t.lease_id AND i.phase='open'))
