@@ -579,6 +579,85 @@ mod tests {
             .unwrap()
     }
 
+    fn fixture_guest(router: &PrivateRouter, link: &str, address: Ipv4Addr) -> File {
+        let ns = thread::spawn(enter_private_namespace).join().unwrap().unwrap();
+        let target = namespace_path(ns.as_fd());
+        ip(router.namespace(), &format!(
+            "link add {link} type veth peer name eth0 netns {target}\n\
+             link set {link} up\nroute add {address}/32 dev {link} scope link\n"
+        )).unwrap();
+        ip(ns.as_fd(), &format!(
+            "link set lo up\nlink set eth0 up\naddr add {address}/32 dev eth0\n\
+             route add default via {} dev eth0 onlink\n", router.gateway,
+        )).unwrap();
+        ns
+    }
+
+    fn inside<T: Send>(ns: BorrowedFd<'_>, operation: impl FnOnce() -> T + Send) -> T {
+        thread::scope(|threads| threads.spawn(move || {
+            assert_eq!(unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) }, 0);
+            operation()
+        }).join().unwrap())
+    }
+
+    #[test]
+    #[ignore = "requires isolated Linux router, iproute2 and nft privileges"]
+    fn worker_revokes_established_private_packets_and_scopes_host_bound_relay() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+
+        let router_ip = Ipv4Addr::new(10, 78, 0, 1);
+        let source = Ipv4Addr::new(10, 78, 0, 2);
+        let target = Ipv4Addr::new(10, 78, 0, 3);
+        let mut router = PrivateRouter::new(router_ip, 29).unwrap();
+        let left = fixture_guest(&router, "pfixture1", source);
+        let right = fixture_guest(&router, "pfixture2", target);
+        let service = inside(right.as_fd(), || TcpListener::bind((target, 0)).unwrap());
+        router.apply_membership_filter(&[(source, target), (target, source)], &[], true).unwrap();
+        let service_address = service.local_addr().unwrap();
+        let mut client = inside(left.as_fd(), || TcpStream::connect_timeout(&service_address, Duration::from_secs(2))).unwrap();
+        let (mut backend, _) = service.accept().unwrap();
+        client.write_all(b"Y").unwrap();
+        let mut one = [0];
+        backend.read_exact(&mut one).unwrap();
+        assert_eq!(one, *b"Y");
+
+        router.apply_membership_filter(&[], &[], true).unwrap();
+        client.write_all(b"N").unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let failed = client.read(&mut one).unwrap_err();
+        assert_eq!(failed.kind(), io::ErrorKind::ConnectionReset);
+        backend.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        assert!(matches!(backend.read(&mut one).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut));
+
+        let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let unused = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        router.apply_host_bound(source, crate::host_bound::Apply {
+            catalog_revision: 1, machine_revision: 1, hosts: vec!["selected.example".into()],
+            http_port: unused.local_addr().unwrap().port(), https_port: origin_port,
+            token: "42".repeat(32), lease_seconds: 900,
+        }).unwrap();
+        let fixture_address = std::net::SocketAddr::from((crate::host_bound::ADDRESS, 443));
+        let mut selected = inside(left.as_fd(), || TcpStream::connect_timeout(&fixture_address, Duration::from_secs(2))).unwrap();
+        selected.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let (mut scoped, _) = origin.accept().unwrap();
+        scoped.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut token = [0; 32];
+        scoped.read_exact(&mut token).unwrap();
+        assert_eq!(token, [0x42; 32]);
+        scoped.write_all(b"S").unwrap();
+        selected.read_exact(&mut one).unwrap();
+        assert_eq!(one, *b"S");
+
+        let mut neighbor = inside(right.as_fd(), || TcpStream::connect_timeout(&fixture_address, Duration::from_secs(2))).unwrap();
+        neighbor.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(neighbor.read(&mut one).unwrap(), 0);
+        router.remove_host_bound(source);
+        assert_eq!(selected.read(&mut one).unwrap(), 0);
+    }
+
     #[test]
     #[ignore = "requires Linux network privileges, iproute2, nft and /dev/net/tun"]
     fn worker_prepare_keeps_both_modes_quarantined_and_scoped() {
