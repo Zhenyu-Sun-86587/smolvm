@@ -239,14 +239,48 @@ pub(super) fn publish(
     rename(source, &destination, RenameFlags::NOREPLACE)
 }
 
+fn mkdir_recursive(path: &Path, client: RawFd) -> Result<()> {
+    let mut first = path;
+    let anchor = loop {
+        let parent = parent(first)?;
+        match open_path(parent, true) {
+            Ok(dir) => break dir,
+            Err(err) if err.0 == "NOT_FOUND" => first = parent,
+            Err(err) => return Err(err),
+        }
+    };
+    let first_name = first.file_name().expect("mkdir path with parent");
+    let destination = fd_path(&anchor).join(first_name);
+    if first == path {
+        check_connected(client)?;
+        if let Err(err) = fs::create_dir(&destination) {
+            if err.kind() != io::ErrorKind::AlreadyExists
+                || !destination.symlink_metadata()?.is_dir()
+            {
+                return Err(err.into());
+            }
+        }
+        return Ok(());
+    }
+    let stage = stage_in(&fd_path(&anchor))?;
+    let staged = stage.path().join(first_name);
+    let remaining = path
+        .strip_prefix(first)
+        .expect("first missing path is an ancestor");
+    fs::create_dir_all(staged.join(remaining))?;
+    check_connected(client)?;
+    rename(&staged, &destination, RenameFlags::NOREPLACE)
+}
+
 pub(super) fn mutate(operation: Request, client: RawFd) -> Result<AgentResponse> {
+    let mut copied_bytes = None;
     let target = match &operation {
         Request::Mkdir { path, recursive } => {
             let path = path_from_bytes(path, false)?;
-            check_connected(client)?;
             if *recursive {
-                fs::create_dir_all(path)?;
+                mkdir_recursive(path, client)?;
             } else {
+                check_connected(client)?;
                 fs::create_dir(path)?;
             }
             path
@@ -359,15 +393,19 @@ pub(super) fn mutate(operation: Request, client: RawFd) -> Result<AgentResponse>
                 scope: mount(&source)?,
                 client,
             };
-            copy_member(&source, path, &target, 0, &mut Walk::default(), &options)?;
+            let mut walk = Walk::default();
+            copy_member(&source, path, &target, 0, &mut walk, &options)?;
+            copied_bytes = Some(walk.bytes);
             publish(&target, destination, *overwrite, client)?;
             destination
         }
         _ => return Err(invalid("unknown filesystem mutation")),
     };
-    Ok(reply(
-        serde_json::json!({ "path": target.to_string_lossy(), "path_bytes": bytes(target) }),
-    ))
+    Ok(reply(serde_json::json!({
+        "path": target.to_string_lossy(),
+        "path_bytes": bytes(target),
+        "bytes": copied_bytes.unwrap_or(0),
+    })))
 }
 
 struct CopyOptions {

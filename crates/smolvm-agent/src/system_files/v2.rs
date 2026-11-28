@@ -84,9 +84,9 @@ pub(crate) fn handle(
     let client = stream.as_raw_fd();
     let response = match request {
         Request::Capabilities => {
-            let home = Path::new("/root");
+            let home = guest_home();
             reply(serde_json::json!({
-                "home": home, "home_bytes": bytes(home),
+                "home": home.to_string_lossy(), "home_bytes": bytes(&home),
                 "max_upload_bytes": MAX_BYTES, "max_download_bytes": MAX_BYTES,
                 "max_archive_entries": MAX_ARCHIVE_ENTRIES,
             }))
@@ -165,6 +165,24 @@ pub(crate) fn handle(
         }
     };
     send_response(stream, &response)
+}
+
+fn guest_home() -> PathBuf {
+    let mut passwd = Vec::new();
+    if File::open("/etc/passwd")
+        .and_then(|file| file.take(1 << 20).read_to_end(&mut passwd))
+        .is_ok()
+    {
+        for line in passwd.split(|byte| *byte == b'\n') {
+            let fields: Vec<_> = line.splitn(7, |byte| *byte == b':').collect();
+            if let [_, _, b"0", _, _, home, _] = fields.as_slice() {
+                if let Ok(home) = path_from_bytes(&BytePath(home.to_vec()), true) {
+                    return home.to_path_buf();
+                }
+            }
+        }
+    }
+    PathBuf::from("/root")
 }
 
 fn invalid(message: impl Into<String>) -> Fault {
@@ -462,14 +480,12 @@ fn begin(
     } else {
         file_destination(&destination, overwrite)?;
     }
-    let (stage, _slot) = (
-        tree::stage_in(if archive {
-            &destination
-        } else {
-            tree::parent(&destination)?
-        })?,
-        slot().map_err(|_| limit("too many active System file requests"))?,
-    );
+    let _slot = slot().map_err(|_| limit("too many active System file requests"))?;
+    let stage = tree::stage_in(if archive {
+        &destination
+    } else {
+        tree::parent(&destination)?
+    })?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
