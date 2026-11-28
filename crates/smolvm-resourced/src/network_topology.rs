@@ -45,6 +45,8 @@ pub struct PrivateRouter {
     gateway: Ipv4Addr,
     mask: u32,
     dns: Option<Arc<crate::network_dns::Resolver>>,
+    host_bound_routes: crate::host_bound::Routes,
+    host_bound_relay: Option<Arc<crate::host_bound::Relay>>,
 }
 
 pub struct QuarantinedPort {
@@ -119,6 +121,8 @@ impl PrivateRouter {
             gateway,
             mask,
             dns: None,
+            host_bound_routes: Default::default(),
+            host_bound_relay: None,
         };
         let subnet = Ipv4Addr::from(u32::from(gateway) & mask);
         // Until an attachment is published, retransmission can wait for wake without an ICMP rejection.
@@ -201,9 +205,30 @@ impl PrivateRouter {
                 self.gateway,
                 catalog,
                 network,
+                self.host_bound_routes.clone(),
             )?));
         }
         Ok(())
+    }
+
+    pub(crate) fn apply_host_bound(
+        &mut self, source: Ipv4Addr, apply: crate::host_bound::Apply,
+    ) -> crate::ipc::Result<()> {
+        apply.validate()?;
+        if !apply.hosts.is_empty() && self.host_bound_relay.is_none() {
+            let start = || {
+                ip(self.namespace(), &format!("addr replace {}/32 dev lo\n", crate::host_bound::ADDRESS))?;
+                crate::host_bound::Relay::start(self.namespace(), self.host_bound_routes.clone())
+            };
+            self.host_bound_relay = Some(Arc::new(start().map_err(|_| {
+                crate::ipc::Fault::new("E_HOST_BOUND_UNAVAILABLE", "could not bind the Worker host-bound router listener")
+            })?));
+        }
+        self.host_bound_routes.set(source, apply)
+    }
+
+    pub(crate) fn remove_host_bound(&self, source: Ipv4Addr) {
+        self.host_bound_routes.remove(source);
     }
 
     /// Connect a TAP through private Linux namespaces. The guest-facing link
