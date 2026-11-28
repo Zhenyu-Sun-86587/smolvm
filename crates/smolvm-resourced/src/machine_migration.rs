@@ -409,24 +409,10 @@ fn remember(catalog: &mut Catalog, input: &Input, phase: &str, result: Value) ->
     Ok(result)
 }
 
-fn cpu_clock_profile() -> Result<String> {
+fn cpu_clock_profile(boot: &str) -> Result<String> {
     if !cfg!(target_arch = "x86_64") {
         return Err(unsupported(
             "held migration currently requires Linux x86-64 KVM",
-        ));
-    }
-    let kvm = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .map_err(|_| unsupported("KVM is unavailable"))?;
-    use std::os::fd::AsRawFd;
-    // KVM API version and KVM_CAP_TSC_CONTROL from linux/kvm.h.
-    if unsafe { libc::ioctl(kvm.as_raw_fd(), 0xae00) } != 12
-        || unsafe { libc::ioctl(kvm.as_raw_fd(), 0xae03, 60) } <= 0
-    {
-        return Err(unsupported(
-            "KVM cannot restore the captured guest TSC frequency",
         ));
     }
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
@@ -459,18 +445,87 @@ fn cpu_clock_profile() -> Result<String> {
             "held migration requires a uniform, measurable CPU fingerprint",
         ));
     };
+    let clock_domain = migration_clock_domain(signature, boot)?;
+    let rate = measured_kvm_tsc_rate()?;
+    Ok(digest(
+        format!("{signature}\nclock_domain={clock_domain}\nkvm_tsc_khz={rate}").as_bytes(),
+    ))
+}
+
+fn migration_clock_domain(signature: &str, boot: &str) -> Result<String> {
     if !signature
         .lines()
         .any(|line| line == "vendor_id=GenuineIntel" || line == "vendor_id=AuthenticAMD")
-        || !signature
-            .split_ascii_whitespace()
-            .any(|feature| feature == "constant_tsc")
     {
         return Err(unsupported(
-            "held migration requires Intel or AMD KVM with a constant TSC",
+            "held migration needs a measured Intel or AMD CPU",
         ));
     }
-    Ok(digest(signature.as_bytes()))
+    let flags = signature
+        .lines()
+        .find_map(|line| line.strip_prefix("flags="))
+        .unwrap_or("");
+    let has = |wanted| flags.split_ascii_whitespace().any(|flag| flag == wanted);
+    if has("constant_tsc") {
+        return Ok("constant_tsc".into());
+    }
+    // Nested KVM can expose a calibrated rate and a usable paravirtual clock
+    // without advertising constant TSC. Limit this clock to the same Linux boot.
+    let clock =
+        std::fs::read_to_string("/sys/devices/system/clocksource/clocksource0/current_clocksource");
+    if has("hypervisor")
+        && has("tsc_known_freq")
+        && valid_id(boot)
+        && clock.is_ok_and(|value| value.trim() == "kvm-clock")
+    {
+        return Ok(format!("same_boot:{boot}"));
+    }
+    Err(unsupported(
+        "held migration needs constant TSC or a shared calibrated KVM clock within one host boot",
+    ))
+}
+
+fn measured_kvm_tsc_rate() -> Result<i32> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    const GET_API_VERSION: libc::c_ulong = 0xae00;
+    const CREATE_VM: libc::c_ulong = 0xae01;
+    const CHECK_EXTENSION: libc::c_ulong = 0xae03;
+    const CREATE_VCPU: libc::c_ulong = 0xae41;
+    const GET_TSC_KHZ: libc::c_ulong = 0xaea3;
+    const CLOCK_CAPABILITIES: [libc::c_ulong; 3] = [39, 60, 61]; // clock adjust, TSC control, TSC query
+    let kvm = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .map_err(|_| unsupported("KVM is unavailable"))?;
+    if unsafe { libc::ioctl(kvm.as_raw_fd(), GET_API_VERSION) } != 12
+        || CLOCK_CAPABILITIES
+            .into_iter()
+            .any(|cap| unsafe { libc::ioctl(kvm.as_raw_fd(), CHECK_EXTENSION, cap) } <= 0)
+    {
+        return Err(unsupported(
+            "KVM cannot measure and restore the guest clock and TSC frequency",
+        ));
+    }
+    let create = |fd, command| -> Result<OwnedFd> {
+        let result = unsafe { libc::ioctl(fd, command, 0 as libc::c_ulong) };
+        if result < 0 {
+            return Err(unsupported(
+                "KVM cannot provision a vCPU to measure its default TSC frequency",
+            ));
+        }
+        // KVM_CREATE_VM and KVM_CREATE_VCPU return fresh, owned descriptors.
+        Ok(unsafe { OwnedFd::from_raw_fd(result) })
+    };
+    let vm = create(kvm.as_raw_fd(), CREATE_VM)?;
+    let vcpu = create(vm.as_raw_fd(), CREATE_VCPU)?;
+    let khz = unsafe { libc::ioctl(vcpu.as_raw_fd(), GET_TSC_KHZ) };
+    if khz <= 0 {
+        return Err(unsupported(
+            "KVM did not report a measurable virtual TSC frequency",
+        ));
+    }
+    Ok(khz)
 }
 
 fn source_plan(catalog: &Catalog, input: &Input) -> Result<(Execution, managed::Plan)> {
@@ -536,7 +591,7 @@ fn hold_source(catalog: &mut Catalog, objects: &File, boot: &str, input: &Input)
         ));
     }
     let profile = if input.ticket().mode == "live" {
-        Some(cpu_clock_profile()?)
+        Some(cpu_clock_profile(boot)?)
     } else {
         None
     };
@@ -663,7 +718,7 @@ fn inspect(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Value> {
                 "the StatePoint reader cannot restore live compute growth",
             ));
         }
-        Some(cpu_clock_profile()?)
+        Some(cpu_clock_profile(boot)?)
     } else {
         None
     };
@@ -682,7 +737,7 @@ fn inspect(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Value> {
     )
 }
 
-fn preflight(catalog: &mut Catalog, input: &Input) -> Result<Value> {
+fn preflight(catalog: &mut Catalog, input: &Input, boot: &str) -> Result<Value> {
     let endpoint = input.endpoint();
     let (epoch, incarnation, active) =
         crate::catalog::binding(&catalog.db, "deep", &endpoint.execution.instance_id)?;
@@ -711,7 +766,7 @@ fn preflight(catalog: &mut Catalog, input: &Input) -> Result<Value> {
             }
         }
         if input.ticket().mode == "live" {
-            let target = cpu_clock_profile()?;
+            let target = cpu_clock_profile(boot)?;
             if source["details"]["profile"] != target {
                 return Err(unsupported(
                     "held migration requires identical CPU fingerprints and KVM TSC support",
@@ -756,6 +811,7 @@ fn prepare_target(
     catalog: &mut Catalog,
     objects: &File,
     points: &Path,
+    boot: &str,
     input: &Input,
     wire: &Request,
     descriptors: Vec<OwnedFd>,
@@ -775,7 +831,7 @@ fn prepare_target(
         return Err(fenced("source hold has no eligible immutable disk closure"));
     }
     let live = input.ticket().mode == "live";
-    if live && details.profile.as_deref() != Some(cpu_clock_profile()?.as_str()) {
+    if live && details.profile.as_deref() != Some(cpu_clock_profile(boot)?.as_str()) {
         return Err(unsupported("held migration CPU or clock profile changed"));
     }
     reserve(catalog, input)?;
@@ -1211,7 +1267,7 @@ impl crate::worker::Worker {
             state(&self.catalog, &input)?.unwrap_or_else(|| ("new".into(), None));
         match (step, phase.as_str()) {
             ("inspect_source", "new") => inspect(&mut self.catalog, &input, &self.boot),
-            ("preflight_target", "new") => preflight(&mut self.catalog, &input),
+            ("preflight_target", "new") => preflight(&mut self.catalog, &input, &self.boot),
             ("hold_source", "new" | "reserved") => {
                 hold_source(&mut self.catalog, &self.objects, &self.boot, &input)
             }
@@ -1219,6 +1275,7 @@ impl crate::worker::Worker {
                 &mut self.catalog,
                 &self.objects,
                 self.statepoints.directory(),
+                &self.boot,
                 &input,
                 request,
                 descriptors,
@@ -1704,13 +1761,15 @@ mod tests {
             .code,
             "E_FENCE_UNPROVEN"
         );
-        assert!(guard_operation(
-            &catalog.db,
-            "deep",
-            &source.ticket().target.execution.instance_id,
-            "new-wake"
-        )
-        .is_ok());
+        assert!(
+            guard_operation(
+                &catalog.db,
+                "deep",
+                &source.ticket().target.execution.instance_id,
+                "new-wake"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
