@@ -1238,11 +1238,20 @@ fn reserve_target_tap(
     })?;
     let fixed = spec.fixed_route();
     let (_, _, expected) = native.scope()?;
+    let dns_name = input
+        .request
+        .network
+        .as_ref()
+        .unwrap()
+        .source_attachment
+        .dns_name
+        .clone()
+        .unwrap_or_else(|| format!("{}.private", managed::key(&expected.instance_id, "vm", 0)));
     let data = serde_json::from_value(json!({
         "attachment_id":transfer.target_attachment_id, "network_id":spec.network_id,
         "device_id":"net0", "mode":transfer.network_mode, "guest_ipv4":fixed.map(|(guest,_,_)|guest),
         "preferred_private_ipv4":transfer.private_ipv4, "transfer_id":input.ticket().id,
-        "dns_name":format!("{}.private",managed::key(&expected.instance_id,"vm",0)),
+        "dns_name":dns_name,
     })).map_err(|_|Fault::invalid("invalid transfer reservation"))?;
     catalog.reserve_network_with_overlay(native, &data, network.overlay())?;
     let lease = network.prepare(

@@ -252,6 +252,16 @@ impl Catalog {
         overlay: &crate::network::overlay::Overlay,
     ) -> Result<NetworkReservation> {
         let prior = lookup(&self.db, attachment_id)?;
+        let mut dns_name = dns_name;
+        if let Some(before) = &prior {
+            let migrated: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM network_transfer_guards WHERE attachment_id=?)",
+                [attachment_id], |row| row.get(0),
+            )?;
+            if migrated {
+                dns_name = before.dns_name.as_deref().unwrap_or(dns_name);
+            }
+        }
         let fixed = network.fixed_route();
         self.reserve_network_with_overlay(
             request,
@@ -441,6 +451,9 @@ impl Catalog {
                 ));
             }
             if let Some(transfer) = &data.transfer_id {
+                if prior.state == "released" && prior.operation_id != operation.operation_id {
+                    return self.reclaim_aborted_transfer(request, prior, transfer, data.dns_name.as_deref());
+                }
                 if !crate::network_transfer::guard_matches(&self.db, &operation.operation_id, &data.attachment_id, transfer)? {
                     return Err(Fault::new("E_IDEMPOTENCY_CONFLICT", "attachment already has another transfer intent"));
                 }
@@ -548,6 +561,50 @@ impl Catalog {
             .ok_or_else(|| Fault::new("E_CATALOG", "network reservation was not stored"))?;
         tx.commit()?;
         Ok(reservation)
+    }
+
+    fn reclaim_aborted_transfer(
+        &mut self,
+        request: &Request,
+        prior: NetworkReservation,
+        migration: &str,
+        dns_name: Option<&str>,
+    ) -> Result<NetworkReservation> {
+        self.ready()?;
+        let operation = self.active_operation(request)?;
+        let old = self.operation(&prior.operation_id)?;
+        let prior_aborted: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM machine_migrations m
+             JOIN network_transfer_guards g USING(migration_id)
+             WHERE m.native_operation_id=?1 AND m.side='target' AND m.state='aborted'
+               AND g.operation_id=?1 AND g.attachment_id=?2 AND m.decision_json IS NULL)",
+            params![old.operation_id,prior.attachment_id], |row|row.get(0),
+        )?;
+        if !prior_aborted || old.phase != "ABORTED" || !operation.launches_execution()
+            || old.route_id != operation.route_id || old.bundle_digest != operation.bundle_digest
+            || old.instance_id != operation.instance_id || prior.dns_name.as_deref() != dns_name
+        {
+            return Err(Fault::new("E_FENCE_UNPROVEN", "previous transfer reservation has no confirmed abort"));
+        }
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE network_attachments SET operation_id=?1,state='reserved',revision=revision+1
+             WHERE attachment_id=?2 AND state='released' AND revision=?3
+               AND NOT EXISTS(SELECT 1 FROM network_tap_leases WHERE attachment_id=?2 AND state<>'retired')
+               AND NOT EXISTS(SELECT 1 FROM network_attachments current
+                 WHERE current.network_id=?4 AND current.private_ipv4=?5 AND current.state<>'released')",
+            params![operation.operation_id, prior.attachment_id, prior.revision,
+                prior.network_id, u32::from(prior.private_ipv4)],
+        )?;
+        if changed != 1 {
+            return Err(Fault::new("E_NETWORK_ATTACHMENT_CONFLICT", "stable address is unavailable after the prior aborted transfer"));
+        }
+        tx.execute(
+            "INSERT INTO network_transfer_guards(operation_id,attachment_id,migration_id) VALUES(?,?,?)",
+            params![operation.operation_id, prior.attachment_id, migration],
+        )?;
+        tx.commit()?;
+        self.scoped_network_reservation(request, &prior.attachment_id)
     }
 
     fn rebind_network(

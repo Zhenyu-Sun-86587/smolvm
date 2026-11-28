@@ -631,6 +631,11 @@ fn overlay_commit_requires_real_source_tap_fence_and_withdrawal() {
         "E_FENCE_UNPROVEN"
     );
 
+    // M13 closes the original data path without retiring the guest's TAP.
+    source_network.close_migration_source(&opened).unwrap();
+    source_network.reopen_migration_source(&catalog, &opened).unwrap();
+    assert_eq!(catalog.tap_lease(&transfer.attachment_id).unwrap(), opened);
+
     let fence_request = || serde_json::from_value(json!({"transfer":transfer})).unwrap();
     let fence = fence_source(&catalog, &execution, &mut source_network, fence_request()).unwrap();
     assert_eq!(
