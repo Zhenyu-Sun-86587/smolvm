@@ -180,7 +180,10 @@ impl Machine {
         }
         let mut disks = self.disks.clone();
         if let Some(previous) = previous.as_ref() {
-            if self.boot_profile == "system-debian-v1" && previous.restore.is_some() {
+            let preserved_root = previous.restore.is_some() || crate::machine_migration::has_committed_target(
+                c, &previous.launch.operation_id,
+            )?;
+            if self.boot_profile == "system-debian-v1" && preserved_root {
                 let declared = &disks[0];
                 let captured = previous.machine.disks.first()
                     .ok_or_else(|| Fault::new("E_CATALOG", "restored System has no root declaration"))?;

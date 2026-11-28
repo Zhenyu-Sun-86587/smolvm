@@ -1429,6 +1429,15 @@ pub(crate) fn reject_source_command(catalog: &Catalog, op: &str) -> Result<()> {
     Ok(())
 }
 
+// A migrated cold launch can have a captured root layered on top of the
+// original installed base. Later managed starts must preserve that root slot.
+pub(crate) fn has_committed_target(catalog: &Catalog, operation: &str) -> Result<bool> {
+    Ok(catalog.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM machine_migrations WHERE side='target'
+         AND native_operation_id=? AND decision_json IS NOT NULL AND state IN ('active','complete'))",
+        [operation], |row| row.get(0))?)
+}
+
 pub(crate) fn permit_target_process(catalog: &Catalog, operation: &Operation) -> Result<()> {
     let held: bool = catalog.db.query_row(
         "SELECT EXISTS(SELECT 1 FROM machine_migrations WHERE side='target' AND native_operation_id=?
