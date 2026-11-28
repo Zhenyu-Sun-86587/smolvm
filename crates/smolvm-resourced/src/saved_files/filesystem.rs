@@ -444,11 +444,15 @@ fn entry(path: &[u8], name: &[u8], stat: &Metadata) -> Value {
         "socket"
     } else if kind.is_fifo() {
         "fifo"
+    } else if kind.is_char_device() {
+        "character_device"
+    } else if kind.is_block_device() {
+        "block_device"
     } else {
-        "device"
+        "other"
     };
     json!({"path":path,"path_bytes":path_bytes,"type":kind,"name":String::from_utf8_lossy(name),
-        "size":stat.len(),"mode":stat.mode(),"modified_unix":stat.mtime()})
+        "size":stat.len(),"mode":stat.mode() & 0o7777,"modified_unix":stat.mtime()})
 }
 
 fn names(directory: &Path) -> Result<Vec<OsString>> {
@@ -463,40 +467,64 @@ fn names(directory: &Path) -> Result<Vec<OsString>> {
 
 fn list(
     namespace: &Namespace,
-    path: &[u8],
+    requested: &[u8],
+    resolved: &[u8],
     directory: &Path,
     cursor: &[u8],
     limit: usize,
     result: &mut Value,
 ) -> Result<()> {
-    if !cursor.is_empty() && (cursor == path || parent(cursor) != path) {
+    if !cursor.is_empty() && (cursor == requested || parent(cursor) != requested) {
         return Err(Fault::invalid(
             "saved file cursor belongs to another directory",
         ));
     }
-    let mut items = Vec::new();
+    let mut next = std::collections::BTreeSet::new();
+    for (index, item) in fs::read_dir(directory).map_err(path_error)?.enumerate() {
+        if index == 262_144 {
+            return Err(Fault::new(
+                "E_FILE_TOO_LARGE",
+                "saved directory exceeds its entry scan limit",
+            ));
+        }
+        let name = item.map_err(path_error)?.file_name();
+        if append(requested, name.as_bytes()).as_slice() > cursor {
+            next.insert(name);
+            if next.len() > limit + 1 {
+                next.pop_last();
+            }
+        }
+    }
+    let more = next.len() > limit;
+    if more {
+        next.pop_last();
+    }
+    let mut items = Vec::with_capacity(next.len());
     let mut last = Vec::new();
-    for name in names(directory)? {
-        let logical = append(path, name.as_bytes());
-        if logical.as_slice() <= cursor {
-            continue;
+    for name in next {
+        let child = append(requested, name.as_bytes());
+        if !topology::valid_path(&child) {
+            return Err(Fault::new(
+                "E_FILE_TOO_LARGE",
+                "saved directory path exceeds its byte limit",
+            ));
         }
-        if items.len() == limit {
-            result["next_cursor"] = json!(STANDARD.encode(last));
-            break;
-        }
+        let logical = append(resolved, name.as_bytes());
         let stat = fs::symlink_metadata(directory.join(&name)).map_err(path_error)?;
-        let mut item = entry(&logical, name.as_bytes(), &stat);
+        let mut item = entry(&child, name.as_bytes(), &stat);
         if namespace
             .mounts
             .get(&logical)
             .is_some_and(|mount| mount.reason.is_some())
         {
-            item["type"] = json!("unavailable");
+            item["type"] = json!("other");
             item["size"] = json!(0);
         }
         items.push(item);
-        last = logical;
+        last = child;
+    }
+    if more {
+        result["next_cursor"] = json!(STANDARD.encode(last));
     }
     result["items"] = json!(items);
     Ok(())
@@ -587,19 +615,27 @@ pub(super) fn serve(
     let mut body = tempfile::tempfile().map_err(host)?;
     if input.operation != Operation::Scope {
         namespace()?;
-        let follow =
-            input.follow || matches!(input.operation, Operation::List | Operation::Realpath);
+        let follow = input.follow
+            || matches!(
+                input.operation,
+                Operation::List | Operation::Realpath | Operation::Read
+            );
         let (logical, location, stat) = ns.resolve(&path, follow)?;
-        let name = as_path(&logical)
+        let name = as_path(&path)
             .file_name()
             .map(OsStr::as_bytes)
             .unwrap_or(b"/");
-        let (display, bytes) = wire_path(&logical);
+        let display_path = if input.operation == Operation::Realpath {
+            &logical
+        } else {
+            &path
+        };
+        let (display, bytes) = wire_path(display_path);
         result["path"] = json!(display);
         result["path_bytes"] = json!(bytes);
         match input.operation {
             Operation::Scope | Operation::Realpath => (),
-            Operation::Stat | Operation::Exists => result["entry"] = entry(&logical, name, &stat),
+            Operation::Stat | Operation::Exists => result["entry"] = entry(&path, name, &stat),
             Operation::List => {
                 if !stat.is_dir() {
                     return Err(Fault::new(
@@ -607,7 +643,15 @@ pub(super) fn serve(
                         "saved listing requires a directory",
                     ));
                 }
-                list(&ns, &logical, &location, &cursor, input.limit, &mut result)?;
+                list(
+                    &ns,
+                    &path,
+                    &logical,
+                    &location,
+                    &cursor,
+                    input.limit,
+                    &mut result,
+                )?;
             }
             Operation::Read => {
                 if !stat.is_file() {
