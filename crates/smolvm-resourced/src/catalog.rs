@@ -324,7 +324,7 @@ impl Catalog {
                 tx.execute_batch(include_str!("schema_product_machine_volumes.sql"))?;
                 migrate_capture_journal(&tx)?;
             }
-            1..=35 => {
+            1..=36 => {
                 if version == 1 {
                     tx.execute_batch(include_str!("schema_escrow.sql"))?;
                 }
@@ -455,7 +455,8 @@ impl Catalog {
         tx.execute_batch(include_str!("schema_network_overlay.sql"))?;
         tx.execute_batch(include_str!("schema_saved_files.sql"))?;
         tx.execute_batch(include_str!("schema_bucket_bases.sql"))?;
-        tx.pragma_update(None, "user_version", 35)?;
+        tx.execute_batch(include_str!("schema_machine_migration.sql"))?;
+        tx.pragma_update(None, "user_version", 36)?;
         tx.commit()?;
         Ok(Self { db })
     }
