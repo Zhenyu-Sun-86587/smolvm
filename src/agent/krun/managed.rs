@@ -1,10 +1,9 @@
 //! Configure the deep block ABI with the original Worker file descriptions.
 use super::KrunFunctions;
-use smolvm_resourced::managed::{DiskSet, Plan};
+use smolvm_resourced::managed::Plan;
 use smolvm_resourced::network_client::AttachmentDescriptor;
-use std::collections::BTreeMap;
 use std::ffi::{c_char, CString};
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::ptr;
@@ -31,6 +30,7 @@ struct Block {
     layers: *const Layer,
     layer_count: usize,
 }
+type BucketRange = unsafe extern "C" fn(u32, *const c_char, i32, u64) -> i32;
 type Attach = unsafe extern "C" fn(u32, *const Block, usize) -> i32;
 type Mount = unsafe extern "C" fn(u32, *const c_char, *const c_char, *const c_char) -> i32;
 type Text = unsafe extern "C" fn(u32, *const c_char) -> i32;
@@ -43,8 +43,7 @@ impl KrunFunctions {
         &self,
         ctx: u32,
         plan: &Plan,
-        layouts: &[DiskSet],
-        files: &BTreeMap<String, OwnedFd>,
+        disks: &smolvm_resourced::native_client::ManagedLaunchDisks,
         helper: &[u8; 32],
         control: &Path,
         worker: &Path,
@@ -60,10 +59,10 @@ impl KrunFunctions {
         };
         let mut chains = Vec::new();
         let mut blocks = Vec::new();
-        for set in layouts {
+        for set in &disks.sets {
             let mut layers = Vec::new();
             for object in &set.layers {
-                let fd = files
+                let fd = disks.files
                     .get(&object.spec.resource_id)
                     .ok_or("missing Worker disk FD")?;
                 let format = match object.format.as_str() {
@@ -189,6 +188,13 @@ impl KrunFunctions {
                     .set_live_resize
                     .ok_or("the installed VMM lacks the requested live compute geometry")?;
                 check("managed CPU and RAM hot-add", resize(ctx, 3))?;
+            }
+            if !disks.ranges.is_empty() {
+                let range = self._handle.get::<BucketRange>(b"krun_set_managed_block_range_v1\0")
+                    .map_err(|_| "installed libkrun lacks the managed Bucket range reader".to_owned())?;
+                for (id, (bytes, fd)) in &disks.ranges {
+                    check("managed Bucket base", range(ctx, string(id)?, fd.as_raw_fd(), *bytes))?;
+                }
             }
             check("block set", attach(ctx, blocks.as_ptr(), blocks.len()))?;
             check(

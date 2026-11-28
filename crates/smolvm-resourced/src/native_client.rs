@@ -61,6 +61,12 @@ pub struct ProductVolumeMutation {
     pub expected_revision: i64,
     pub command: Value,
 }
+pub struct ManagedLaunchDisks {
+    pub sets: Vec<crate::managed::DiskSet>,
+    pub files: BTreeMap<String, OwnedFd>,
+    pub ranges: BTreeMap<String, (u64, OwnedFd)>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Launch {
@@ -658,13 +664,15 @@ impl Client<'_> {
     pub fn managed_disks(
         &self,
         plan: &crate::managed::Plan,
-    ) -> Result<(Vec<crate::managed::DiskSet>, BTreeMap<String, OwnedFd>), QueryError> {
+    ) -> Result<ManagedLaunchDisks, QueryError> {
         #[derive(Deserialize)]
         struct Disks {
             devices: Vec<crate::managed::DiskSet>,
             incarnation_id: String,
             execution_epoch: i64,
             grant: Option<Value>,
+            #[serde(default)]
+            bucket_ranges: BTreeMap<String, u64>,
         }
         let launch = &plan.launch;
         let (packet, table, fds): (Disks, _, _) = self.exchange(
@@ -710,7 +718,19 @@ impl Client<'_> {
             .flat_map(|d| d.layers.iter().map(|l| l.spec.resource_id.as_str()))
             .collect();
         let mut files = BTreeMap::new();
+        let mut ranges = BTreeMap::new();
         for (entry, fd) in table.into_iter().zip(fds) {
+            if entry.role == "bucket_range" {
+                let id = entry.resource_id;
+                let bytes = packet.bucket_ranges.get(&id).copied()
+                    .filter(|bytes| *bytes > 0 && *bytes <= i64::MAX as u64)
+                    .ok_or_else(protocol)?;
+                if writes.contains(id.as_str()) || !required.contains(id.as_str())
+                    || ranges.insert(id, (bytes, fd)).is_some() {
+                    return Err(protocol());
+                }
+                continue;
+            }
             let role = if writes.contains(entry.resource_id.as_str()) {
                 "block_writer"
             } else {
@@ -723,10 +743,10 @@ impl Client<'_> {
                 return Err(protocol());
             }
         }
-        if files.len() != required.len() {
+        if files.len() != required.len() || ranges.len() != packet.bucket_ranges.len() {
             return Err(protocol());
         }
-        Ok((packet.devices, files))
+        Ok(ManagedLaunchDisks { sets: packet.devices, files, ranges })
     }
     pub fn ack_managed_disks(&self, launch: &Launch) -> Result<(), QueryError> {
         let result: Value = self.call(
