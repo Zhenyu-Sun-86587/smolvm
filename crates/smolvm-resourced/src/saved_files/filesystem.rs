@@ -197,7 +197,24 @@ impl Namespace {
             if next.len() > 4096 {
                 return Err(Fault::invalid("resolved saved path is too long"));
             }
-            let location = self.physical(&next, &self.owner(&next))?;
+            let owner = self.owner(&next);
+            // A captured persistent mount can sit below a RAM-only or external
+            // filesystem. Its mount target was proven by the saved topology
+            // even though the offline reader cannot walk that parent.
+            if self.mounts[&owner].slot.is_none() {
+                let remaining = todo
+                    .iter()
+                    .fold(next.clone(), |path, part| append(&path, part));
+                let mounted = self.owner(&remaining);
+                if topology::valid_path(&remaining)
+                    && mounted != owner
+                    && self.mounts[&mounted].slot.is_some()
+                {
+                    current = next;
+                    continue;
+                }
+            }
+            let location = self.physical(&next, &owner)?;
             let stat = fs::symlink_metadata(&location).map_err(path_error)?;
             if stat.is_symlink() && (follow || !todo.is_empty()) {
                 links += 1;
@@ -671,4 +688,119 @@ pub(super) fn serve(
     body.rewind().map_err(host)?;
     io::copy(&mut body, &mut frame).map_err(host)?;
     File::open(format!("/proc/self/fd/{}", frame.as_raw_fd())).map_err(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blocks::{BlockObject, BlockSpec};
+
+    #[test]
+    #[ignore = "requires root, mount namespace support, free loop devices and e2fsprogs"]
+    fn saved_ext4_mounts_read_original_root_and_attached_data() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut inputs = Vec::new();
+        let capacity = 16 << 20;
+        for (tag, filename, contents) in [
+            ("root", "root.txt", "root payload"),
+            ("data", "extra.txt", "attached payload"),
+        ] {
+            let source = fixture.path().join(format!("{tag}-tree"));
+            let image = fixture.path().join(format!("{tag}.raw"));
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(source.join("mnt")).unwrap();
+            fs::write(source.join(filename), contents).unwrap();
+            File::create(&image).unwrap().set_len(capacity).unwrap();
+            assert!(command(
+                "/usr/sbin/mkfs.ext4",
+                &[
+                    OsStr::new("-q"),
+                    OsStr::new("-F"),
+                    OsStr::new("-d"),
+                    source.as_os_str(),
+                    image.as_os_str()
+                ],
+            )
+            .unwrap()
+            .status
+            .success());
+            let digest = Sha256::digest(fs::read(&image).unwrap());
+            inputs.push((tag, image, digest));
+        }
+        let topology = b"1 0 252:0 / / rw - ext4 /dev/vda rw\n2 1 252:16 / /mnt rw - ext4 /dev/vdb rw\n3 1 0:4 / /proc rw - proc proc rw\n";
+        for (path, expected) in [
+            (b"/root.txt".as_slice(), b"root payload".as_slice()),
+            (b"/mnt/extra.txt".as_slice(), b"attached payload".as_slice()),
+        ] {
+            let disks = inputs
+                .iter()
+                .enumerate()
+                .map(|(slot, (id, path, _))| {
+                    let object = BlockObject {
+                        spec: BlockSpec {
+                            resource_id: id.to_string(),
+                            capacity_bytes: capacity,
+                            volume_id: None,
+                            backing_id: None,
+                            content_sha256: None,
+                            sealed: true,
+                        },
+                        format: "raw".into(),
+                        backing_identity: String::new(),
+                        verified_identity: None,
+                    };
+                    (
+                        slot,
+                        Disk {
+                            layers: vec![(object, File::open(path).unwrap())],
+                            volume: id.to_string(),
+                            generation: id.to_string(),
+                            capacity,
+                        },
+                    )
+                })
+                .collect();
+            let input = Input {
+                job_id: "job".into(),
+                capture_id: "fixed".into(),
+                manifest_digest: "digest".into(),
+                source_operation_id: "operation".into(),
+                instance_id: "instance".into(),
+                operation: Operation::Read,
+                path: String::new(),
+                cursor: String::new(),
+                limit: 0,
+                offset: 0,
+                length: None,
+                follow: false,
+            };
+            let path = path.to_vec();
+            let mut frame = std::thread::spawn(move || {
+                serve(
+                    input,
+                    path,
+                    Vec::new(),
+                    topology::parse(topology).unwrap(),
+                    disks,
+                )
+            })
+            .join()
+            .unwrap()
+            .unwrap();
+            let mut header = [0; 4];
+            frame.read_exact(&mut header).unwrap();
+            let mut raw = vec![0; u32::from_be_bytes(header) as usize];
+            frame.read_exact(&mut raw).unwrap();
+            let metadata: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(metadata["scope"], json!(["/", "/mnt"]));
+            assert_eq!(metadata["capture_id"], "fixed");
+            assert_eq!(metadata["bytes"], expected.len());
+            let mut body = Vec::new();
+            frame.read_to_end(&mut body).unwrap();
+            assert_eq!(body, expected);
+        }
+        for (_, image, expected) in inputs {
+            assert_eq!(Sha256::digest(fs::read(image).unwrap()), expected);
+        }
+    }
 }

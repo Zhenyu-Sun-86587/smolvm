@@ -120,3 +120,20 @@ pub fn disk_slot(root_major: u32, mount: &Mount) -> Option<usize> {
     (mount.filesystem == "ext4" && mount.device.0 == root_major && mount.device.1 % 16 == 0)
         .then_some(mount.device.1 as usize / 16)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captured_mounts_preserve_byte_paths_and_distinguish_external_devices() {
+        let sample = b"1 0 251:0 / / rw - ext4 /dev/root rw\n2 1 251:16 /sub /mnt\\040space rw - ext4 /dev/vdb rw\n3 1 0:2 / /mnt\\134remote rw - nfs server:/mnt rw\n";
+        let mounts = parse(sample).unwrap();
+        assert_eq!(mounts[1].target, b"/mnt space");
+        assert_eq!(mounts[1].root, b"/sub");
+        assert_eq!(disk_slot(mounts[0].device.0, &mounts[1]), Some(1));
+        assert_eq!(mounts[2].target, b"/mnt\\remote");
+        assert_eq!(disk_slot(mounts[0].device.0, &mounts[2]), None);
+        assert!(!valid_path(b"/mnt/../root"));
+    }
+}
