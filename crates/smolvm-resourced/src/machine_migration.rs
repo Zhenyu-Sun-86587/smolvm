@@ -2086,6 +2086,128 @@ pub(crate) fn query_boot_environment(catalog: &Catalog, request: &Request) -> Re
     Ok(json!(operation))
 }
 
+fn seal_aborted_target_heads(catalog: &mut Catalog, objects: &File, input: &Input) -> Result<()> {
+    let native = input.native(input.endpoint().execution.clone(), json!({}));
+    let operation = match catalog.matching_operation(&native) {
+        Ok(operation) => operation,
+        Err(error) if error.code == "E_NOT_FOUND" => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let op = &operation.operation_id;
+    if !operation.launches_execution()
+        || operation.phase != "ABORTED"
+        || operation.expected_incarnation_id.is_some()
+        || operation.expected_execution_epoch.checked_add(1)
+            != Some(input.endpoint().execution.execution_epoch)
+    {
+        return Err(fenced(
+            "target disk cleanup requires the exact aborted launch",
+        ));
+    }
+    let plan = managed::plan(catalog, &operation)?
+        .filter(|plan| plan.launch.execution == input.endpoint().execution)
+        .ok_or_else(|| fenced("aborted target launch lost its exact disk plan"))?;
+    let tx = catalog.db.unchecked_transaction()?;
+    let has_authority: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM machine_migrations WHERE migration_id=?1 AND side='target'
+                        AND native_operation_id=?2 AND state='aborting' AND decision_json IS NULL)
+             AND NOT EXISTS(SELECT 1 FROM executions WHERE last_operation_id=?2 AND phase<>'exited')
+             AND NOT EXISTS(SELECT 1 FROM writer_reservations WHERE operation_id=?2)
+             AND NOT EXISTS(SELECT 1 FROM writer_grants WHERE operation_id=?2 AND state<>'released')",
+        params![input.ticket().id,op], |row|row.get(0),
+    )?;
+    if !has_authority {
+        return Err(fenced(
+            "aborted target retains an execution or writer, or its migration decision changed",
+        ));
+    }
+    let mut locks = Vec::new();
+    let mut sealed = Vec::new();
+    for device in &plan.devices {
+        let Some(head) = device.head_id.as_deref() else {
+            continue;
+        };
+        if device.reattach || device.disk.read_only {
+            return Err(fenced(
+                "aborted migration launch does not own one of its disk heads",
+            ));
+        }
+        let before: Option<(String, String)> = tx
+            .query_row(
+                "SELECT head_resource_id,backing_identity FROM volume_heads WHERE volume_id=?",
+                [&device.volume_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((registered, identity)) = before else {
+            if let Some((owner, spec, _)) = catalog.block_intent(head)? {
+                if owner != *op || !spec.sealed {
+                    return Err(fenced("aborted migration has an unaccounted disk head"));
+                }
+                sealed.push(head);
+            }
+            continue;
+        };
+        let (owner, spec, saved_identity) = catalog
+            .block_intent(head)?
+            .ok_or_else(|| fenced("aborted target head has no managed backing"))?;
+        let expected = plan
+            .head_spec(head)
+            .ok_or_else(|| fenced("aborted target disk head changed"))?;
+        let writer: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM writer_reservations WHERE volume_id=?1 OR head_resource_id=?2)
+                OR EXISTS(SELECT 1 FROM root_refs WHERE owner_kind='block_seal' AND resource_id=?2 AND state='active')",
+            params![device.volume_id,head], |row|row.get(0),
+        )?;
+        if registered != head
+            || owner != *op
+            || spec != expected
+            || !spec.mutable()
+            || saved_identity.as_deref() != Some(&identity)
+            || writer
+        {
+            return Err(fenced(
+                "aborted target head or writer authority differs from its exact launch",
+            ));
+        }
+        let mut object = catalog.block_closure(head)?.remove(0);
+        let (directory, file) = crate::blocks::fence_head_for_seal(objects, &object, true)?;
+        crate::blocks::seal_fenced_head(&directory, &file, &mut object)?;
+        if tx.execute(
+            "DELETE FROM volume_heads WHERE volume_id=?1 AND head_resource_id=?2 AND backing_identity=?3",
+            params![device.volume_id,head,identity],
+        )? != 1 {
+            return Err(fenced("aborted target disk head changed while being discarded"));
+        }
+        crate::blocks::publish_seal_record(&tx, op, &object)?;
+        tx.execute(
+            "UPDATE root_refs SET state='dropped',revision=revision+1
+             WHERE owner_kind='operation' AND owner_id=?1 AND resource_id=?2 AND state='active'",
+            params![op, head],
+        )?;
+        locks.push(file);
+        sealed.push(head);
+    }
+    tx.commit()?;
+    drop(locks);
+    // The target heads are immutable staging garbage after the transaction.
+    // If collection is interrupted, the Worker resumes from 'deleting'.
+    for head in sealed {
+        let resource = catalog.resource(head)?;
+        if resource["state"] == "available" {
+            let revision = resource["revision"]
+                .as_i64()
+                .ok_or_else(|| fenced("aborted target disk has no catalog revision"))?;
+            match catalog.mark_gc(head, revision) {
+                Ok(_) => (),
+                Err(error) if error.code == "E_RESOURCE_PINNED" => (),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn abort_target_tap(catalog: &Catalog, network: &mut NetworkRuntime, input: &Input) -> Result<()> {
     let Some(transfer) = requested_transfer(input) else {
         return Ok(());
@@ -2413,6 +2535,7 @@ impl crate::worker::Worker {
                 } else {
                     None
                 };
+                seal_aborted_target_heads(&mut self.catalog, &self.objects, &input)?;
                 products::remove_aborted_target(&self.catalog, &input.ticket().id)?;
                 release_import(
                     &mut self.catalog,
